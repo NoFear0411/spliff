@@ -124,6 +124,9 @@ h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id,
 /* Free stream resources */
 void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id);
 
+/* Cleanup all HTTP/2 resources for a specific PID (process exit handling) */
+void http2_cleanup_pid(uint32_t pid);
+
 /* Check if a frame header looks valid (exposed for testing) */
 bool http2_is_valid_frame_header(const uint8_t *data);
 

@@ -2,6 +2,30 @@
 
 All notable changes to sslsniff will be documented in this file.
 
+## [0.4.0] - 2026-01-09
+
+### Added
+- **Process Exit Handler**: BPF tracepoint to cleanup sessions when processes die
+  - Added `sched_process_exit` tracepoint handler in BPF
+  - Added `http2_cleanup_pid()` to free HTTP/2 sessions and stream buffers
+  - Added `cleanup_pending_bodies_pid()` to free HTTP/1.1 pending body buffers
+  - Prevents memory leaks when monitored processes exit unexpectedly
+
+- **Dynamic Library Discovery**: Find SSL libraries via `/proc/PID/maps`
+  - Added `bpf_loader_discover_libraries()` to scan process memory maps
+  - Added `bpf_loader_find_library_dynamic()` with fallback to static paths
+  - Supports Flatpak/Snap containers and bundled SSL libraries
+  - When `--pid` is specified, scans those PIDs for library paths
+
+- **SSL Context Connection Tracking**: Track connections by `(PID, ssl_ctx)` tuple
+  - Isolates HTTP/2 sessions per actual SSL connection
+  - Supports multiple concurrent SSL connections per process (e.g., browser tabs)
+  - Correctly tracks HTTP/1.1 body accumulation per connection
+
+### Changed
+- Library discovery now tries dynamic `/proc/maps` discovery before static paths
+- Event structure includes `ssl_ctx` field for connection isolation
+
 ## [0.3.0] - 2026-01-09
 
 ### Changed
