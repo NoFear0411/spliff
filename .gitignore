@@ -1,0 +1,82 @@
+# Build outputs
+build/
+obj/
+*.o
+*.a
+*.so
+*.bpf.o
+
+# Executables
+sslsniff
+test_http1
+test_http2
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CPackConfig.cmake
+CPackSourceConfig.cmake
+CTestTestfile.cmake
+Makefile.cmake
+_CPack_Packages/
+*.deb
+*.rpm
+
+# Editor/IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.sublime-*
+.project
+.cproject
+.settings/
+*.kate-swp
+
+# Claude Code
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Secret/credential files
+.webui_secret_key
+*.pem
+*.key
+*.crt
+.env
+.env.*
+
+# Old/legacy files (pre-refactor)
+sslsniff.c
+Makefile.new
+Makefile.legacy
+
+# Testing artifacts
+Testing/
+*.log
+core
+core.*
+vgcore.*
+
+# Coverage
+*.gcno
+*.gcda
+*.gcov
+coverage/
+lcov.info
+
+# Package artifacts
+*.tar.gz
+*.zip
+
+# Backup files
+*.bak
+*.orig
+*.backup
