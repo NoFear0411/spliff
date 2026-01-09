@@ -58,8 +58,9 @@ typedef enum {
 
 /* Per-stream state */
 typedef struct {
-    /* Key */
+    /* Key - expanded to include ssl_ctx for per-connection tracking */
     uint32_t pid;
+    uint64_t ssl_ctx;
     int32_t stream_id;
     bool active;
 
@@ -114,14 +115,14 @@ bool http2_is_preface(const uint8_t *data, size_t len);
 /* Process HTTP/2 data from BPF event */
 void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *event);
 
-/* Check if PID has active HTTP/2 session */
-bool http2_has_session(uint32_t pid);
+/* Check if (PID, ssl_ctx) has active HTTP/2 session */
+bool http2_has_session(uint32_t pid, uint64_t ssl_ctx);
 
 /* Get stream info (for external use) */
-h2_stream_t *http2_get_stream(uint32_t pid, int32_t stream_id, bool create);
+h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id, bool create);
 
 /* Free stream resources */
-void http2_free_stream(uint32_t pid, int32_t stream_id);
+void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id);
 
 /* Check if a frame header looks valid (exposed for testing) */
 bool http2_is_valid_frame_header(const uint8_t *data);

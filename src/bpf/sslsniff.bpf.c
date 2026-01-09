@@ -34,6 +34,7 @@
 struct ssl_data_event {
     __u64 timestamp_ns;
     __u64 delta_ns;       // Latency (for handshake or request-response)
+    __u64 ssl_ctx;        // SSL context pointer for connection tracking
     __u32 pid;
     __u32 tid;
     __u32 uid;
@@ -46,8 +47,15 @@ struct ssl_data_event {
 
 // Arguments saved between entry and exit probes
 struct ssl_args {
+    __u64 ssl_ctx;        // SSL context pointer
     __u64 buf_ptr;        // Buffer pointer
     __u32 len;            // Requested length
+};
+
+// Handshake state saved between entry and exit probes
+struct handshake_args {
+    __u64 ssl_ctx;        // SSL context pointer
+    __u64 start_ns;       // Start timestamp
 };
 
 // =============================================================================
@@ -80,14 +88,14 @@ struct {
     __type(value, __u64); // start timestamp
 } start_ns SEC(".maps");
 
-// Separate map for handshake start times (to avoid race with read/write)
+// Separate map for handshake state (to avoid race with read/write)
 // Key: tid (thread ID)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
     __type(key, __u32);  // tid
-    __type(value, __u64); // start timestamp
-} handshake_start_ns SEC(".maps");
+    __type(value, struct handshake_args);
+} handshake_args_map SEC(".maps");
 
 // Ring buffer for sending events to userspace
 struct {
@@ -138,19 +146,20 @@ static __always_inline void fill_event_metadata(struct ssl_data_event *event) {
 SEC("uprobe/ssl_rw_enter")
 int BPF_UPROBE(probe_ssl_rw_enter, void *ssl_ctx, void *buf, int num) {
     __u32 tid = get_tid();
-    
-    // Save buffer address and length for the exit probe
+
+    // Save SSL context, buffer address and length for the exit probe
     struct ssl_args args = {
+        .ssl_ctx = (__u64)ssl_ctx,
         .buf_ptr = (__u64)buf,
         .len = (__u32)num,
     };
-    
+
     bpf_map_update_elem(&ssl_args_map, &tid, &args, BPF_ANY);
-    
+
     // Save start timestamp for latency calculation
     __u64 ts = bpf_ktime_get_ns();
     bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY);
-    
+
     return 0;
 }
 
@@ -190,7 +199,8 @@ int BPF_URETPROBE(probe_ssl_read_exit) {
     fill_event_metadata(event);
     event->event_type = EVENT_SSL_READ;
     event->len = (__u32)ret;
-    
+    event->ssl_ctx = args->ssl_ctx;
+
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
     if (tsp) {
@@ -261,7 +271,8 @@ int BPF_URETPROBE(probe_ssl_write_exit) {
     fill_event_metadata(event);
     event->event_type = EVENT_SSL_WRITE;
     event->len = (__u32)ret;
-    
+    event->ssl_ctx = args->ssl_ctx;
+
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
     if (tsp) {
@@ -304,10 +315,15 @@ int BPF_URETPROBE(probe_ssl_write_exit) {
 SEC("uprobe/ssl_handshake_enter")
 int BPF_UPROBE(probe_ssl_handshake_enter, void *ssl_ctx) {
     __u32 tid = get_tid();
-    __u64 ts = bpf_ktime_get_ns();
+
+    // Save SSL context and start timestamp
+    struct handshake_args args = {
+        .ssl_ctx = (__u64)ssl_ctx,
+        .start_ns = bpf_ktime_get_ns(),
+    };
 
     // Use separate map to avoid race with SSL_read/SSL_write during handshake
-    bpf_map_update_elem(&handshake_start_ns, &tid, &ts, BPF_ANY);
+    bpf_map_update_elem(&handshake_args_map, &tid, &args, BPF_ANY);
     return 0;
 }
 
@@ -316,9 +332,9 @@ int BPF_URETPROBE(probe_ssl_handshake_exit) {
     __u32 tid = get_tid();
     __u32 zero = 0;
 
-    // Lookup start timestamp from handshake-specific map
-    __u64 *tsp = bpf_map_lookup_elem(&handshake_start_ns, &tid);
-    if (!tsp) {
+    // Lookup handshake state from handshake-specific map
+    struct handshake_args *args = bpf_map_lookup_elem(&handshake_args_map, &tid);
+    if (!args) {
         return 0;
     }
 
@@ -328,7 +344,7 @@ int BPF_URETPROBE(probe_ssl_handshake_exit) {
     // Get event buffer
     struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
     if (!event) {
-        bpf_map_delete_elem(&handshake_start_ns, &tid);
+        bpf_map_delete_elem(&handshake_args_map, &tid);
         return 0;
     }
 
@@ -337,13 +353,14 @@ int BPF_URETPROBE(probe_ssl_handshake_exit) {
     event->event_type = EVENT_HANDSHAKE;
     event->len = (__u32)ret;  // Store return value (1=success, 0/-1=fail)
     event->buf_filled = 0;
-    event->delta_ns = event->timestamp_ns - *tsp;
+    event->ssl_ctx = args->ssl_ctx;
+    event->delta_ns = event->timestamp_ns - args->start_ns;
 
     // Submit event (small, no buffer data) - use fixed size for verifier
     bpf_ringbuf_output(&ssl_events, event, sizeof(struct ssl_data_event) - MAX_BUF_SIZE, 0);
 
     // Cleanup
-    bpf_map_delete_elem(&handshake_start_ns, &tid);
+    bpf_map_delete_elem(&handshake_args_map, &tid);
 
     return 0;
 }
@@ -357,8 +374,9 @@ SEC("uprobe/gnutls_send_enter")
 int BPF_UPROBE(probe_gnutls_send_enter, void *session, void *buf, size_t num) {
     __u32 tid = get_tid();
 
-    // Save buffer address and length for the exit probe
+    // Save session context, buffer address and length for the exit probe
     struct ssl_args args = {
+        .ssl_ctx = (__u64)session,
         .buf_ptr = (__u64)buf,
         .len = (__u32)num,
     };
@@ -403,6 +421,7 @@ int BPF_URETPROBE(probe_gnutls_send_exit) {
     fill_event_metadata(event);
     event->event_type = EVENT_SSL_WRITE;
     event->len = (__u32)ret;
+    event->ssl_ctx = args->ssl_ctx;
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -442,8 +461,9 @@ SEC("uprobe/gnutls_recv_enter")
 int BPF_UPROBE(probe_gnutls_recv_enter, void *session, void *buf, size_t num) {
     __u32 tid = get_tid();
 
-    // Save buffer address and length for the exit probe
+    // Save session context, buffer address and length for the exit probe
     struct ssl_args args = {
+        .ssl_ctx = (__u64)session,
         .buf_ptr = (__u64)buf,
         .len = (__u32)num,
     };
@@ -488,6 +508,7 @@ int BPF_URETPROBE(probe_gnutls_recv_exit) {
     fill_event_metadata(event);
     event->event_type = EVENT_SSL_READ;
     event->len = (__u32)ret;
+    event->ssl_ctx = args->ssl_ctx;
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -532,8 +553,9 @@ SEC("uprobe/nss_write_enter")
 int BPF_UPROBE(probe_nss_write_enter, void *fd, void *buf, int num) {
     __u32 tid = get_tid();
 
-    // Save buffer address and length for the exit probe
+    // Save file descriptor, buffer address and length for the exit probe
     struct ssl_args args = {
+        .ssl_ctx = (__u64)fd,
         .buf_ptr = (__u64)buf,
         .len = (__u32)num,
     };
@@ -578,6 +600,7 @@ int BPF_URETPROBE(probe_nss_write_exit) {
     fill_event_metadata(event);
     event->event_type = EVENT_SSL_WRITE;
     event->len = (__u32)ret;
+    event->ssl_ctx = args->ssl_ctx;
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -617,8 +640,9 @@ SEC("uprobe/nss_read_enter")
 int BPF_UPROBE(probe_nss_read_enter, void *fd, void *buf, int num) {
     __u32 tid = get_tid();
 
-    // Save buffer address and length for the exit probe
+    // Save file descriptor, buffer address and length for the exit probe
     struct ssl_args args = {
+        .ssl_ctx = (__u64)fd,
         .buf_ptr = (__u64)buf,
         .len = (__u32)num,
     };
@@ -663,6 +687,7 @@ int BPF_URETPROBE(probe_nss_read_exit) {
     fill_event_metadata(event);
     event->event_type = EVENT_SSL_READ;
     event->len = (__u32)ret;
+    event->ssl_ctx = args->ssl_ctx;
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
