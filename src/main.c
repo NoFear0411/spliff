@@ -461,6 +461,14 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
 show_raw:
     /* Unknown/binary data - show basic info */
     ;  /* Empty statement after label for C99 compliance */
+
+    /* Try to detect file type early to filter non-HTTP traffic */
+    const char *sig = signature_detect(data, len);
+    if (signature_is_local_file(sig)) {
+        /* Skip local file I/O (ELF, Mach-O, SQLite, etc.) - not HTTP traffic */
+        return;
+    }
+
     char ts[32];
     display_get_timestamp(ts, sizeof(ts));
     const char *dir = (event->event_type == EVENT_SSL_WRITE) ? "WRITE" : "READ";
@@ -475,8 +483,6 @@ show_raw:
            display_color(C_CYAN), dir, display_color(C_RESET),
            display_name, event->pid, event->buf_filled);
 
-    /* Try to detect file type */
-    const char *sig = signature_detect(data, len);
     if (sig) {
         printf("%s[%s]%s", display_color(C_YELLOW), sig, display_color(C_RESET));
     }

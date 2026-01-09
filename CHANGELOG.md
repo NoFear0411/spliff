@@ -44,6 +44,9 @@ All notable changes to sslsniff will be documented in this file.
   - Prevents buffer filling up and blocking all HTTP/2 traffic
 - **Thread filtering**: Removed overly aggressive filtering of "Web Content", "Renderer"
   - These Firefox processes actually make HTTP requests
+- **NSS non-HTTP traffic**: Filter out local file I/O captured by NSPR probes
+  - ELF, Mach-O, SQLite, Java class files are silently skipped
+  - Reduces noise from Firefox loading shared libraries via NSPR
 - CMake sanitizer library detection (checks both compile and link)
 
 ## [0.2.6] - 2026-01-08

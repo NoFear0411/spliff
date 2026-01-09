@@ -196,3 +196,16 @@ bool signature_is_binary(const char *description) {
     /* Special detections are all binary */
     return true;
 }
+
+/* Check if content is local file I/O (not HTTP traffic) */
+bool signature_is_local_file(const char *description) {
+    if (description == NULL) return false;
+
+    /* These are clearly local file reads, not HTTP traffic */
+    if (strcmp(description, "ELF binary") == 0) return true;
+    if (strcmp(description, "Mach-O binary") == 0) return true;
+    if (strcmp(description, "SQLite database") == 0) return true;
+    if (strcmp(description, "Java class") == 0) return true;
+
+    return false;
+}
