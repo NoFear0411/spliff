@@ -164,7 +164,7 @@ static void test_session_tracking(void) {
     http2_init();
 
     /* No session initially */
-    if (http2_has_session(12345)) {
+    if (http2_has_session(12345, 0)) {
         FAIL("Session exists before creation");
         http2_cleanup();
         return;
@@ -184,7 +184,7 @@ static void test_stream_management(void) {
     http2_init();
 
     /* Create a stream */
-    h2_stream_t *stream1 = http2_get_stream(1000, 1, true);
+    h2_stream_t *stream1 = http2_get_stream(1000, 0, 1, true);
     if (!stream1) {
         FAIL("Failed to create stream");
         http2_cleanup();
@@ -198,7 +198,7 @@ static void test_stream_management(void) {
     }
 
     /* Get same stream (no create) */
-    h2_stream_t *stream1_again = http2_get_stream(1000, 1, false);
+    h2_stream_t *stream1_again = http2_get_stream(1000, 0, 1, false);
     if (stream1_again != stream1) {
         FAIL("Should return same stream pointer");
         http2_cleanup();
@@ -206,7 +206,7 @@ static void test_stream_management(void) {
     }
 
     /* Create another stream for same PID */
-    h2_stream_t *stream3 = http2_get_stream(1000, 3, true);
+    h2_stream_t *stream3 = http2_get_stream(1000, 0, 3, true);
     if (!stream3 || stream3 == stream1) {
         FAIL("Failed to create second stream");
         http2_cleanup();
@@ -214,7 +214,7 @@ static void test_stream_management(void) {
     }
 
     /* Create stream for different PID */
-    h2_stream_t *stream_other = http2_get_stream(2000, 1, true);
+    h2_stream_t *stream_other = http2_get_stream(2000, 0, 1, true);
     if (!stream_other || stream_other == stream1) {
         FAIL("Failed to create stream for different PID");
         http2_cleanup();
@@ -222,7 +222,7 @@ static void test_stream_management(void) {
     }
 
     /* Non-existent stream without create */
-    h2_stream_t *nonexistent = http2_get_stream(9999, 99, false);
+    h2_stream_t *nonexistent = http2_get_stream(9999, 0, 99, false);
     if (nonexistent) {
         FAIL("Should return NULL for non-existent stream");
         http2_cleanup();
@@ -230,8 +230,8 @@ static void test_stream_management(void) {
     }
 
     /* Free a stream */
-    http2_free_stream(1000, 1);
-    h2_stream_t *freed = http2_get_stream(1000, 1, false);
+    http2_free_stream(1000, 0, 1);
+    h2_stream_t *freed = http2_get_stream(1000, 0, 1, false);
     if (freed) {
         FAIL("Stream should be freed");
         http2_cleanup();
@@ -239,7 +239,7 @@ static void test_stream_management(void) {
     }
 
     /* Stream 3 should still exist */
-    h2_stream_t *still_exists = http2_get_stream(1000, 3, false);
+    h2_stream_t *still_exists = http2_get_stream(1000, 0, 3, false);
     if (!still_exists) {
         FAIL("Other stream should still exist");
         http2_cleanup();
@@ -312,7 +312,7 @@ static void test_stream_id_rules(void) {
     http2_init();
 
     /* Client-initiated streams are odd */
-    h2_stream_t *client_stream = http2_get_stream(1000, 1, true);
+    h2_stream_t *client_stream = http2_get_stream(1000, 0, 1, true);
     if (!client_stream) {
         FAIL("Failed to create client stream");
         http2_cleanup();
@@ -321,7 +321,7 @@ static void test_stream_id_rules(void) {
 
     /* Stream 3, 5, 7 are also valid client streams */
     for (int id = 3; id <= 7; id += 2) {
-        h2_stream_t *s = http2_get_stream(1000, id, true);
+        h2_stream_t *s = http2_get_stream(1000, 0, id, true);
         if (!s) {
             char buf[64];
             snprintf(buf, sizeof(buf), "Failed to create client stream %d", id);
@@ -332,7 +332,7 @@ static void test_stream_id_rules(void) {
     }
 
     /* Server-initiated streams are even (but stream 0 is connection-level) */
-    h2_stream_t *server_stream = http2_get_stream(1000, 2, true);
+    h2_stream_t *server_stream = http2_get_stream(1000, 0, 2, true);
     if (!server_stream) {
         FAIL("Failed to create server stream");
         http2_cleanup();
@@ -449,7 +449,7 @@ static void test_multiple_pids(void) {
     /* Create streams for multiple PIDs */
     uint32_t pids[] = { 1001, 1002, 1003, 1004, 1005 };
     for (size_t i = 0; i < sizeof(pids)/sizeof(pids[0]); i++) {
-        h2_stream_t *s = http2_get_stream(pids[i], 1, true);
+        h2_stream_t *s = http2_get_stream(pids[i], 0, 1, true);
         if (!s) {
             char buf[64];
             snprintf(buf, sizeof(buf), "Failed for PID %u", pids[i]);
@@ -466,7 +466,7 @@ static void test_multiple_pids(void) {
 
     /* Verify each PID's stream is independent */
     for (size_t i = 0; i < sizeof(pids)/sizeof(pids[0]); i++) {
-        h2_stream_t *s = http2_get_stream(pids[i], 1, false);
+        h2_stream_t *s = http2_get_stream(pids[i], 0, 1, false);
         if (!s || s->pid != pids[i]) {
             FAIL("Stream lookup failed or wrong PID");
             http2_cleanup();
@@ -475,13 +475,13 @@ static void test_multiple_pids(void) {
     }
 
     /* Free one and verify others unaffected */
-    http2_free_stream(1003, 1);
-    if (http2_get_stream(1003, 1, false)) {
+    http2_free_stream(1003, 0, 1);
+    if (http2_get_stream(1003, 0, 1, false)) {
         FAIL("Freed stream still exists");
         http2_cleanup();
         return;
     }
-    if (!http2_get_stream(1002, 1, false) || !http2_get_stream(1004, 1, false)) {
+    if (!http2_get_stream(1002, 0, 1, false) || !http2_get_stream(1004, 0, 1, false)) {
         FAIL("Adjacent streams affected by free");
         http2_cleanup();
         return;

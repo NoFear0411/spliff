@@ -73,6 +73,7 @@ static void get_process_name(uint32_t pid, char *buf, size_t bufsize) {
 
 typedef struct {
     uint32_t pid;
+    uint64_t ssl_ctx;     /* SSL context pointer for connection tracking */
     size_t expected_len;
     size_t received_len;
     char content_type[256];
@@ -87,18 +88,20 @@ typedef struct {
 #define MAX_PENDING_BODIES 16
 static pending_body_t g_pending_bodies[MAX_PENDING_BODIES];
 
-static pending_body_t *find_pending_body(uint32_t pid) {
+static pending_body_t *find_pending_body(uint32_t pid, uint64_t ssl_ctx) {
     for (int i = 0; i < MAX_PENDING_BODIES; i++) {
-        if (g_pending_bodies[i].active && g_pending_bodies[i].pid == pid) {
+        if (g_pending_bodies[i].active &&
+            g_pending_bodies[i].pid == pid &&
+            g_pending_bodies[i].ssl_ctx == ssl_ctx) {
             return &g_pending_bodies[i];
         }
     }
     return NULL;
 }
 
-static void set_pending_body(uint32_t pid, size_t len, const char *ct, const char *ce) {
+static void set_pending_body(uint32_t pid, uint64_t ssl_ctx, size_t len, const char *ct, const char *ce) {
     /* Find existing or empty slot */
-    pending_body_t *slot = find_pending_body(pid);
+    pending_body_t *slot = find_pending_body(pid, ssl_ctx);
     if (!slot) {
         for (int i = 0; i < MAX_PENDING_BODIES; i++) {
             if (!g_pending_bodies[i].active) {
@@ -115,6 +118,7 @@ static void set_pending_body(uint32_t pid, size_t len, const char *ct, const cha
         }
 
         slot->pid = pid;
+        slot->ssl_ctx = ssl_ctx;
         slot->expected_len = len;
         slot->received_len = 0;
         slot->accum_len = 0;
@@ -139,8 +143,8 @@ static void set_pending_body(uint32_t pid, size_t len, const char *ct, const cha
     }
 }
 
-static void clear_pending_body(uint32_t pid) {
-    pending_body_t *p = find_pending_body(pid);
+static void clear_pending_body(uint32_t pid, uint64_t ssl_ctx) {
+    pending_body_t *p = find_pending_body(pid, ssl_ctx);
     if (p) {
         /* If we accumulated compressed data, decompress and display now */
         if (p->accum_buf && p->accum_len > 0) {
@@ -252,8 +256,8 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
 
     /* Try HTTP/1.1 parsing first (using llhttp with HTTP_BOTH) */
     if (http1_is_request(data, len) || http1_is_response(data, len)) {
-        /* New HTTP message - clear any pending body from this PID */
-        clear_pending_body(event->pid);
+        /* New HTTP message - clear any pending body from this connection */
+        clear_pending_body(event->pid, event->ssl_ctx);
 
         http_message_t msg = {0};
         static uint8_t body_buf[MAX_BODY_BUFFER];  /* Static to avoid stack overflow */
@@ -316,12 +320,12 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
                 }
 
                 display_body(body_data, display_len, msg.content_type);
-                clear_pending_body(event->pid);
+                clear_pending_body(event->pid, event->ssl_ctx);
             } else if (msg.direction == DIR_RESPONSE &&
                        (msg.content_length > 0 || msg.is_chunked)) {
                 /* Body will arrive in next event - track it
                  * For chunked encoding, use 0 as expected_len (unknown size) */
-                set_pending_body(event->pid,
+                set_pending_body(event->pid, event->ssl_ctx,
                                  msg.content_length > 0 ? msg.content_length : 0,
                                  msg.content_type, msg.content_encoding);
             }
@@ -331,9 +335,10 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
         return;
     }
 
-    /* Check if we already have an active HTTP/2 session for this PID */
-    bool has_h2 = http2_has_session(event->pid);
-    DEBUG_MAIN("PID=%u has_h2_session=%d len=%zu", event->pid, has_h2, len);
+    /* Check if we already have an active HTTP/2 session for this (PID, ssl_ctx) */
+    bool has_h2 = http2_has_session(event->pid, event->ssl_ctx);
+    DEBUG_MAIN("PID=%u ssl_ctx=0x%llx has_h2_session=%d len=%zu",
+               event->pid, (unsigned long long)event->ssl_ctx, has_h2, len);
     if (has_h2) {
         /* Always process data for active H2 sessions */
         http2_process_frame(data, len, event);
@@ -411,7 +416,7 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
 
     /* Check if this is body data for a pending response */
     if (g_config.show_body) {
-        pending_body_t *pending = find_pending_body(event->pid);
+        pending_body_t *pending = find_pending_body(event->pid, event->ssl_ctx);
         if (pending && pending->active) {
             pending->received_len += len;
 
@@ -424,7 +429,7 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
                 }
                 /* Check if complete (Content-Length known) */
                 if (pending->expected_len > 0 && pending->received_len >= pending->expected_len) {
-                    clear_pending_body(event->pid);
+                    clear_pending_body(event->pid, event->ssl_ctx);
                 }
                 /* For chunked (expected_len=0), wait for next HTTP message to trigger clear */
                 return;
@@ -450,7 +455,7 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
 
             /* Check if we've received all expected data */
             if (pending->expected_len > 0 && pending->received_len >= pending->expected_len) {
-                clear_pending_body(event->pid);
+                clear_pending_body(event->pid, event->ssl_ctx);
             }
             fflush(stdout);
 

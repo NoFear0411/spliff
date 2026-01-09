@@ -91,6 +91,7 @@ typedef struct h2_callback_ctx h2_callback_ctx_t;
 /* Per-connection HTTP/2 session state */
 typedef struct {
     uint32_t pid;
+    uint64_t ssl_ctx;        /* SSL context pointer for connection tracking */
     bool active;
 
     /* nghttp2 server session for parsing requests */
@@ -120,6 +121,7 @@ typedef struct {
 /* Context passed to nghttp2 callbacks */
 struct h2_callback_ctx {
     uint32_t pid;
+    uint64_t ssl_ctx;
     h2_connection_t *conn;
     const ssl_data_event_t *event;
     h2_dir_t direction;
@@ -139,11 +141,12 @@ static uint64_t get_time_ns(void) {
 }
 
 /* Stream management */
-h2_stream_t *http2_get_stream(uint32_t pid, int32_t stream_id, bool create) {
-    /* Find existing */
+h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id, bool create) {
+    /* Find existing by (pid, ssl_ctx, stream_id) */
     for (int i = 0; i < MAX_H2_STREAMS; i++) {
         if (g_h2_streams[i].active &&
             g_h2_streams[i].pid == pid &&
+            g_h2_streams[i].ssl_ctx == ssl_ctx &&
             g_h2_streams[i].stream_id == stream_id) {
             return &g_h2_streams[i];
         }
@@ -164,7 +167,8 @@ h2_stream_t *http2_get_stream(uint32_t pid, int32_t stream_id, bool create) {
         /* Evict oldest closed stream */
         for (int i = 0; i < MAX_H2_STREAMS; i++) {
             if (g_h2_streams[i].state == H2_STREAM_CLOSED) {
-                http2_free_stream(g_h2_streams[i].pid, g_h2_streams[i].stream_id);
+                http2_free_stream(g_h2_streams[i].pid, g_h2_streams[i].ssl_ctx,
+                                  g_h2_streams[i].stream_id);
                 slot = &g_h2_streams[i];
                 break;
             }
@@ -176,6 +180,7 @@ h2_stream_t *http2_get_stream(uint32_t pid, int32_t stream_id, bool create) {
     /* Initialize stream */
     memset(slot, 0, sizeof(*slot));
     slot->pid = pid;
+    slot->ssl_ctx = ssl_ctx;
     slot->stream_id = stream_id;
     slot->active = true;
     slot->state = H2_STREAM_OPEN;
@@ -192,10 +197,11 @@ h2_stream_t *http2_get_stream(uint32_t pid, int32_t stream_id, bool create) {
     return slot;
 }
 
-void http2_free_stream(uint32_t pid, int32_t stream_id) {
+void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id) {
     for (int i = 0; i < MAX_H2_STREAMS; i++) {
         if (g_h2_streams[i].active &&
             g_h2_streams[i].pid == pid &&
+            g_h2_streams[i].ssl_ctx == ssl_ctx &&
             g_h2_streams[i].stream_id == stream_id) {
             if (g_h2_streams[i].body_buf) {
                 free(g_h2_streams[i].body_buf);
@@ -224,7 +230,7 @@ static int on_begin_headers_callback(nghttp2_session *session,
     /* Only process on appropriate session */
     if (ctx->direction == H2_DIR_SERVER) {
         /* Server session sees requests - create/update stream state */
-        h2_stream_t *stream = http2_get_stream(ctx->pid, frame->hd.stream_id, true);
+        h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, true);
         if (!stream) {
             return 0;
         }
@@ -247,7 +253,7 @@ static int on_begin_headers_callback(nghttp2_session *session,
         }
     } else {
         /* Client session sees responses - update existing stream */
-        h2_stream_t *stream = http2_get_stream(ctx->pid, frame->hd.stream_id, false);
+        h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
         if (!stream) {
             DEBUG_H2("Response for unknown stream %d", frame->hd.stream_id);
             return 0;
@@ -277,7 +283,7 @@ static int on_header_callback(nghttp2_session *session,
     DEBUG_H2("on_header: stream=%d '%.*s: %.*s'",
              frame->hd.stream_id, (int)namelen, name, (int)valuelen, value);
 
-    h2_stream_t *stream = http2_get_stream(ctx->pid, frame->hd.stream_id, false);
+    h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
     if (!stream) {
         DEBUG_H2("on_header: stream %d not found!", frame->hd.stream_id);
         return 0;
@@ -350,7 +356,7 @@ static int on_frame_recv_callback(nghttp2_session *session,
     case NGHTTP2_HEADERS:
         /* Headers complete - check END_HEADERS flag */
         if (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS) {
-            h2_stream_t *stream = http2_get_stream(ctx->pid, frame->hd.stream_id, false);
+            h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
             if (stream) {
                 if (ctx->direction == H2_DIR_SERVER) {
                     /* Request headers complete - only display once */
@@ -383,7 +389,7 @@ static int on_frame_recv_callback(nghttp2_session *session,
     case NGHTTP2_DATA:
         /* DATA frame - check END_STREAM */
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-            h2_stream_t *stream = http2_get_stream(ctx->pid, frame->hd.stream_id, false);
+            h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
             if (stream) {
                 if (ctx->direction == H2_DIR_SERVER) {
                     /* Request body complete */
@@ -415,7 +421,7 @@ static int on_frame_recv_callback(nghttp2_session *session,
     case NGHTTP2_RST_STREAM:
         /* Stream reset - mark as closed */
         {
-            h2_stream_t *stream = http2_get_stream(ctx->pid, frame->hd.stream_id, false);
+            h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
             if (stream) {
                 stream->state = H2_STREAM_CLOSED;
             }
@@ -439,7 +445,7 @@ static int on_data_chunk_recv_callback(nghttp2_session *session,
     (void)flags;
     h2_callback_ctx_t *ctx = (h2_callback_ctx_t *)user_data;
 
-    h2_stream_t *stream = http2_get_stream(ctx->pid, stream_id, false);
+    h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, stream_id, false);
     if (!stream || !stream->body_buf) return 0;
 
     /* Accumulate body data */
@@ -462,7 +468,7 @@ static int on_stream_close_callback(nghttp2_session *session,
     (void)error_code;
     h2_callback_ctx_t *ctx = (h2_callback_ctx_t *)user_data;
 
-    h2_stream_t *stream = http2_get_stream(ctx->pid, stream_id, false);
+    h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, stream_id, false);
     if (stream) {
         stream->state = H2_STREAM_CLOSED;
 
@@ -639,20 +645,25 @@ static void h2_connection_cleanup(h2_connection_t *conn) {
     free(conn->server_ctx);
     conn->server_ctx = NULL;
 
-    /* Cleanup associated streams */
+    /* Cleanup associated streams for this connection */
     for (int i = 0; i < MAX_H2_STREAMS; i++) {
-        if (g_h2_streams[i].active && g_h2_streams[i].pid == conn->pid) {
-            http2_free_stream(g_h2_streams[i].pid, g_h2_streams[i].stream_id);
+        if (g_h2_streams[i].active &&
+            g_h2_streams[i].pid == conn->pid &&
+            g_h2_streams[i].ssl_ctx == conn->ssl_ctx) {
+            http2_free_stream(g_h2_streams[i].pid, g_h2_streams[i].ssl_ctx,
+                              g_h2_streams[i].stream_id);
         }
     }
 
     conn->active = false;
 }
 
-static h2_connection_t *get_h2_connection(uint32_t pid, bool create) {
-    /* Find existing */
+static h2_connection_t *get_h2_connection(uint32_t pid, uint64_t ssl_ctx, bool create) {
+    /* Find existing by (pid, ssl_ctx) */
     for (int i = 0; i < MAX_H2_SESSIONS; i++) {
-        if (g_h2_connections[i].active && g_h2_connections[i].pid == pid) {
+        if (g_h2_connections[i].active &&
+            g_h2_connections[i].pid == pid &&
+            g_h2_connections[i].ssl_ctx == ssl_ctx) {
             g_h2_connections[i].last_activity_ns = get_time_ns();
             return &g_h2_connections[i];
         }
@@ -685,6 +696,7 @@ static h2_connection_t *get_h2_connection(uint32_t pid, bool create) {
     /* Initialize new connection */
     memset(slot, 0, sizeof(*slot));
     slot->pid = pid;
+    slot->ssl_ctx = ssl_ctx;
     slot->active = true;
     slot->last_activity_ns = get_time_ns();
 
@@ -697,6 +709,7 @@ static h2_connection_t *get_h2_connection(uint32_t pid, bool create) {
 
     memset(server_ctx, 0, sizeof(*server_ctx));
     server_ctx->pid = pid;
+    server_ctx->ssl_ctx = ssl_ctx;
     server_ctx->conn = slot;
     server_ctx->direction = H2_DIR_SERVER;
 
@@ -842,9 +855,11 @@ bool http2_is_preface(const uint8_t *data, size_t len) {
     return len >= 24 && memcmp(data, preface, 24) == 0;
 }
 
-bool http2_has_session(uint32_t pid) {
+bool http2_has_session(uint32_t pid, uint64_t ssl_ctx) {
     for (int i = 0; i < MAX_H2_SESSIONS; i++) {
-        if (g_h2_connections[i].active && g_h2_connections[i].pid == pid) {
+        if (g_h2_connections[i].active &&
+            g_h2_connections[i].pid == pid &&
+            g_h2_connections[i].ssl_ctx == ssl_ctx) {
             return true;
         }
     }
@@ -918,10 +933,10 @@ static void h2_process_complete_response_frame(h2_connection_t *conn, const uint
     case 0x01: /* HEADERS */
         {
             /* Get or create stream - for responses we need the stream to exist from request */
-            h2_stream_t *stream = http2_get_stream(conn->pid, stream_id, false);
+            h2_stream_t *stream = http2_get_stream(conn->pid, conn->ssl_ctx, stream_id, false);
             if (!stream) {
                 DEBUG_H2("Response for unknown stream %d, creating", stream_id);
-                stream = http2_get_stream(conn->pid, stream_id, true);
+                stream = http2_get_stream(conn->pid, conn->ssl_ctx, stream_id, true);
                 if (!stream) break;
             }
 
@@ -1019,7 +1034,7 @@ static void h2_process_complete_response_frame(h2_connection_t *conn, const uint
 
     case 0x00: /* DATA */
         {
-            h2_stream_t *stream = http2_get_stream(conn->pid, stream_id, false);
+            h2_stream_t *stream = http2_get_stream(conn->pid, conn->ssl_ctx, stream_id, false);
             if (stream && stream->body_buf) {
                 /* Skip padding if present */
                 const uint8_t *body_data = payload;
@@ -1201,10 +1216,11 @@ void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *e
     DEBUG_H2("process_frame: PID=%u type=%s len=%d",
              event->pid, event->event_type == EVENT_SSL_WRITE ? "WRITE" : "READ", len);
 
-    /* Get or create connection for this PID */
-    h2_connection_t *conn = get_h2_connection(event->pid, true);
+    /* Get or create connection for this (PID, ssl_ctx) */
+    h2_connection_t *conn = get_h2_connection(event->pid, event->ssl_ctx, true);
     if (!conn) {
-        DEBUG_H2("get_h2_connection failed for PID %u", event->pid);
+        DEBUG_H2("get_h2_connection failed for PID %u ssl_ctx=0x%llx",
+                 event->pid, (unsigned long long)event->ssl_ctx);
         return;
     }
 
@@ -1340,8 +1356,9 @@ bool http2_is_preface(const uint8_t *data, size_t len) {
     return len >= 24 && memcmp(data, preface, 24) == 0;
 }
 
-bool http2_has_session(uint32_t pid) {
+bool http2_has_session(uint32_t pid, uint64_t ssl_ctx) {
     (void)pid;
+    (void)ssl_ctx;
     return false;
 }
 
@@ -1352,15 +1369,17 @@ void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *e
     /* No-op without nghttp2 - HTTP/2 detection will just show connection message */
 }
 
-h2_stream_t *http2_get_stream(uint32_t pid, int32_t stream_id, bool create) {
+h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id, bool create) {
     (void)pid;
+    (void)ssl_ctx;
     (void)stream_id;
     (void)create;
     return NULL;
 }
 
-void http2_free_stream(uint32_t pid, int32_t stream_id) {
+void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id) {
     (void)pid;
+    (void)ssl_ctx;
     (void)stream_id;
 }
 
