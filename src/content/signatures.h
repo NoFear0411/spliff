@@ -45,4 +45,7 @@ const char *signature_detect(const uint8_t *data, size_t len);
 /* Check if content should be displayed as text */
 bool signature_is_binary(const char *description);
 
+/* Check if content is local file I/O (not HTTP traffic) */
+bool signature_is_local_file(const char *description);
+
 #endif /* SIGNATURES_H */
