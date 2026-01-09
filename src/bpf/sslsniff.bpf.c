@@ -26,9 +26,10 @@
 #define TASK_COMM_LEN 16
 
 // Event types
-#define EVENT_SSL_READ  0
-#define EVENT_SSL_WRITE 1
-#define EVENT_HANDSHAKE 2
+#define EVENT_SSL_READ     0
+#define EVENT_SSL_WRITE    1
+#define EVENT_HANDSHAKE    2
+#define EVENT_PROCESS_EXIT 3
 
 // Data structure for SSL events
 struct ssl_data_event {
@@ -103,6 +104,14 @@ struct {
     __uint(max_entries, 256 * 1024);
 } ssl_events SEC(".maps");
 
+// Map to track PIDs that have had SSL activity (for process exit filtering)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);    // PID
+    __type(value, __u8);   // dummy value (just need existence)
+} tracked_pids SEC(".maps");
+
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -135,6 +144,12 @@ static __always_inline void fill_event_metadata(struct ssl_data_event *event) {
         event->comm[i] = 0;
     }
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
+}
+
+// Helper to mark a PID as having SSL activity
+static __always_inline void track_pid(__u32 pid) {
+    __u8 val = 1;
+    bpf_map_update_elem(&tracked_pids, &pid, &val, BPF_ANY);
 }
 
 // =============================================================================
@@ -221,17 +236,20 @@ int BPF_URETPROBE(probe_ssl_read_exit) {
         }
     }
     
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
+
     // Submit event - size must be bounded for verifier
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
         submit_size = sizeof(struct ssl_data_event);
     }
     bpf_ringbuf_output(&ssl_events, event, submit_size & 0xFFFF, 0);
-    
+
     // Cleanup
     bpf_map_delete_elem(&ssl_args_map, &tid);
     bpf_map_delete_elem(&start_ns, &tid);
-    
+
     return 0;
 }
 
@@ -293,17 +311,20 @@ int BPF_URETPROBE(probe_ssl_write_exit) {
         }
     }
     
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
+
     // Submit event - size must be bounded for verifier
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
         submit_size = sizeof(struct ssl_data_event);
     }
     bpf_ringbuf_output(&ssl_events, event, submit_size & 0xFFFF, 0);
-    
+
     // Cleanup
     bpf_map_delete_elem(&ssl_args_map, &tid);
     bpf_map_delete_elem(&start_ns, &tid);
-    
+
     return 0;
 }
 
@@ -355,6 +376,9 @@ int BPF_URETPROBE(probe_ssl_handshake_exit) {
     event->buf_filled = 0;
     event->ssl_ctx = args->ssl_ctx;
     event->delta_ns = event->timestamp_ns - args->start_ns;
+
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
 
     // Submit event (small, no buffer data) - use fixed size for verifier
     bpf_ringbuf_output(&ssl_events, event, sizeof(struct ssl_data_event) - MAX_BUF_SIZE, 0);
@@ -443,6 +467,9 @@ int BPF_URETPROBE(probe_gnutls_send_exit) {
         }
     }
 
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
+
     // Submit event
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
@@ -529,6 +556,9 @@ int BPF_URETPROBE(probe_gnutls_recv_exit) {
             event->buf_filled = buf_copy_size;
         }
     }
+
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
 
     // Submit event
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
@@ -622,6 +652,9 @@ int BPF_URETPROBE(probe_nss_write_exit) {
         }
     }
 
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
+
     // Submit event
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
@@ -709,6 +742,9 @@ int BPF_URETPROBE(probe_nss_read_exit) {
         }
     }
 
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
+
     // Submit event
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
@@ -719,6 +755,54 @@ int BPF_URETPROBE(probe_nss_read_exit) {
     // Cleanup
     bpf_map_delete_elem(&ssl_args_map, &tid);
     bpf_map_delete_elem(&start_ns, &tid);
+
+    return 0;
+}
+
+// =============================================================================
+// Process Exit Tracepoint
+// Notifies userspace when a tracked process exits for session cleanup
+// =============================================================================
+
+SEC("tracepoint/sched/sched_process_exit")
+int handle_process_exit(void *ctx) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = pid_tgid >> 32;
+
+    // Only emit event if this PID had SSL activity
+    __u8 *tracked = bpf_map_lookup_elem(&tracked_pids, &pid);
+    if (!tracked) {
+        return 0;  // Not a tracked PID, ignore
+    }
+
+    // Remove from tracking map
+    bpf_map_delete_elem(&tracked_pids, &pid);
+
+    __u32 zero = 0;
+
+    // Get event buffer from per-CPU heap
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        return 0;
+    }
+
+    // Fill basic metadata
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = pid;
+    event->tid = (__u32)pid_tgid;
+    event->uid = (__u32)bpf_get_current_uid_gid();
+    event->event_type = EVENT_PROCESS_EXIT;
+    event->len = 0;
+    event->buf_filled = 0;
+    event->delta_ns = 0;
+    event->ssl_ctx = 0;
+
+    // Get process name
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    // Submit event (small, no buffer data)
+    bpf_ringbuf_output(&ssl_events, event,
+                       sizeof(struct ssl_data_event) - MAX_BUF_SIZE, 0);
 
     return 0;
 }

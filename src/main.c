@@ -189,6 +189,19 @@ static void cleanup_pending_bodies(void) {
     }
 }
 
+/* Cleanup pending body buffers for a specific PID (process exit) */
+static void cleanup_pending_bodies_pid(uint32_t pid) {
+    for (int i = 0; i < MAX_PENDING_BODIES; i++) {
+        if (g_pending_bodies[i].active && g_pending_bodies[i].pid == pid) {
+            if (g_pending_bodies[i].accum_buf) {
+                free(g_pending_bodies[i].accum_buf);
+                g_pending_bodies[i].accum_buf = NULL;
+            }
+            g_pending_bodies[i].active = false;
+        }
+    }
+}
+
 /* Master cleanup function registered with atexit() */
 static void cleanup_all_resources(void) {
     /* Cleanup probe handler (ring buffer) */
@@ -237,6 +250,13 @@ static void setup_signals(void) {
 /* Event processing callback */
 static void process_event(const ssl_data_event_t *event, void *ctx) {
     (void)ctx;
+
+    /* Handle process exit events - cleanup resources */
+    if (event->event_type == EVENT_PROCESS_EXIT) {
+        http2_cleanup_pid(event->pid);
+        cleanup_pending_bodies_pid(event->pid);
+        return;
+    }
 
     /* Handle handshake events (no buffer data) */
     if (event->event_type == EVENT_HANDSHAKE) {
@@ -640,26 +660,37 @@ int main(int argc, char **argv) {
     printf("%s╚════════════════════════════════════════╝%s\n\n",
            display_color(C_CYAN), display_color(C_RESET));
 
-    /* Find SSL libraries */
-    if (use_openssl && bpf_loader_find_library("libssl.so", openssl_path, sizeof(openssl_path)) == 0) {
+    /* Find SSL libraries - use dynamic discovery if PIDs specified */
+    int *discovery_pids = (num_target_pids > 0) ? target_pids : NULL;
+    int discovery_pid_count = num_target_pids;
+
+    if (use_openssl && bpf_loader_find_library_dynamic("libssl.so", openssl_path,
+                                                        sizeof(openssl_path),
+                                                        discovery_pids, discovery_pid_count) == 0) {
         printf("  %s✓%s OpenSSL: %s\n",
                display_color(C_GREEN), display_color(C_RESET), openssl_path);
     } else {
         openssl_path[0] = '\0';
     }
 
-    if (use_gnutls && bpf_loader_find_library("libgnutls.so", gnutls_path, sizeof(gnutls_path)) == 0) {
+    if (use_gnutls && bpf_loader_find_library_dynamic("libgnutls.so", gnutls_path,
+                                                       sizeof(gnutls_path),
+                                                       discovery_pids, discovery_pid_count) == 0) {
         printf("  %s✓%s GnuTLS:  %s\n",
                display_color(C_GREEN), display_color(C_RESET), gnutls_path);
     } else {
         gnutls_path[0] = '\0';
     }
 
-    if (use_nss && bpf_loader_find_library("libnspr4.so", nss_path, sizeof(nss_path)) == 0) {
+    if (use_nss && bpf_loader_find_library_dynamic("libnspr4.so", nss_path,
+                                                    sizeof(nss_path),
+                                                    discovery_pids, discovery_pid_count) == 0) {
         printf("  %s✓%s NSS:     %s\n",
                display_color(C_GREEN), display_color(C_RESET), nss_path);
         /* Also find libssl3.so for NSS handshake probes */
-        if (bpf_loader_find_library("libssl3.so", nss_ssl_path, sizeof(nss_ssl_path)) == 0) {
+        if (bpf_loader_find_library_dynamic("libssl3.so", nss_ssl_path,
+                                             sizeof(nss_ssl_path),
+                                             discovery_pids, discovery_pid_count) == 0) {
             printf("  %s✓%s NSS SSL: %s\n",
                    display_color(C_GREEN), display_color(C_RESET), nss_ssl_path);
         }
@@ -754,6 +785,14 @@ int main(int argc, char **argv) {
                                     "probe_ssl_handshake_enter", false, debug_mode);
             bpf_loader_attach_uprobe(&g_loader, nss_ssl_path, "SSL_ForceHandshake",
                                     "probe_ssl_handshake_exit", true, debug_mode);
+        }
+    }
+
+    /* Attach process exit tracepoint for session cleanup */
+    if (bpf_loader_attach_tracepoint(&g_loader, "sched", "sched_process_exit",
+                                      "handle_process_exit", debug_mode) == 0) {
+        if (debug_mode) {
+            printf("  [DEBUG] Process exit tracepoint attached\n");
         }
     }
 

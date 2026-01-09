@@ -213,6 +213,29 @@ void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id) {
     }
 }
 
+/* Forward declaration for cleanup */
+static void h2_connection_cleanup(h2_connection_t *conn);
+
+void http2_cleanup_pid(uint32_t pid) {
+    /* Free all streams for this PID */
+    for (int i = 0; i < MAX_H2_STREAMS; i++) {
+        if (g_h2_streams[i].active && g_h2_streams[i].pid == pid) {
+            if (g_h2_streams[i].body_buf) {
+                free(g_h2_streams[i].body_buf);
+                g_h2_streams[i].body_buf = NULL;
+            }
+            g_h2_streams[i].active = false;
+        }
+    }
+
+    /* Free all connections for this PID */
+    for (int i = 0; i < MAX_H2_SESSIONS; i++) {
+        if (g_h2_connections[i].active && g_h2_connections[i].pid == pid) {
+            h2_connection_cleanup(&g_h2_connections[i]);
+        }
+    }
+}
+
 /* nghttp2 callbacks */
 static int on_begin_headers_callback(nghttp2_session *session,
                                      const nghttp2_frame *frame,
@@ -1381,6 +1404,10 @@ void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id) {
     (void)pid;
     (void)ssl_ctx;
     (void)stream_id;
+}
+
+void http2_cleanup_pid(uint32_t pid) {
+    (void)pid;
 }
 
 #endif /* HAVE_NGHTTP2 */

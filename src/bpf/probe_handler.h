@@ -34,7 +34,8 @@
 enum event_type {
     EVENT_SSL_READ = 0,
     EVENT_SSL_WRITE = 1,
-    EVENT_HANDSHAKE = 2
+    EVENT_HANDSHAKE = 2,
+    EVENT_PROCESS_EXIT = 3
 };
 
 /* SSL data event from BPF (must match BPF side) */
