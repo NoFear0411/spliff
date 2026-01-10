@@ -1,277 +1,419 @@
-# sslsniff - eBPF SSL/TLS Traffic Sniffer
+# sslsniff
 
-**Version 0.3.0**
+eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic.
 
-Capture and display decrypted HTTPS traffic using eBPF uprobes. Intercepts SSL/TLS library calls to show plaintext HTTP/1.1 and HTTP/2 traffic with full header parsing, body decompression, and smart content display.
+sslsniff intercepts SSL library calls using eBPF uprobes to capture plaintext HTTP/1.1 and HTTP/2 traffic with full header parsing, body decompression, and smart content detection.
 
 ## Features
 
 ### SSL/TLS Library Support
-- **OpenSSL** - `SSL_read`/`SSL_write` and `SSL_read_ex`/`SSL_write_ex`
-- **GnuTLS** - `gnutls_record_recv`/`gnutls_record_send`
-- **NSS/NSPR** - `PR_Read`/`PR_Write`/`PR_Recv`/`PR_Send`
+- **OpenSSL**: `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex`
+- **GnuTLS**: `gnutls_record_recv`, `gnutls_record_send`
+- **NSS/NSPR**: `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send`, `SSL_ForceHandshake`
+- **WolfSSL**: `wolfSSL_read`, `wolfSSL_write`
 
-### Protocol Support
-- **HTTP/1.1** - Full header parsing via llhttp, chunked transfer decoding, body aggregation
-- **HTTP/2** - Full nghttp2 integration with HPACK decompression, stream tracking, frame reassembly
+### ALPN Protocol Detection
+Hook ALPN negotiation functions for definitive HTTP/1.1 vs HTTP/2 detection:
+- OpenSSL: `SSL_get0_alpn_selected`
+- GnuTLS: `gnutls_alpn_get_selected_protocol`
+- NSS: `SSL_GetNextProto`
+- WolfSSL: `wolfSSL_ALPN_GetProtocol`
+
+### HTTP Protocol Support
+- **HTTP/1.1**: Full header parsing via llhttp, chunked transfer encoding
+- **HTTP/2**: Frame parsing via nghttp2 with full HPACK decompression
+- Stream tracking with request/response correlation
+- Mid-connection detection for late-joining sessions
 
 ### Body Handling
-- **Automatic decompression** - gzip, deflate, zstd (optional), brotli (optional)
-- **Smart content display** - Shows text content, detects binary via magic bytes
-- **40+ file signatures** - JPEG, PNG, GIF, WebP, PDF, MP4, ZIP, WASM, and more
-- **Request/response correlation** - Links bodies to their originating requests
+- **Decompression**: gzip, deflate (always), zstd, brotli (optional)
+- **Content Detection**: 40+ file format signatures via magic bytes
+- Smart text vs binary display
+- Body accumulation for multi-packet responses
+
+### Filtering
+- Filter by PID(s): `-p 1234` or `-p 1234,5678`
+- Filter by parent PID: `--ppid 1234` (traverses process tree)
+- Filter by process name: `--comm curl` (checks executable path too)
+- Filter by SSL library: `--openssl`, `--gnutls`, `--nss`
+- Filter IPC traffic: `--filter-ipc` (reduces browser noise)
 
 ### Output Features
-- **Colored output** - Requests (cyan), responses (green/yellow/red by status)
-- **Timestamps** - Millisecond precision on all events
-- **Latency measurement** - Shows request→response time for HTTP/1.1
-- **Flexible filtering** - By PID, process name, parent PID, or SSL library
+- Colored terminal output (disable with `-C`)
+- Millisecond timestamps
+- SSL operation latency (`-l`)
+- TLS handshake events with duration (`-H`)
+- Compact mode (`-c`) and body display (`-b`)
+- Debug/hexdump mode (`-d`, `-x`)
 
-## Building
+### Advanced Features
+- **Dynamic Library Discovery**: Finds SSL libraries via `/proc/PID/maps`
+- **Container Support**: Works with Flatpak/Snap bundled libraries
+- **Firefox Support**: Static paths for bundled NSS libraries
+- **Connection Tracking**: Isolates sessions by `(PID, ssl_ctx)` tuple
+- **Process Exit Cleanup**: BPF tracepoint cleans up when processes die
 
-### Quick Start
+## Requirements
 
-```bash
-# Configure and build
-mkdir build && cd build
-cmake ..
-make
+### System Requirements
+- Linux kernel 5.x+ with BTF support (`/sys/kernel/btf/vmlinux`)
+- Root privileges or `CAP_BPF` + `CAP_PERFMON` capabilities
+- x86_64 or aarch64 architecture
 
-# Or use the Makefile wrapper
-make          # Debug build with sanitizers
-make release  # Optimized build (-O2, stripped)
-```
-
-### Build Options
-
-```bash
-# CMake options
-cmake -DCMAKE_BUILD_TYPE=Release ..     # Release build
-cmake -DENABLE_SANITIZERS=OFF ..        # Disable sanitizers
-cmake -DENABLE_ZSTD=OFF ..              # Disable zstd support
-cmake -DENABLE_BROTLI=OFF ..            # Disable brotli support
-
-# Makefile wrapper targets
-make          # Debug build with sanitizers
-make release  # Optimized release build (stripped, no sanitizers)
-make relsan   # Optimized build with sanitizers (for testing)
-make clean    # Remove build artifacts
-make package  # Create .deb package
-make rpm      # Create .rpm package
-```
-
-### Dependencies
-
-**Required:**
+### Build Requirements
 - CMake 3.20+
-- clang (for BPF compilation)
-- libbpf-dev (or libbpf-devel)
-- libelf-dev (or elfutils-libelf-devel)
-- zlib1g-dev (or zlib-devel)
-- libllhttp-dev (or llhttp-devel) - HTTP/1.1 parsing
-- libnghttp2-dev (or nghttp2-devel) - HTTP/2 parsing
-- Linux kernel 5.x+ with BTF support
+- Clang (for BPF compilation)
+- C23-compatible compiler (GCC 14+ or Clang 16+)
 
-**Optional (auto-detected):**
-- libzstd-dev - Enables zstd decompression
-- libbrotli-dev - Enables brotli decompression
-- libasan, libubsan - Sanitizers for debug builds
+## Dependencies
 
-### Installing Dependencies
+### Required
+
+| Library | Purpose | Fedora/RHEL | Debian/Ubuntu |
+|---------|---------|-------------|---------------|
+| libbpf | BPF loading | `libbpf-devel` | `libbpf-dev` |
+| libelf | ELF parsing | `elfutils-libelf-devel` | `libelf-dev` |
+| zlib | gzip/deflate decompression | `zlib-devel` | `zlib1g-dev` |
+| llhttp | HTTP/1.1 parsing | `llhttp-devel` | `libllhttp-dev` |
+| nghttp2 | HTTP/2 parsing | `libnghttp2-devel` | `libnghttp2-dev` |
+| clang | BPF compilation | `clang` | `clang` |
+
+### Optional
+
+| Library | Purpose | Fedora/RHEL | Debian/Ubuntu |
+|---------|---------|-------------|---------------|
+| libzstd | zstd decompression | `libzstd-devel` | `libzstd-dev` |
+| libbrotli | brotli decompression | `brotli-devel` | `libbrotli-dev` |
+| libasan | AddressSanitizer | `libasan` | `libasan6` |
+| libubsan | UBSanitizer | `libubsan` | `libubsan1` |
+
+### Install All Dependencies
 
 **Fedora/RHEL:**
 ```bash
-sudo dnf install cmake clang libbpf-devel elfutils-libelf-devel zlib-devel \
-    llhttp-devel libnghttp2-devel libasan libubsan
+sudo dnf install libbpf-devel elfutils-libelf-devel zlib-devel \
+    llhttp-devel libnghttp2-devel clang cmake \
+    libzstd-devel brotli-devel
 ```
 
-**Ubuntu/Debian:**
+**Debian/Ubuntu:**
 ```bash
-sudo apt install cmake clang libbpf-dev libelf-dev zlib1g-dev \
-    libllhttp-dev libnghttp2-dev
+sudo apt install libbpf-dev libelf-dev zlib1g-dev \
+    libllhttp-dev libnghttp2-dev clang cmake \
+    libzstd-dev libbrotli-dev
+```
+
+## Building
+
+### Using Makefile Wrapper (Recommended)
+
+```bash
+make              # Debug build with sanitizers
+make release      # Optimized release build (stripped)
+make relsan       # Release build with sanitizers (for testing)
+make test         # Build and run tests
+make clean        # Remove build artifacts
+sudo make install # Install to /usr/local/bin
+```
+
+### Using CMake Directly
+
+```bash
+# Debug build
+cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+
+# Release build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# Install
+sudo cmake --install build
+```
+
+### CMake Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `CMAKE_BUILD_TYPE` | Debug | Build type (Debug/Release/RelWithSan) |
+| `ENABLE_SANITIZERS` | ON | Enable ASan/UBSan in debug builds |
+| `ENABLE_ZSTD` | ON | Enable zstd decompression |
+| `ENABLE_BROTLI` | ON | Enable brotli decompression |
+
+### Build Types
+
+| Type | Optimization | Sanitizers | Debug Info | Stripped |
+|------|--------------|------------|------------|----------|
+| Debug | -O0 | Yes | Yes | No |
+| Release | -O2 | No | No | Yes |
+| RelWithSan | -O2 | Yes | Yes | No |
+
+### Packaging
+
+```bash
+make package-deb  # Create Debian package
+make package-rpm  # Create RPM package
 ```
 
 ## Usage
 
-```bash
-# Capture all SSL/TLS traffic (all libraries)
-sudo ./sslsniff
+```
+sslsniff v0.5.0 - SSL/TLS Traffic Sniffer
 
-# Filter by process name
-sudo ./sslsniff --comm curl
-sudo ./sslsniff --comm firefox
+Usage: sslsniff [options]
 
-# Filter by PID(s)
-sudo ./sslsniff -p 12345
-sudo ./sslsniff -p 1234,5678,9012
+Filtering:
+  -p, --pid PID   Filter by PID(s), comma-separated
+  --ppid PID      Filter by parent PID (captures all children)
+  --comm NAME     Filter by process name or executable path
 
-# Filter by parent PID (useful for Firefox/Chrome with multiple processes)
-sudo ./sslsniff --ppid 12345
+Library Selection:
+  --openssl       Only attach to OpenSSL
+  --gnutls        Only attach to GnuTLS
+  --nss           Only attach to NSS
 
-# Specific SSL library only
-sudo ./sslsniff --openssl
-sudo ./sslsniff --nss --comm firefox
-sudo ./sslsniff --gnutls
+Display:
+  -b              Show response/request bodies
+  -c              Compact mode (hide headers)
+  -l              Show latency (SSL operation time)
+  -H              Show TLS handshake events
+  -d              Debug mode (verbose output)
+  -C              Disable colored output
 
-# Show response/request bodies
-sudo ./sslsniff -b --comm curl
+Advanced:
+  --filter-ipc    Filter out IPC/internal browser traffic
+  --show-libs     Show all discovered SSL libraries
 
-# Compact mode (headers hidden)
-sudo ./sslsniff -c --comm curl
-
-# Debug mode (show raw data hexdump)
-sudo ./sslsniff -d --comm curl
-
-# Combine options
-sudo ./sslsniff --nss --ppid 12345 -b -c
+Other:
+  -v, --version   Show version
+  -h, --help      Show this help
 ```
 
-## Command Line Options
+## Examples
 
-| Option | Long Form | Description |
-|--------|-----------|-------------|
-| `-p` | `--pid` | Filter by PID(s), comma-separated |
-| | `--ppid` | Filter by parent PID (captures all children) |
-| | `--comm` | Filter by process name (exact match) |
-| | `--openssl` | Attach to OpenSSL only |
-| | `--gnutls` | Attach to GnuTLS only |
-| | `--nss` | Attach to NSS/NSPR only |
-| `-b` | `--body` | Show request/response bodies |
-| `-c` | `--compact` | Hide HTTP headers |
-| `-d` | `--debug` | Show raw data hexdump |
-| `-x` | `--hexdump` | Alias for --debug |
-| `-C` | `--no-color` | Disable colored output |
-| `-h` | `--help` | Show help message |
+### Basic Usage
+
+```bash
+# Capture all HTTPS traffic
+sudo sslsniff
+
+# Capture traffic from a specific process
+sudo sslsniff --comm curl
+
+# Capture traffic from specific PIDs
+sudo sslsniff -p 1234,5678
+
+# Capture Firefox and all child processes
+sudo sslsniff --ppid $(pgrep -f firefox) --nss
+```
+
+### Display Options
+
+```bash
+# Show request/response bodies
+sudo sslsniff -b
+
+# Show SSL operation latency
+sudo sslsniff -l
+
+# Show TLS handshake events
+sudo sslsniff -H
+
+# Compact mode (headers hidden)
+sudo sslsniff -c
+
+# Combine options
+sudo sslsniff -b -l -H --comm curl
+```
+
+### Browser Traffic
+
+```bash
+# Firefox (uses NSS)
+sudo sslsniff --nss --comm firefox
+
+# Firefox with IPC filtering (cleaner output)
+sudo sslsniff --nss --comm firefox --filter-ipc
+
+# Chrome/Chromium (uses OpenSSL)
+sudo sslsniff --openssl --comm chrome
+```
+
+### Library Discovery
+
+```bash
+# Show all discovered SSL libraries
+sudo sslsniff --show-libs
+```
 
 ## Output Examples
 
 ### HTTP/1.1 Request/Response
+
 ```
-14:32:15.123 ▶ GET https://api.example.com/users [HTTP/1.1] curl (PID 12345)
+14:32:15.123 ← GET https://api.example.com/users HTTP/1.1 curl (12345)
   Host: api.example.com
   User-Agent: curl/8.0.0
   Accept: application/json
 
-14:32:15.234 ◀ 200 OK (application/json) [1234 bytes] [111ms] curl (PID 12345)
+14:32:15.234 → 200 OK (application/json) [1234 bytes] [111ms] curl (12345)
   Content-Type: application/json
   Content-Encoding: gzip
   Content-Length: 567
 ```
 
-### HTTP/2 with Body Display
+### HTTP/2 with Body
+
 ```
-14:32:15.345 ▶ GET https://example.com/data.json [H2 stream=1] curl (PID 12345)
+14:32:15.345 ← GET https://example.com/data.json HTTP/2 curl (12345)
   :authority: example.com
   :path: /data.json
   accept: application/json
 
-14:32:15.456 ◀ 200 (application/json) [256 bytes] [H2 stream=1]
-14:32:15.456 ◀ BODY (application/json) [stream=1] ← GET example.com/data.json
-  --- Body (256 bytes, was 512 gzip) ---
-  {"status":"ok","data":[1,2,3]}
+14:32:15.456 → 200 (application/json) [256 bytes] [H2 stream=1]
+─── Body ───
+{"status":"ok","data":[1,2,3]}
+────────────
 ```
 
-### Binary Content Detection
-```
-14:32:15.567 ◀ 200 (image/jpeg) [45678 bytes] [H2 stream=3]
-14:32:15.567 ◀ BODY (image/jpeg) [stream=3] ← GET example.com/photo.jpg
-  --- Body (45678 bytes) [JPEG image] ---
-```
+### TLS Handshake
 
-### TLS Handshake Detection
 ```
-14:32:15.100 ◆ TLS HANDSHAKE curl (PID 12345) → api.example.com:443
+14:32:15.100 🔒 TLS handshake complete [2.54ms] curl (12345)
 ```
 
-## How It Works
+### ALPN Detection
 
-1. **eBPF Uprobes** - Attaches to SSL library functions at runtime
-2. **Plaintext Capture** - Intercepts data after decryption (read) and before encryption (write)
-3. **Protocol Detection** - Identifies HTTP/1.1 vs HTTP/2 via connection preface
-4. **Header Parsing** - Parses text headers (HTTP/1.1) or HPACK-compressed headers (HTTP/2)
-5. **Body Handling** - Aggregates chunked/streamed data, decompresses, detects content type
-6. **Smart Display** - Shows text content, summarizes binary with file type detection
+```
+14:32:15.050 📋 ALPN: h2 selected curl (12345)
+```
 
-## File Signature Detection
+## File Signatures Supported
 
-Binary content is identified by magic bytes before display. Supported formats:
+sslsniff detects 40+ binary file formats via magic bytes:
 
-| Category | Formats |
-|----------|---------|
-| Images | JPEG, PNG, GIF, WebP, BMP, ICO, AVIF, HEIC |
-| Video | MP4, MOV, WebM, AVI, M4V |
-| Audio | MP3, OGG, FLAC, WAV, M4A |
-| Archives | ZIP, GZIP, ZSTD, 7-Zip, RAR, XZ, BZ2 |
-| Documents | PDF |
-| Fonts | WOFF, WOFF2, TTF, OTF |
-| Binary | WebAssembly, ELF, Mach-O, Java class, SQLite |
+- **Images**: JPEG, PNG, GIF87/89, WebP, BMP, ICO, AVIF, HEIC
+- **Video**: MP4, MOV, WebM, AVI, M4V, QuickTime
+- **Audio**: MP3, OGG, FLAC, WAV, M4A
+- **Archives**: ZIP, GZIP, ZSTD, 7-Zip, RAR, XZ, BZ2
+- **Documents**: PDF
+- **Fonts**: WOFF, WOFF2, TTF, OTF
+- **Binary**: WebAssembly, ELF, Mach-O, Java class, SQLite
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                              main.c                                  │
+│           (CLI parsing, initialization, event loop, cleanup)         │
+└─────────────────────────────────┬───────────────────────────────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        │                         │                         │
+        ▼                         ▼                         ▼
+┌───────────────┐       ┌─────────────────┐       ┌─────────────────┐
+│   bpf/        │       │   protocol/     │       │   output/       │
+│ ───────────── │       │ ─────────────── │       │ ─────────────── │
+│ bpf_loader    │──────▶│ http1 (llhttp)  │──────▶│ display         │
+│ probe_handler │       │ http2 (nghttp2) │       │ (formatting)    │
+│ sslsniff.bpf  │       └────────┬────────┘       └─────────────────┘
+└───────────────┘                │
+                    ┌────────────┴────────────┐
+                    │                         │
+                    ▼                         ▼
+             ┌─────────────┐           ┌─────────────┐
+             │ decompressor│           │ signatures  │
+             │ (content/)  │           │ (content/)  │
+             └─────────────┘           └─────────────┘
+```
 
 ## Known Limitations
 
-- **HPACK Dynamic Table** - Not maintained across frames (static table + Huffman only)
-- **NSS/Firefox** - Captures all NSPR I/O; internal IPC is filtered but some noise may appear
-- **Mid-connection capture** - May miss initial frames if attached after connection established
-- **HTTP/2 CONTINUATION** - Basic support only
-- **Kernel requirement** - Needs BTF-enabled kernel (most distros 5.x+)
+- HPACK dynamic table not maintained (static table only)
+- HTTP/2 CONTINUATION frames have basic support only
+- NSS captures all NSPR I/O (use `--filter-ipc` to reduce noise)
+- Requires kernel 5.x+ with BTF support
+- HTTP/3 (QUIC) not yet supported
 
-## Troubleshooting
+## Testing
 
-### "Failed to load BPF object"
-- Ensure kernel has BTF support: `ls /sys/kernel/btf/vmlinux`
-- Check kernel version: `uname -r` (needs 5.x+)
+```bash
+# Build and run all tests
+make test
 
-### "Failed to attach uprobe"
-- Verify library path exists: `ls /usr/lib/x86_64-linux-gnu/libssl.so*`
-- Check library has symbols: `nm -D /usr/lib/x86_64-linux-gnu/libssl.so.3 | grep SSL_read`
+# Run tests with verbose output
+cd build && ctest --output-on-failure
 
-### No output when traffic expected
-- Verify process is using expected SSL library
-- Try without filters first: `sudo ./sslsniff`
-- Use `--debug` to see raw data
-
-### Firefox showing garbage
-- Use `--ppid` with main Firefox PID for cleaner output
-- Internal IPC uses NSPR but isn't HTTP
-
-## Requirements
-
-- Linux kernel 5.x+ with BTF (`/sys/kernel/btf/vmlinux` must exist)
-- Root privileges or `CAP_BPF` + `CAP_PERFMON` capabilities
-- x86_64 or aarch64 architecture
-
-## Version History
-
-### v0.3.0 (2026-01-09)
-- Migrated to CMake build system
-- Re-licensed under GPL-3.0 (GPL-2.0 for BPF code)
-- C23 standard enforcement
-- Fixed `--comm` filter to check executable path (Firefox child processes now work)
-- Fixed `--ppid` filter to traverse full process tree
-- Fixed HTTP/2 mid-connection detection
-- Added `RelWithSan` build type (optimized + sanitizers)
-
-### v0.2.6 (2026-01-08)
-- Added NSS SSL_ForceHandshake probe for TLS handshake detection
-- Fixed HTTP/2 session detection for multi-process browsers
-
-### v0.2.0 (2026-01-07)
-- Modular code architecture (split from monolithic single-file)
-- Integrated llhttp library for HTTP/1.1 parsing
-- Integrated nghttp2 library for HTTP/2 parsing
-- Memory-safe string utilities (C23)
-
-### v0.1.0 (2025-01-05)
-- Initial stable release
-- OpenSSL, GnuTLS, NSS support
-- HTTP/1.1 and HTTP/2 parsing
-- HPACK with Huffman decoding
-- gzip/deflate/zstd/brotli decompression
-- Smart body display with 40+ file signatures
-- PID, PPID, and process name filtering
-- Colored output with timestamps
+# Run specific test
+./build/test_http1
+./build/test_http2
+```
 
 ## License
 
-GPL-3.0-only (userspace code) / GPL-2.0-only (BPF kernel code)
+- **Userspace code**: GPL-3.0-only
+- **BPF kernel code**: GPL-2.0-only
 
-See [LICENSE](LICENSE) for details.
+```
+sslsniff - eBPF-based SSL/TLS traffic sniffer
+Copyright (C) 2025-2026 sslsniff authors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, version 3 of the License.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+```
+
+## Version History
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
+
+### v0.5.0 (2026-01-10)
+- ALPN protocol detection for all SSL libraries
+- IPC/internal traffic filtering (`--filter-ipc`)
+- Enhanced process scanner with `--show-libs`
+- WolfSSL library support
+- Firefox bundled library path discovery
+
+### v0.4.0 (2026-01-09)
+- Process exit handler for cleanup
+- Dynamic library discovery via `/proc/PID/maps`
+- SSL context connection tracking `(PID, ssl_ctx)`
+
+### v0.3.0 (2026-01-09)
+- CMake build system migration
+- GPL-3.0 licensing with SPDX identifiers
+- C23 standard with comprehensive safety fixes
+- Fixed `--comm` and `--ppid` filters
+- HTTP/2 mid-connection detection
+- Security: Fixed command injection vulnerability
+
+### v0.2.x (2026-01-08)
+- TLS handshake detection (`-H`)
+- Latency measurement (`-l`)
+- NSS PR_Send/PR_Recv probes
+- Multi-event body tracking
+
+### v0.1.0 (2025-01-05)
+- Initial release with OpenSSL, GnuTLS, NSS support
+- HTTP/1.1 and HTTP/2 parsing
+- Decompression and file signature detection
+
+## Contributing
+
+Contributions are welcome. Please ensure:
+- Code follows the existing style (C23, GNU extensions)
+- All tests pass (`make test`)
+- No sanitizer warnings in debug builds
+- Commits are signed off
+
+## Related Projects
+
+- [bcc](https://github.com/iovisor/bcc) - BPF Compiler Collection
+- [libbpf](https://github.com/libbpf/libbpf) - BPF library
+- [llhttp](https://github.com/nodejs/llhttp) - HTTP/1.1 parser
+- [nghttp2](https://github.com/nghttp2/nghttp2) - HTTP/2 library
