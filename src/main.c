@@ -707,8 +707,25 @@ int main(int argc, char **argv) {
     }
     g_bpf_initialized = true;
 
-    /* Load BPF program */
-    if (bpf_loader_load(&g_loader, "src/bpf/sslsniff.bpf.o") < 0) {
+    /* Load BPF program - try multiple paths */
+    static const char *bpf_paths[] = {
+        "build/sslsniff.bpf.o",           /* CMake build directory */
+        "sslsniff.bpf.o",                 /* Current directory */
+        "src/bpf/sslsniff.bpf.o",         /* Source directory (legacy) */
+        "/usr/lib/sslsniff/sslsniff.bpf.o", /* Installed path */
+        NULL
+    };
+    int bpf_loaded = 0;
+    for (const char **path = bpf_paths; *path; path++) {
+        if (bpf_loader_load(&g_loader, *path) == 0) {
+            if (debug_mode) {
+                printf("  [DEBUG] Loaded BPF program from %s\n", *path);
+            }
+            bpf_loaded = 1;
+            break;
+        }
+    }
+    if (!bpf_loaded) {
         fprintf(stderr, "%sError:%s Cannot load BPF program\n",
                 display_color(C_RED), display_color(C_RESET));
         return 1;
