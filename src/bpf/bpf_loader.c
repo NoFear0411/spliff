@@ -133,7 +133,25 @@ static const char *lib_patterns[] = {
     [LIB_GNUTLS]  = "libgnutls.so",
     [LIB_NSS]     = "libnspr4.so",
     [LIB_NSS_SSL] = "libssl3.so",
+    [LIB_WOLFSSL] = "libwolfssl.so",
 };
+
+/* Library type names for display */
+static const char *lib_type_names[] = {
+    [LIB_OPENSSL] = "OpenSSL",
+    [LIB_GNUTLS]  = "GnuTLS",
+    [LIB_NSS]     = "NSS",
+    [LIB_NSS_SSL] = "NSS-SSL",
+    [LIB_WOLFSSL] = "WolfSSL",
+};
+
+/* Get library type name */
+const char *bpf_loader_lib_type_name(lib_type_t type) {
+    if (type >= 0 && type < LIB_TYPE_COUNT) {
+        return lib_type_names[type];
+    }
+    return "Unknown";
+}
 
 /* Check if path matches a library pattern and return type */
 static int match_library_pattern(const char *path, lib_type_t *out_type) {
@@ -146,6 +164,29 @@ static int match_library_pattern(const char *path, lib_type_t *out_type) {
     return -1;
 }
 
+/* Check if path is already in extended results for a type */
+static bool path_already_tracked(lib_discovery_result_t *result, lib_type_t type, const char *path) {
+    lib_paths_t *ext = &result->extended[type];
+    for (int i = 0; i < ext->path_count; i++) {
+        if (strcmp(ext->paths[i], path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Add path to extended results */
+static void add_extended_path(lib_discovery_result_t *result, lib_type_t type, const char *path) {
+    lib_paths_t *ext = &result->extended[type];
+    if (ext->path_count < MAX_PATHS_PER_TYPE) {
+        strncpy(ext->paths[ext->path_count], path, 511);
+        ext->paths[ext->path_count][511] = '\0';
+        ext->path_count++;
+        ext->found = true;
+        result->total_unique_paths++;
+    }
+}
+
 /* Parse /proc/PID/maps to find loaded SSL libraries */
 static int parse_proc_maps(int pid, lib_discovery_result_t *result) {
     char maps_path[64];
@@ -153,6 +194,9 @@ static int parse_proc_maps(int pid, lib_discovery_result_t *result) {
 
     FILE *f = fopen(maps_path, "r");
     if (!f) return -1;
+
+    result->processes_scanned++;
+    bool found_ssl = false;
 
     char line[1024];
     while (fgets(line, sizeof(line), f)) {
@@ -168,20 +212,84 @@ static int parse_proc_maps(int pid, lib_discovery_result_t *result) {
         /* Check if this is a library we care about */
         lib_type_t lib_type;
         if (match_library_pattern(pathname, &lib_type) == 0) {
-            /* Only store if not already found (first occurrence wins) */
+            found_ssl = true;
+
+            /* Quick lookup (first path found per type) - backward compatible */
             if (!result->libs[lib_type].found) {
                 strncpy(result->libs[lib_type].path, pathname,
                         sizeof(result->libs[lib_type].path) - 1);
                 result->libs[lib_type].path[sizeof(result->libs[lib_type].path) - 1] = '\0';
                 result->libs[lib_type].type = lib_type;
                 result->libs[lib_type].found = true;
+                result->libs[lib_type].process_count = 1;
                 result->count++;
+
+                /* Also add to extended paths */
+                add_extended_path(result, lib_type, pathname);
+            } else {
+                /* Already have this type, increment process count for primary */
+                result->libs[lib_type].process_count++;
+
+                /* Track additional unique paths */
+                if (!path_already_tracked(result, lib_type, pathname)) {
+                    add_extended_path(result, lib_type, pathname);
+                }
             }
         }
     }
 
+    if (found_ssl) {
+        result->processes_with_ssl++;
+    }
+
     fclose(f);
     return 0;
+}
+
+/* Firefox bundled library paths to check */
+static const char *firefox_bundled_paths[] = {
+    "/usr/lib/firefox/libnspr4.so",
+    "/usr/lib/firefox/libssl3.so",
+    "/usr/lib/firefox/libnss3.so",
+    "/usr/lib64/firefox/libnspr4.so",
+    "/usr/lib64/firefox/libssl3.so",
+    "/usr/lib64/firefox/libnss3.so",
+    "/opt/firefox/libnspr4.so",
+    "/opt/firefox/libssl3.so",
+    "/snap/firefox/current/usr/lib/firefox/libnspr4.so",
+    "/snap/firefox/current/usr/lib/firefox/libssl3.so",
+    "/snap/core22/current/usr/lib/x86_64-linux-gnu/libssl.so.3",
+    NULL
+};
+
+/* Check for Firefox bundled libraries */
+static void check_firefox_bundled_libs(lib_discovery_result_t *result) {
+    for (int i = 0; firefox_bundled_paths[i] != NULL; i++) {
+        const char *path = firefox_bundled_paths[i];
+
+        /* Check if file exists */
+        if (access(path, F_OK) != 0) continue;
+
+        /* Determine library type */
+        lib_type_t lib_type;
+        if (match_library_pattern(path, &lib_type) != 0) continue;
+
+        /* Add if not already tracked */
+        if (!path_already_tracked(result, lib_type, path)) {
+            add_extended_path(result, lib_type, path);
+
+            /* Also update primary if not set */
+            if (!result->libs[lib_type].found) {
+                strncpy(result->libs[lib_type].path, path,
+                        sizeof(result->libs[lib_type].path) - 1);
+                result->libs[lib_type].path[sizeof(result->libs[lib_type].path) - 1] = '\0';
+                result->libs[lib_type].type = lib_type;
+                result->libs[lib_type].found = true;
+                result->libs[lib_type].process_count = 0;  /* Static discovery */
+                result->count++;
+            }
+        }
+    }
 }
 
 /* Discover SSL libraries from running processes */
@@ -211,15 +319,39 @@ int bpf_loader_discover_libraries(const int *pids, int pid_count,
             if (*endptr != '\0' || pid_long <= 0 || pid_long > INT_MAX) continue;
 
             parse_proc_maps((int)pid_long, result);
-
-            /* Early exit if we found all library types */
-            if (result->count >= LIB_TYPE_COUNT) break;
+            /* NOTE: No early exit - scan ALL processes for complete discovery */
         }
 
         closedir(proc);
     }
 
+    /* Also check Firefox bundled paths */
+    check_firefox_bundled_libs(result);
+
     return (result->count > 0) ? 0 : -1;
+}
+
+/* Print discovered libraries (for verbose output) */
+void bpf_loader_print_discovery(const lib_discovery_result_t *result) {
+    if (!result) return;
+
+    printf("SSL Library Discovery:\n");
+    printf("  Processes scanned: %d\n", result->processes_scanned);
+    printf("  Processes with SSL: %d\n", result->processes_with_ssl);
+    printf("  Unique library paths: %d\n", result->total_unique_paths);
+    printf("\n");
+
+    for (int type = 0; type < LIB_TYPE_COUNT; type++) {
+        const lib_paths_t *ext = &result->extended[type];
+        if (!ext->found) continue;
+
+        printf("  %s:\n", lib_type_names[type]);
+        for (int i = 0; i < ext->path_count; i++) {
+            const char *marker = (i == 0) ? "(primary)" : "";
+            printf("    %s %s\n", ext->paths[i], marker);
+        }
+    }
+    printf("\n");
 }
 
 /* Find library with dynamic discovery fallback */

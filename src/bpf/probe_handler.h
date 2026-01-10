@@ -35,7 +35,8 @@ enum event_type {
     EVENT_SSL_READ = 0,
     EVENT_SSL_WRITE = 1,
     EVENT_HANDSHAKE = 2,
-    EVENT_PROCESS_EXIT = 3
+    EVENT_PROCESS_EXIT = 3,
+    EVENT_ALPN = 4
 };
 
 /* SSL data event from BPF (must match BPF side) */
@@ -69,6 +70,7 @@ typedef struct {
     int target_ppid;
     int ppid_cache[PID_CACHE_SIZE];
     int ppid_cache_count;
+    bool filter_ipc;        /* Filter out IPC/Unix socket traffic */
 } probe_handler_t;
 
 /* Initialize probe handler - returns 0 on success, -1 on failure */
@@ -81,6 +83,7 @@ void probe_handler_set_callback(probe_handler_t *handler, event_callback_t callb
 void probe_handler_set_filter_comm(probe_handler_t *handler, const char *comm);
 void probe_handler_set_filter_pids(probe_handler_t *handler, int *pids, int count);
 void probe_handler_set_filter_ppid(probe_handler_t *handler, int ppid);
+void probe_handler_set_filter_ipc(probe_handler_t *handler, bool filter);
 
 /* Setup ring buffer from BPF object - returns 0 on success, -1 on failure */
 [[nodiscard]] int probe_handler_setup_ringbuf(probe_handler_t *handler, struct bpf_object *obj);

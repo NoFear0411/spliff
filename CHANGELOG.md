@@ -2,6 +2,40 @@
 
 All notable changes to sslsniff will be documented in this file.
 
+## [0.5.0] - 2026-01-10
+
+### Added
+- **ALPN Protocol Detection**: Hook ALPN negotiation functions for definitive HTTP/1.1 vs HTTP/2 detection
+  - OpenSSL: `SSL_get0_alpn_selected`
+  - GnuTLS: `gnutls_alpn_get_selected_protocol`
+  - NSS: `SSL_GetNextProto`
+  - WolfSSL: `wolfSSL_ALPN_GetProtocol`
+  - ALPN events display negotiated protocol before data transfer begins
+
+- **IPC/Internal Traffic Filtering**: New `--filter-ipc` option to reduce browser noise
+  - Content-based detection (HTTP signatures vs binary data ratio)
+  - Known internal thread pattern filtering (Cache2 I/O, Timer, Socket Thread, etc.)
+  - Filters non-HTTP traffic from multi-process browsers like Firefox
+
+- **Enhanced Process Scanner**: Comprehensive SSL library discovery
+  - Scans ALL running processes (removed early-exit limitation)
+  - Tracks multiple unique library paths per type
+  - New `--show-libs` option displays discovery statistics
+  - Reports: processes scanned, SSL-enabled processes, unique paths found
+
+- **WolfSSL Support**: Added support for wolfSSL library
+  - Automatic discovery of `libwolfssl.so`
+  - Hooks for `wolfSSL_read` and `wolfSSL_write`
+
+- **Firefox Bundled Library Paths**: Static path discovery for Firefox's bundled NSS
+  - `/usr/lib/firefox/`, `/usr/lib64/firefox/`
+  - `/opt/firefox/`
+  - `/snap/firefox/current/usr/lib/firefox/`
+
+### Changed
+- Library discovery now returns extended results with all unique paths per library type
+- `lib_discovery_result_t` structure expanded with statistics and multi-path tracking
+
 ## [0.4.0] - 2026-01-09
 
 ### Added

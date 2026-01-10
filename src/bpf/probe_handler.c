@@ -85,6 +85,94 @@ static bool is_descendant_of(int pid, int ancestor, int max_depth) {
     return false;
 }
 
+/* Known IPC/internal thread patterns */
+static const char *ipc_thread_patterns[] = {
+    "Cache2 I/O",       /* Firefox cache I/O */
+    "Timer",            /* Timer threads */
+    "LS Thread",        /* Firefox local storage */
+    "BgIOThr",          /* Background I/O threads */
+    "Socket Thread",    /* Generic socket threads */
+    "TaskScheduler",    /* Chromium task scheduler */
+    "Chrome_IOThread",  /* Chrome I/O thread */
+    "Compositor",       /* Compositor threads */
+    "GPU Process",      /* GPU process threads */
+    "AudioIPC",         /* Audio IPC threads */
+    "PaintThread",      /* Painting threads */
+    "DOM Worker",       /* Web workers */
+    "JS Helper",        /* JavaScript helpers */
+    "StyleThread",      /* Style computation threads */
+    NULL
+};
+
+/* Check if data looks like IPC/binary protocol rather than HTTP */
+static bool is_ipc_traffic(const ssl_data_event_t *e) {
+    if (e->buf_filled < 2) return true;  /* Too short to be HTTP */
+
+    const uint8_t *data = e->data;
+    size_t len = e->buf_filled;
+
+    /* Check for HTTP/1.x signatures */
+    if (len >= 4) {
+        /* Request methods */
+        if (memcmp(data, "GET ", 4) == 0 ||
+            memcmp(data, "POST", 4) == 0 ||
+            memcmp(data, "PUT ", 4) == 0 ||
+            memcmp(data, "HEAD", 4) == 0 ||
+            memcmp(data, "DELE", 4) == 0 ||  /* DELETE */
+            memcmp(data, "PATC", 4) == 0 ||  /* PATCH */
+            memcmp(data, "OPTI", 4) == 0) {  /* OPTIONS */
+            return false;  /* Looks like HTTP request */
+        }
+        /* Response status line */
+        if (memcmp(data, "HTTP", 4) == 0) {
+            return false;  /* Looks like HTTP response */
+        }
+    }
+
+    /* Check for HTTP/2 connection preface */
+    if (len >= 24 && memcmp(data, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0) {
+        return false;  /* HTTP/2 preface */
+    }
+
+    /* Check for HTTP/2 frame header (first byte should be frame length high byte,
+     * second and third are length, fourth is type 0x00-0x09) */
+    if (len >= 9) {
+        uint8_t frame_type = data[3];
+        uint32_t frame_len = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2];
+        if (frame_type <= 9 && frame_len <= 16384) {
+            /* Looks like a valid HTTP/2 frame */
+            return false;
+        }
+    }
+
+    /* Check for high concentration of non-printable bytes (binary data) */
+    int non_printable = 0;
+    size_t check_len = len > 64 ? 64 : len;  /* Check first 64 bytes */
+    for (size_t i = 0; i < check_len; i++) {
+        uint8_t c = data[i];
+        /* Non-printable and not common whitespace */
+        if (c < 0x20 && c != '\r' && c != '\n' && c != '\t') {
+            non_printable++;
+        }
+    }
+    /* If more than 30% non-printable, likely binary IPC */
+    if (non_printable * 100 / check_len > 30) {
+        return true;
+    }
+
+    return false;  /* Looks like it could be text/HTTP */
+}
+
+/* Check if comm name matches known internal thread patterns */
+static bool is_internal_thread(const char *comm) {
+    for (int i = 0; ipc_thread_patterns[i] != NULL; i++) {
+        if (strstr(comm, ipc_thread_patterns[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Refresh PPID cache (for --ppid filtering) - builds list of all descendants */
 static void refresh_ppid_cache(probe_handler_t *handler) {
     if (handler->target_ppid == 0) return;
@@ -163,13 +251,24 @@ static bool should_display(probe_handler_t *handler, const ssl_data_event_t *e) 
 
     if (!passes) return false;
 
-    /* Handshake events have no buffer data - always pass through */
-    if (e->event_type == EVENT_HANDSHAKE) return true;
+    /* Handshake and ALPN events have no buffer data - always pass through */
+    if (e->event_type == EVENT_HANDSHAKE || e->event_type == EVENT_ALPN) return true;
 
     /* Filter truly internal threads (non-HTTP traffic like file cache) */
     if (e->buf_filled <= 1) return false;
-    if (strstr(e->comm, "Cache2 I/O") || strstr(e->comm, "Timer") ||
-        strstr(e->comm, "LS Thread") || strstr(e->comm, "BgIOThr")) return false;
+
+    /* Enhanced IPC filtering (opt-in via --filter-ipc) */
+    if (handler->filter_ipc) {
+        /* Check for known internal thread patterns */
+        if (is_internal_thread(e->comm)) return false;
+
+        /* Check if data looks like IPC rather than HTTP */
+        if (is_ipc_traffic(e)) return false;
+    } else {
+        /* Basic internal thread filtering (always on) */
+        if (strstr(e->comm, "Cache2 I/O") || strstr(e->comm, "Timer") ||
+            strstr(e->comm, "LS Thread") || strstr(e->comm, "BgIOThr")) return false;
+    }
 
     return true;
 }
@@ -202,6 +301,7 @@ int probe_handler_init(probe_handler_t *handler) {
     handler->num_target_pids = 0;
     handler->target_ppid = 0;
     handler->ppid_cache_count = 0;
+    handler->filter_ipc = false;
 
     return 0;
 }
@@ -228,6 +328,11 @@ void probe_handler_set_filter_pids(probe_handler_t *handler, int *pids, int coun
 void probe_handler_set_filter_ppid(probe_handler_t *handler, int ppid) {
     if (!handler) return;
     handler->target_ppid = ppid;
+}
+
+void probe_handler_set_filter_ipc(probe_handler_t *handler, bool filter) {
+    if (!handler) return;
+    handler->filter_ipc = filter;
 }
 
 /* Setup ring buffer from BPF object */
