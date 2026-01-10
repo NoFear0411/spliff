@@ -630,6 +630,7 @@ static void print_usage(const char *prog) {
     printf("  --nss           Only attach to NSS\n");
     printf("  --filter-ipc    Filter out IPC/internal browser traffic\n");
     printf("  -b              Show response/request bodies\n");
+    printf("  -x              Show body as hexdump with file signature detection\n");
     printf("  -c              Compact mode (hide headers)\n");
     printf("  -l              Show latency (SSL operation time)\n");
     printf("  -H              Show TLS handshake events\n");
@@ -722,6 +723,9 @@ int main(int argc, char **argv) {
             g_config.debug_mode = true;
         } else if (strcmp(argv[i], "-b") == 0) {
             g_config.show_body = true;
+        } else if (strcmp(argv[i], "-x") == 0) {
+            g_config.show_body = true;
+            g_config.hexdump_body = true;
         } else if (strcmp(argv[i], "-c") == 0) {
             g_config.compact_mode = true;
         } else if (strcmp(argv[i], "-l") == 0) {
@@ -760,7 +764,10 @@ int main(int argc, char **argv) {
 
     /* Initialize modules */
     display_init(g_config.use_colors);
-    signatures_init();
+    if (signatures_init() != 0) {
+        fprintf(stderr, "Warning: Failed to initialize signature detection (memory allocation failure)\n");
+        /* Continue anyway - detection will work but signatures won't be in priority order */
+    }
     decompressor_init();
     http1_init();
     http2_init();

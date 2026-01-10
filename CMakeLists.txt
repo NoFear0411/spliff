@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(sslsniff
-    VERSION 0.5.1
+    VERSION 0.5.3
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/example/sslsniff"
     LANGUAGES C

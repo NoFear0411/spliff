@@ -2,6 +2,38 @@
 
 All notable changes to sslsniff will be documented in this file.
 
+## [0.5.3] - 2026-01-11
+
+### Added
+- **Enhanced File Signature Detection**: Expanded from ~27 to ~50 web-relevant signatures
+  - New formats: AVIF, HEIC, HEVC, M4A, M4B, 3GP, DASH, XZ, LZ4, BZIP2, FLV, TIFF, PSD, CUR
+  - Container format variants: RAR5, ZIP empty/spanned archives, multiple MP3 frame sync patterns
+  - Mach-O endianness variants, Android DEX files
+  - ISO Base Media File Format (ISOBMFF) brand detection for MP4/MOV/HEIC/AVIF variants
+
+- **File Class Categorization**: New `file_class_t` enum for semantic grouping
+  - Categories: Image, Video, Audio, Archive, Document, Font, Executable, Database, Container
+  - `signature_class_name()` API returns human-readable class names
+
+- **"Most Specific Wins" Matching**: Signatures sorted by magic length at initialization
+  - Uses qsort for automatic priority ordering (longest magic bytes first)
+  - Prevents short signatures from shadowing more specific ones
+
+- **Trailer Byte Validation**: Optional end-of-file signature verification
+  - PNG (IEND chunk), GIF (00 3B), JPEG (EOI marker), PDF (%%EOF)
+  - `signature_detect_full()` API with `validate_trailer` parameter
+  - Shows "(trailer mismatch)" warning when validation fails
+
+- **New CLI Option `-x`**: Hexdump body display with file signature detection
+  - Shows detected file type, class, and size in body header
+  - Always displays hex dump (16 bytes per line with ASCII)
+  - Implies `-b` (show body)
+
+### Changed
+- `signature_result_t` struct provides full detection metadata: description, class, is_binary, trailer_valid, confidence
+- Legacy `signature_detect()` API preserved for backward compatibility
+- Signature initialization checks return value and warns on failure
+
 ## [0.5.1] - 2026-01-11
 
 ### Fixed

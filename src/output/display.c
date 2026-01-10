@@ -18,6 +18,7 @@
  */
 
 #include "display.h"
+#include "../content/signatures.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -201,6 +202,12 @@ static bool is_printable_text(const uint8_t *data, size_t len) {
 void display_body(const uint8_t *data, size_t len, const char *content_type) {
     if (len == 0) return;
 
+    /* Delegate to hex display if -x flag is set */
+    if (g_config.hexdump_body) {
+        display_body_hex(data, len, content_type);
+        return;
+    }
+
     printf("%s─── Body ───%s\n", display_color(C_DIM), display_color(C_RESET));
 
     /* Determine if this is text content */
@@ -239,6 +246,68 @@ void display_body(const uint8_t *data, size_t len, const char *content_type) {
                    display_color(C_DIM), len - 512, display_color(C_RESET));
         }
     }
+    printf("%s────────────%s\n", display_color(C_DIM), display_color(C_RESET));
+}
+
+/* Display body with file signature detection and hexdump */
+void display_body_hex(const uint8_t *data, size_t len, const char *content_type) {
+    if (len == 0) return;
+
+    /* Detect file signature */
+    signature_result_t sig_result;
+    bool detected = signature_detect_full(data, len, true, &sig_result);
+
+    /* Print header with signature info */
+    printf("%s─── Body", display_color(C_DIM));
+
+    if (detected) {
+        /* Show: type [class] (confidence) */
+        printf(" │ %s%s%s [%s%s%s]",
+               display_color(C_CYAN), sig_result.description, display_color(C_DIM),
+               display_color(C_YELLOW), signature_class_name(sig_result.file_class),
+               display_color(C_DIM));
+
+        /* Show trailer validation status if applicable */
+        if (!sig_result.trailer_valid) {
+            printf(" %s(trailer mismatch)%s", display_color(C_RED), display_color(C_DIM));
+        }
+    } else if (content_type && content_type[0]) {
+        printf(" │ %s", content_type);
+    }
+
+    printf(" (%zu bytes) ───%s\n", len, display_color(C_RESET));
+
+    /* Always show hexdump in -x mode */
+    size_t print_len = len > 512 ? 512 : len;
+    for (size_t i = 0; i < print_len; i += 16) {
+        printf("%s%04zx%s  ", display_color(C_DIM), i, display_color(C_RESET));
+
+        /* Hex bytes */
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < print_len) {
+                printf("%02x ", data[i + j]);
+            } else {
+                printf("   ");
+            }
+            /* Extra space at 8-byte boundary */
+            if (j == 7) printf(" ");
+        }
+
+        printf(" ");
+
+        /* ASCII representation */
+        for (size_t j = 0; j < 16 && i + j < print_len; j++) {
+            uint8_t c = data[i + j];
+            printf("%c", (c >= 32 && c < 127) ? c : '.');
+        }
+        printf("\n");
+    }
+
+    if (len > 512) {
+        printf("%s... (%zu more bytes)%s\n",
+               display_color(C_DIM), len - 512, display_color(C_RESET));
+    }
+
     printf("%s────────────%s\n", display_color(C_DIM), display_color(C_RESET));
 }
 

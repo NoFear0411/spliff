@@ -25,7 +25,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define SSLSNIFF_VERSION "0.5.1"
+#define SSLSNIFF_VERSION "0.5.2"
 
 /* Debug logging macros - only active in DEBUG builds */
 #ifdef DEBUG
@@ -39,7 +39,7 @@
 #endif
 #define SSLSNIFF_VERSION_MAJOR 0
 #define SSLSNIFF_VERSION_MINOR 5
-#define SSLSNIFF_VERSION_PATCH 1
+#define SSLSNIFF_VERSION_PATCH 2
 
 /* Maximum sizes */
 #define MAX_HEADER_NAME     256
@@ -143,6 +143,7 @@ typedef struct {
     bool show_latency;
     bool show_handshake;
     bool hexdump_mode;
+    bool hexdump_body;      /* Show body as hexdump with signature detection (-x) */
     bool use_colors;
     bool filter_ipc;        /* Filter out IPC/Unix socket traffic */
     bool debug_mode;        /* Debug mode - show raw events */
