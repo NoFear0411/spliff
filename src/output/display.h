@@ -64,6 +64,9 @@ void display_http_headers(const http_message_t *msg);
 /* Display body content */
 void display_body(const uint8_t *data, size_t len, const char *content_type);
 
+/* Display body with file signature detection and hexdump */
+void display_body_hex(const uint8_t *data, size_t len, const char *content_type);
+
 /* Display TLS handshake event */
 void display_handshake(uint32_t pid, const char *comm, uint64_t delta_ns, int result);
 
