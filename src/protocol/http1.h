@@ -20,7 +20,7 @@
 #ifndef HTTP1_H
 #define HTTP1_H
 
-#include "../../include/sslsniff.h"
+#include "../include/sslsniff.h"
 #include <stdbool.h>
 
 /* Initialize HTTP/1.1 parser (llhttp-based) */

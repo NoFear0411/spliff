@@ -19,7 +19,7 @@
  * test_common.c - Common test infrastructure (provides g_config)
  */
 
-#include "../include/sslsniff.h"
+#include "../src/include/sslsniff.h"
 
 /* Global configuration - normally in main.c */
 config_t g_config = {

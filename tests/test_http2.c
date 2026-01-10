@@ -23,7 +23,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include "../include/sslsniff.h"
+#include "../src/include/sslsniff.h"
 #include "../src/protocol/http2.h"
 
 #define TEST(name) printf("TEST: %s... ", name)

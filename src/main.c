@@ -25,7 +25,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
-#include "../include/sslsniff.h"
+#include "include/sslsniff.h"
 #include "bpf/bpf_loader.h"
 #include "bpf/probe_handler.h"
 #include "output/display.h"

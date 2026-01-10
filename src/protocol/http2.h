@@ -20,7 +20,7 @@
 #ifndef HTTP2_H
 #define HTTP2_H
 
-#include "../../include/sslsniff.h"
+#include "../include/sslsniff.h"
 #include "../bpf/probe_handler.h"
 #include <stdbool.h>
 #include <stdint.h>
