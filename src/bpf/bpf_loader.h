@@ -27,6 +27,8 @@
 #include <bpf/bpf.h>
 
 #define MAX_LINKS 32
+#define MAX_DISCOVERED_LIBS 32   /* Maximum unique library paths to track */
+#define MAX_PATHS_PER_TYPE 8     /* Maximum paths per library type */
 
 /* BPF loader state */
 typedef struct {
@@ -50,6 +52,7 @@ typedef enum {
     LIB_GNUTLS,
     LIB_NSS,
     LIB_NSS_SSL,
+    LIB_WOLFSSL,
     LIB_TYPE_COUNT
 } lib_type_t;
 
@@ -58,12 +61,29 @@ typedef struct {
     char path[512];
     lib_type_t type;
     bool found;
+    int process_count;  /* Number of processes using this path */
 } discovered_lib_t;
 
-/* Discovery result - holds multiple library paths */
+/* Library paths for a single type (can have multiple paths) */
 typedef struct {
+    char paths[MAX_PATHS_PER_TYPE][512];
+    int path_count;
+    bool found;
+} lib_paths_t;
+
+/* Discovery result - holds multiple library paths per type */
+typedef struct {
+    /* Quick lookup by type (first path found) - backward compatible */
     discovered_lib_t libs[LIB_TYPE_COUNT];
     int count;
+
+    /* Extended: all unique paths per type */
+    lib_paths_t extended[LIB_TYPE_COUNT];
+
+    /* Statistics */
+    int processes_scanned;
+    int processes_with_ssl;
+    int total_unique_paths;
 } lib_discovery_result_t;
 
 /* Discover SSL libraries from running processes
@@ -104,6 +124,12 @@ struct bpf_object *bpf_loader_get_object(bpf_loader_t *loader);
 
 /* Get number of attached probes */
 int bpf_loader_get_link_count(bpf_loader_t *loader);
+
+/* Get library type name for display */
+const char *bpf_loader_lib_type_name(lib_type_t type);
+
+/* Print discovered libraries (for verbose output) */
+void bpf_loader_print_discovery(const lib_discovery_result_t *result);
 
 /* Cleanup BPF resources */
 void bpf_loader_cleanup(bpf_loader_t *loader);

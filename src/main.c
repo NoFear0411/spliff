@@ -269,6 +269,24 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
         return;
     }
 
+    /* Handle ALPN protocol negotiation events */
+    if (event->event_type == EVENT_ALPN) {
+        if (event->buf_filled > 0 && event->buf_filled <= 255) {
+            char alpn_proto[256] = {0};
+            memcpy(alpn_proto, event->data, event->buf_filled);
+
+            char proc_name[TASK_COMM_LEN] = {0};
+            get_process_name(event->pid, proc_name, sizeof(proc_name));
+            const char *name = proc_name[0] ? proc_name : event->comm;
+
+            printf("%s[ALPN: %s]%s PID %u (%s) ssl_ctx=0x%llx\n",
+                   display_color(C_YELLOW), alpn_proto,
+                   display_color(C_RESET), event->pid, name,
+                   (unsigned long long)event->ssl_ctx);
+        }
+        return;
+    }
+
     if (event->buf_filled == 0) return;
 
     const uint8_t *data = event->data;
@@ -525,11 +543,13 @@ static void print_usage(const char *prog) {
     printf("  --openssl       Only attach to OpenSSL\n");
     printf("  --gnutls        Only attach to GnuTLS\n");
     printf("  --nss           Only attach to NSS\n");
+    printf("  --filter-ipc    Filter out IPC/internal browser traffic\n");
     printf("  -b              Show response/request bodies\n");
     printf("  -c              Compact mode (hide headers)\n");
     printf("  -l              Show latency (SSL operation time)\n");
     printf("  -H              Show TLS handshake events\n");
     printf("  -d              Debug mode (verbose output)\n");
+    printf("  --show-libs     Show all discovered SSL libraries\n");
     printf("  -C              Disable colored output\n");
     printf("  -v, --version   Show version\n");
     printf("  -h, --help      Show this help\n");
@@ -545,10 +565,13 @@ int main(int argc, char **argv) {
     char gnutls_path[512] = {0};
     char nss_path[512] = {0};
     char nss_ssl_path[512] = {0};  /* libssl3.so for NSS handshake */
+    char wolfssl_path[512] = {0};  /* WolfSSL support */
     bool use_openssl = true;
     bool use_gnutls = true;
     bool use_nss = true;
+    bool use_wolfssl = true;       /* WolfSSL auto-detection */
     bool debug_mode = false;
+    bool show_libs = false;        /* Show all discovered libraries */
 
     /* Filter options */
     char target_comm[64] = {0};
@@ -625,6 +648,10 @@ int main(int argc, char **argv) {
             use_openssl = use_nss = false;
         } else if (strcmp(argv[i], "--nss") == 0) {
             use_openssl = use_gnutls = false;
+        } else if (strcmp(argv[i], "--filter-ipc") == 0) {
+            g_config.filter_ipc = true;
+        } else if (strcmp(argv[i], "--show-libs") == 0) {
+            show_libs = true;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -664,38 +691,77 @@ int main(int argc, char **argv) {
     int *discovery_pids = (num_target_pids > 0) ? target_pids : NULL;
     int discovery_pid_count = num_target_pids;
 
-    if (use_openssl && bpf_loader_find_library_dynamic("libssl.so", openssl_path,
-                                                        sizeof(openssl_path),
-                                                        discovery_pids, discovery_pid_count) == 0) {
-        printf("  %s✓%s OpenSSL: %s\n",
-               display_color(C_GREEN), display_color(C_RESET), openssl_path);
-    } else {
-        openssl_path[0] = '\0';
-    }
+    /* Run full discovery to get statistics */
+    lib_discovery_result_t discovery_result;
+    if (bpf_loader_discover_libraries(discovery_pids, discovery_pid_count, &discovery_result) == 0) {
+        if (show_libs || debug_mode) {
+            bpf_loader_print_discovery(&discovery_result);
+        }
 
-    if (use_gnutls && bpf_loader_find_library_dynamic("libgnutls.so", gnutls_path,
-                                                       sizeof(gnutls_path),
-                                                       discovery_pids, discovery_pid_count) == 0) {
-        printf("  %s✓%s GnuTLS:  %s\n",
-               display_color(C_GREEN), display_color(C_RESET), gnutls_path);
-    } else {
-        gnutls_path[0] = '\0';
-    }
+        /* Use discovered paths (primary path for each type) */
+        if (use_openssl && discovery_result.libs[LIB_OPENSSL].found) {
+            safe_strcpy(openssl_path, sizeof(openssl_path),
+                       discovery_result.libs[LIB_OPENSSL].path);
+            printf("  %s✓%s OpenSSL: %s\n",
+                   display_color(C_GREEN), display_color(C_RESET), openssl_path);
+        }
 
-    if (use_nss && bpf_loader_find_library_dynamic("libnspr4.so", nss_path,
-                                                    sizeof(nss_path),
-                                                    discovery_pids, discovery_pid_count) == 0) {
-        printf("  %s✓%s NSS:     %s\n",
-               display_color(C_GREEN), display_color(C_RESET), nss_path);
-        /* Also find libssl3.so for NSS handshake probes */
-        if (bpf_loader_find_library_dynamic("libssl3.so", nss_ssl_path,
-                                             sizeof(nss_ssl_path),
-                                             discovery_pids, discovery_pid_count) == 0) {
+        if (use_gnutls && discovery_result.libs[LIB_GNUTLS].found) {
+            safe_strcpy(gnutls_path, sizeof(gnutls_path),
+                       discovery_result.libs[LIB_GNUTLS].path);
+            printf("  %s✓%s GnuTLS:  %s\n",
+                   display_color(C_GREEN), display_color(C_RESET), gnutls_path);
+        }
+
+        if (use_nss && discovery_result.libs[LIB_NSS].found) {
+            safe_strcpy(nss_path, sizeof(nss_path),
+                       discovery_result.libs[LIB_NSS].path);
+            printf("  %s✓%s NSS:     %s\n",
+                   display_color(C_GREEN), display_color(C_RESET), nss_path);
+        }
+
+        if (use_nss && discovery_result.libs[LIB_NSS_SSL].found) {
+            safe_strcpy(nss_ssl_path, sizeof(nss_ssl_path),
+                       discovery_result.libs[LIB_NSS_SSL].path);
             printf("  %s✓%s NSS SSL: %s\n",
                    display_color(C_GREEN), display_color(C_RESET), nss_ssl_path);
         }
+
+        if (use_wolfssl && discovery_result.libs[LIB_WOLFSSL].found) {
+            safe_strcpy(wolfssl_path, sizeof(wolfssl_path),
+                       discovery_result.libs[LIB_WOLFSSL].path);
+            printf("  %s✓%s WolfSSL: %s\n",
+                   display_color(C_GREEN), display_color(C_RESET), wolfssl_path);
+        }
     } else {
-        nss_path[0] = '\0';
+        /* Fallback to individual lookups if full discovery fails */
+        if (use_openssl && bpf_loader_find_library_dynamic("libssl.so", openssl_path,
+                                                            sizeof(openssl_path),
+                                                            discovery_pids, discovery_pid_count) == 0) {
+            printf("  %s✓%s OpenSSL: %s\n",
+                   display_color(C_GREEN), display_color(C_RESET), openssl_path);
+        }
+
+        if (use_gnutls && bpf_loader_find_library_dynamic("libgnutls.so", gnutls_path,
+                                                           sizeof(gnutls_path),
+                                                           discovery_pids, discovery_pid_count) == 0) {
+            printf("  %s✓%s GnuTLS:  %s\n",
+                   display_color(C_GREEN), display_color(C_RESET), gnutls_path);
+        }
+
+        if (use_nss && bpf_loader_find_library_dynamic("libnspr4.so", nss_path,
+                                                        sizeof(nss_path),
+                                                        discovery_pids, discovery_pid_count) == 0) {
+            printf("  %s✓%s NSS:     %s\n",
+                   display_color(C_GREEN), display_color(C_RESET), nss_path);
+            /* Also find libssl3.so for NSS handshake probes */
+            if (bpf_loader_find_library_dynamic("libssl3.so", nss_ssl_path,
+                                                 sizeof(nss_ssl_path),
+                                                 discovery_pids, discovery_pid_count) == 0) {
+                printf("  %s✓%s NSS SSL: %s\n",
+                       display_color(C_GREEN), display_color(C_RESET), nss_ssl_path);
+            }
+        }
     }
 
     printf("\n");
@@ -805,6 +871,46 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Attach WolfSSL probes (same signature as OpenSSL, reuse probes) */
+    if (wolfssl_path[0]) {
+        bpf_loader_attach_uprobe(&g_loader, wolfssl_path, "wolfSSL_write",
+                                "probe_ssl_rw_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, wolfssl_path, "wolfSSL_write",
+                                "probe_ssl_write_exit", true, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, wolfssl_path, "wolfSSL_read",
+                                "probe_ssl_rw_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, wolfssl_path, "wolfSSL_read",
+                                "probe_ssl_read_exit", true, debug_mode);
+    }
+
+    /* Attach ALPN protocol detection probes */
+    if (openssl_path[0]) {
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_get0_alpn_selected",
+                                "probe_openssl_alpn_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_get0_alpn_selected",
+                                "probe_openssl_alpn_exit", true, debug_mode);
+    }
+    if (gnutls_path[0]) {
+        bpf_loader_attach_uprobe(&g_loader, gnutls_path, "gnutls_alpn_get_selected_protocol",
+                                "probe_gnutls_alpn_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, gnutls_path, "gnutls_alpn_get_selected_protocol",
+                                "probe_gnutls_alpn_exit", true, debug_mode);
+    }
+    if (nss_ssl_path[0]) {
+        /* SSL_GetNextProto - NSS ALPN negotiation result */
+        bpf_loader_attach_uprobe(&g_loader, nss_ssl_path, "SSL_GetNextProto",
+                                "probe_nss_alpn_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, nss_ssl_path, "SSL_GetNextProto",
+                                "probe_nss_alpn_exit", true, debug_mode);
+    }
+    if (wolfssl_path[0]) {
+        /* wolfSSL_ALPN_GetProtocol - WolfSSL ALPN negotiation result */
+        bpf_loader_attach_uprobe(&g_loader, wolfssl_path, "wolfSSL_ALPN_GetProtocol",
+                                "probe_wolfssl_alpn_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, wolfssl_path, "wolfSSL_ALPN_GetProtocol",
+                                "probe_wolfssl_alpn_exit", true, debug_mode);
+    }
+
     /* Attach process exit tracepoint for session cleanup */
     if (bpf_loader_attach_tracepoint(&g_loader, "sched", "sched_process_exit",
                                       "handle_process_exit", debug_mode) == 0) {
@@ -841,6 +947,9 @@ int main(int argc, char **argv) {
     if (target_ppid > 0) {
         probe_handler_set_filter_ppid(&g_handler, target_ppid);
     }
+    if (g_config.filter_ipc) {
+        probe_handler_set_filter_ipc(&g_handler, true);
+    }
 
     probe_handler_set_callback(&g_handler, process_event, NULL);
 
@@ -852,7 +961,7 @@ int main(int argc, char **argv) {
     g_probe_initialized = true;
 
     /* Show active filters */
-    if (target_comm[0] || num_target_pids > 0 || target_ppid > 0) {
+    if (target_comm[0] || num_target_pids > 0 || target_ppid > 0 || g_config.filter_ipc) {
         printf("  %sFilters:%s", display_color(C_YELLOW), display_color(C_RESET));
         if (target_comm[0]) {
             printf(" comm=%s", target_comm);
@@ -865,6 +974,9 @@ int main(int argc, char **argv) {
         }
         if (target_ppid > 0) {
             printf(" ppid=%d (+children)", target_ppid);
+        }
+        if (g_config.filter_ipc) {
+            printf(" ipc-filter=on");
         }
         printf("\n\n");
     }

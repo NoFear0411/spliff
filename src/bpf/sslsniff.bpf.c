@@ -30,6 +30,7 @@
 #define EVENT_SSL_WRITE    1
 #define EVENT_HANDSHAKE    2
 #define EVENT_PROCESS_EXIT 3
+#define EVENT_ALPN         4
 
 // Data structure for SSL events
 struct ssl_data_event {
@@ -57,6 +58,13 @@ struct ssl_args {
 struct handshake_args {
     __u64 ssl_ctx;        // SSL context pointer
     __u64 start_ns;       // Start timestamp
+};
+
+// ALPN query state saved between entry and exit probes
+struct alpn_query_args {
+    __u64 ssl_ctx;        // SSL context pointer
+    __u64 data_ptr;       // Pointer to output data pointer (OpenSSL) or buffer (NSS/GnuTLS)
+    __u64 len_ptr;        // Pointer to length output
 };
 
 // =============================================================================
@@ -97,6 +105,15 @@ struct {
     __type(key, __u32);  // tid
     __type(value, struct handshake_args);
 } handshake_args_map SEC(".maps");
+
+// Separate map for ALPN query state
+// Key: tid (thread ID)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);  // tid
+    __type(value, struct alpn_query_args);
+} alpn_query_map SEC(".maps");
 
 // Ring buffer for sending events to userspace
 struct {
@@ -756,6 +773,356 @@ int BPF_URETPROBE(probe_nss_read_exit) {
     bpf_map_delete_elem(&ssl_args_map, &tid);
     bpf_map_delete_elem(&start_ns, &tid);
 
+    return 0;
+}
+
+// =============================================================================
+// ALPN Protocol Detection Probes
+// For: SSL_get0_alpn_selected (OpenSSL), SSL_GetNextProto (NSS),
+//      gnutls_alpn_get_selected_protocol (GnuTLS)
+// =============================================================================
+
+// OpenSSL: void SSL_get0_alpn_selected(const SSL *ssl,
+//                                       const unsigned char **data,
+//                                       unsigned int *len)
+SEC("uprobe/openssl_alpn_enter")
+int BPF_UPROBE(probe_openssl_alpn_enter, void *ssl, void **data_out, unsigned int *len_out) {
+    __u32 tid = get_tid();
+
+    struct alpn_query_args args = {
+        .ssl_ctx = (__u64)ssl,
+        .data_ptr = (__u64)data_out,   // Pointer to output data pointer
+        .len_ptr = (__u64)len_out,     // Pointer to output length
+    };
+
+    bpf_map_update_elem(&alpn_query_map, &tid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/openssl_alpn_exit")
+int BPF_URETPROBE(probe_openssl_alpn_exit) {
+    __u32 tid = get_tid();
+    __u32 zero = 0;
+
+    struct alpn_query_args *args = bpf_map_lookup_elem(&alpn_query_map, &tid);
+    if (!args) {
+        return 0;
+    }
+
+    // Read the length from *len_out
+    __u32 alpn_len = 0;
+    if (args->len_ptr != 0) {
+        bpf_probe_read_user(&alpn_len, sizeof(alpn_len), (void *)args->len_ptr);
+    }
+
+    // No ALPN selected or invalid length
+    if (alpn_len == 0 || alpn_len > 255) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Read the data pointer from *data_out
+    __u64 data_ptr = 0;
+    if (args->data_ptr != 0) {
+        bpf_probe_read_user(&data_ptr, sizeof(data_ptr), (void *)args->data_ptr);
+    }
+
+    if (data_ptr == 0) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Get event buffer
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Fill metadata
+    fill_event_metadata(event);
+    event->event_type = EVENT_ALPN;
+    event->len = alpn_len;
+    event->ssl_ctx = args->ssl_ctx;
+    event->delta_ns = 0;
+
+    // Read ALPN protocol string
+    event->buf_filled = 0;
+    int err = bpf_probe_read_user(&event->buf, alpn_len & 0xFF, (void *)data_ptr);
+    if (err == 0) {
+        event->buf_filled = alpn_len;
+    }
+
+    // Track this PID
+    track_pid(event->pid);
+
+    // Submit event (small, ALPN strings are short)
+    __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
+    if (submit_size > sizeof(struct ssl_data_event)) {
+        submit_size = sizeof(struct ssl_data_event);
+    }
+    bpf_ringbuf_output(&ssl_events, event, submit_size & 0xFFFF, 0);
+
+    bpf_map_delete_elem(&alpn_query_map, &tid);
+    return 0;
+}
+
+// GnuTLS: int gnutls_alpn_get_selected_protocol(gnutls_session_t session,
+//                                                gnutls_datum_t *protocol)
+// gnutls_datum_t = { unsigned char *data; unsigned int size; }
+SEC("uprobe/gnutls_alpn_enter")
+int BPF_UPROBE(probe_gnutls_alpn_enter, void *session, void *protocol_out) {
+    __u32 tid = get_tid();
+
+    struct alpn_query_args args = {
+        .ssl_ctx = (__u64)session,
+        .data_ptr = (__u64)protocol_out,  // Pointer to gnutls_datum_t
+        .len_ptr = 0,
+    };
+
+    bpf_map_update_elem(&alpn_query_map, &tid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/gnutls_alpn_exit")
+int BPF_URETPROBE(probe_gnutls_alpn_exit) {
+    __u32 tid = get_tid();
+    __u32 zero = 0;
+
+    struct alpn_query_args *args = bpf_map_lookup_elem(&alpn_query_map, &tid);
+    if (!args) {
+        return 0;
+    }
+
+    // Check return value (0 = success)
+    int ret = PT_REGS_RC((struct pt_regs *)ctx);
+    if (ret != 0) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Read gnutls_datum_t structure: { unsigned char *data; unsigned int size; }
+    struct {
+        __u64 data;
+        __u32 size;
+    } datum = {0, 0};
+
+    if (args->data_ptr != 0) {
+        bpf_probe_read_user(&datum, sizeof(datum), (void *)args->data_ptr);
+    }
+
+    if (datum.size == 0 || datum.size > 255 || datum.data == 0) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Get event buffer
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Fill metadata
+    fill_event_metadata(event);
+    event->event_type = EVENT_ALPN;
+    event->len = datum.size;
+    event->ssl_ctx = args->ssl_ctx;
+    event->delta_ns = 0;
+
+    // Read ALPN protocol string
+    event->buf_filled = 0;
+    int err = bpf_probe_read_user(&event->buf, datum.size & 0xFF, (void *)datum.data);
+    if (err == 0) {
+        event->buf_filled = datum.size;
+    }
+
+    // Track this PID
+    track_pid(event->pid);
+
+    // Submit event
+    __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
+    if (submit_size > sizeof(struct ssl_data_event)) {
+        submit_size = sizeof(struct ssl_data_event);
+    }
+    bpf_ringbuf_output(&ssl_events, event, submit_size & 0xFFFF, 0);
+
+    bpf_map_delete_elem(&alpn_query_map, &tid);
+    return 0;
+}
+
+// NSS: SECStatus SSL_GetNextProto(PRFileDesc *fd,
+//                                  SSLNextProtoState *state,
+//                                  unsigned char *buf,
+//                                  unsigned int *bufLen,
+//                                  unsigned int bufLenMax)
+SEC("uprobe/nss_alpn_enter")
+int BPF_UPROBE(probe_nss_alpn_enter, void *fd, void *state, void *buf,
+               unsigned int *buf_len, unsigned int buf_len_max) {
+    __u32 tid = get_tid();
+
+    struct alpn_query_args args = {
+        .ssl_ctx = (__u64)fd,
+        .data_ptr = (__u64)buf,        // Output buffer for protocol name
+        .len_ptr = (__u64)buf_len,     // Pointer to output length
+    };
+
+    bpf_map_update_elem(&alpn_query_map, &tid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/nss_alpn_exit")
+int BPF_URETPROBE(probe_nss_alpn_exit) {
+    __u32 tid = get_tid();
+    __u32 zero = 0;
+
+    struct alpn_query_args *args = bpf_map_lookup_elem(&alpn_query_map, &tid);
+    if (!args) {
+        return 0;
+    }
+
+    // Check return value (SECSuccess = 0)
+    int ret = PT_REGS_RC((struct pt_regs *)ctx);
+    if (ret != 0) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Read the length from *buf_len
+    __u32 alpn_len = 0;
+    if (args->len_ptr != 0) {
+        bpf_probe_read_user(&alpn_len, sizeof(alpn_len), (void *)args->len_ptr);
+    }
+
+    if (alpn_len == 0 || alpn_len > 255) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Get event buffer
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Fill metadata
+    fill_event_metadata(event);
+    event->event_type = EVENT_ALPN;
+    event->len = alpn_len;
+    event->ssl_ctx = args->ssl_ctx;
+    event->delta_ns = 0;
+
+    // Read ALPN protocol string from buf
+    event->buf_filled = 0;
+    if (args->data_ptr != 0) {
+        int err = bpf_probe_read_user(&event->buf, alpn_len & 0xFF, (void *)args->data_ptr);
+        if (err == 0) {
+            event->buf_filled = alpn_len;
+        }
+    }
+
+    // Track this PID
+    track_pid(event->pid);
+
+    // Submit event
+    __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
+    if (submit_size > sizeof(struct ssl_data_event)) {
+        submit_size = sizeof(struct ssl_data_event);
+    }
+    bpf_ringbuf_output(&ssl_events, event, submit_size & 0xFFFF, 0);
+
+    bpf_map_delete_elem(&alpn_query_map, &tid);
+    return 0;
+}
+
+// wolfSSL: int wolfSSL_ALPN_GetProtocol(WOLFSSL* ssl, char** protocol, word16* size)
+// Returns WOLFSSL_SUCCESS (1) on success, protocol is double pointer
+SEC("uprobe/wolfssl_alpn_enter")
+int BPF_UPROBE(probe_wolfssl_alpn_enter, void *ssl, char **protocol_out, unsigned short *size_out) {
+    __u32 tid = get_tid();
+
+    struct alpn_query_args args = {
+        .ssl_ctx = (__u64)ssl,
+        .data_ptr = (__u64)protocol_out,  // Double pointer to protocol string
+        .len_ptr = (__u64)size_out,       // Pointer to size
+    };
+
+    bpf_map_update_elem(&alpn_query_map, &tid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/wolfssl_alpn_exit")
+int BPF_URETPROBE(probe_wolfssl_alpn_exit) {
+    __u32 tid = get_tid();
+    __u32 zero = 0;
+
+    struct alpn_query_args *args = bpf_map_lookup_elem(&alpn_query_map, &tid);
+    if (!args) {
+        return 0;
+    }
+
+    // Check return value (WOLFSSL_SUCCESS = 1)
+    int ret = PT_REGS_RC((struct pt_regs *)ctx);
+    if (ret != 1) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Read the size from *size_out
+    __u16 alpn_len = 0;
+    if (args->len_ptr != 0) {
+        bpf_probe_read_user(&alpn_len, sizeof(alpn_len), (void *)args->len_ptr);
+    }
+
+    if (alpn_len == 0 || alpn_len > 255) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Read the protocol pointer from *protocol_out (double pointer)
+    __u64 protocol_ptr = 0;
+    if (args->data_ptr != 0) {
+        bpf_probe_read_user(&protocol_ptr, sizeof(protocol_ptr), (void *)args->data_ptr);
+    }
+
+    if (protocol_ptr == 0) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Get event buffer
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        bpf_map_delete_elem(&alpn_query_map, &tid);
+        return 0;
+    }
+
+    // Fill metadata
+    fill_event_metadata(event);
+    event->event_type = EVENT_ALPN;
+    event->len = alpn_len;
+    event->ssl_ctx = args->ssl_ctx;
+    event->delta_ns = 0;
+
+    // Read ALPN protocol string
+    event->buf_filled = 0;
+    int err = bpf_probe_read_user(&event->buf, alpn_len & 0xFF, (void *)protocol_ptr);
+    if (err == 0) {
+        event->buf_filled = alpn_len;
+    }
+
+    // Track this PID
+    track_pid(event->pid);
+
+    // Submit event
+    __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
+    if (submit_size > sizeof(struct ssl_data_event)) {
+        submit_size = sizeof(struct ssl_data_event);
+    }
+    bpf_ringbuf_output(&ssl_events, event, submit_size & 0xFFFF, 0);
+
+    bpf_map_delete_elem(&alpn_query_map, &tid);
     return 0;
 }
 
