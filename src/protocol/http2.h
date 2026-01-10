@@ -118,6 +118,12 @@ void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *e
 /* Check if (PID, ssl_ctx) has active HTTP/2 session */
 bool http2_has_session(uint32_t pid, uint64_t ssl_ctx);
 
+/* Set ALPN protocol for a connection */
+void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn);
+
+/* Get ALPN protocol for a connection (returns empty string if not set) */
+const char *http2_get_alpn(uint32_t pid, uint64_t ssl_ctx);
+
 /* Get stream info (for external use) */
 h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id, bool create);
 

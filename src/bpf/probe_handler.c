@@ -18,6 +18,7 @@
  */
 
 #include "probe_handler.h"
+#include "../protocol/http2.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,13 +86,13 @@ static bool is_descendant_of(int pid, int ancestor, int max_depth) {
     return false;
 }
 
-/* Known IPC/internal thread patterns */
+/* Known IPC/internal thread patterns
+ * NOTE: "Socket Thread" is Firefox's legitimate web traffic thread - DO NOT filter it */
 static const char *ipc_thread_patterns[] = {
     "Cache2 I/O",       /* Firefox cache I/O */
     "Timer",            /* Timer threads */
     "LS Thread",        /* Firefox local storage */
     "BgIOThr",          /* Background I/O threads */
-    "Socket Thread",    /* Generic socket threads */
     "TaskScheduler",    /* Chromium task scheduler */
     "Chrome_IOThread",  /* Chrome I/O thread */
     "Compositor",       /* Compositor threads */
@@ -103,6 +104,7 @@ static const char *ipc_thread_patterns[] = {
     "StyleThread",      /* Style computation threads */
     NULL
 };
+
 
 /* Check if data looks like IPC/binary protocol rather than HTTP */
 static bool is_ipc_traffic(const ssl_data_event_t *e) {
@@ -129,9 +131,13 @@ static bool is_ipc_traffic(const ssl_data_event_t *e) {
         }
     }
 
-    /* Check for HTTP/2 connection preface */
+    /* Check for HTTP/2 connection preface (full or partial) */
     if (len >= 24 && memcmp(data, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) == 0) {
         return false;  /* HTTP/2 preface */
+    }
+    /* Also check for partial HTTP/2 preface start (when preface is split across reads) */
+    if (len >= 4 && memcmp(data, "PRI ", 4) == 0) {
+        return false;  /* HTTP/2 preface start */
     }
 
     /* Check for HTTP/2 frame header (first byte should be frame length high byte,
@@ -139,13 +145,16 @@ static bool is_ipc_traffic(const ssl_data_event_t *e) {
     if (len >= 9) {
         uint8_t frame_type = data[3];
         uint32_t frame_len = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | data[2];
-        if (frame_type <= 9 && frame_len <= 16384) {
+        /* Accept frame types 0-9, lengths up to 64KB (common max frame size) */
+        if (frame_type <= 9 && frame_len <= 65536) {
             /* Looks like a valid HTTP/2 frame */
             return false;
         }
     }
 
-    /* Check for high concentration of non-printable bytes (binary data) */
+    /* Check for high concentration of non-printable bytes (binary data)
+     * Note: HPACK-compressed headers and gzip bodies have many non-printable bytes
+     * so we use a high threshold to avoid false positives */
     int non_printable = 0;
     size_t check_len = len > 64 ? 64 : len;  /* Check first 64 bytes */
     for (size_t i = 0; i < check_len; i++) {
@@ -155,8 +164,9 @@ static bool is_ipc_traffic(const ssl_data_event_t *e) {
             non_printable++;
         }
     }
-    /* If more than 30% non-printable, likely binary IPC */
-    if (non_printable * 100 / check_len > 30) {
+    /* If more than 50% non-printable, likely binary IPC
+     * (increased from 30% to reduce false positives with compressed data) */
+    if (non_printable * 100 / check_len > 50) {
         return true;
     }
 
@@ -212,6 +222,10 @@ static void refresh_ppid_cache(probe_handler_t *handler) {
     closedir(proc);
 }
 
+/* Forward declarations for NSS SSL FD tracking (via SSL_ImportFD) */
+static void track_nss_ssl_fd(probe_handler_t *handler, const ssl_data_event_t *e);
+static void cleanup_nss_ssl_fds_pid(probe_handler_t *handler, uint32_t pid);
+
 /* Check if event should be displayed */
 static bool should_display(probe_handler_t *handler, const ssl_data_event_t *e) {
     bool passes = (handler->target_comm[0] == '\0' &&
@@ -262,8 +276,13 @@ static bool should_display(probe_handler_t *handler, const ssl_data_event_t *e) 
         /* Check for known internal thread patterns */
         if (is_internal_thread(e->comm)) return false;
 
-        /* Check if data looks like IPC rather than HTTP */
-        if (is_ipc_traffic(e)) return false;
+        /* Content-based IPC detection for all traffic.
+         * Skip if this connection has an active HTTP/2 session (definitely web traffic) */
+        bool has_h2 = http2_has_session(e->pid, e->ssl_ctx);
+        if (!has_h2) {
+            /* Check if data looks like IPC rather than HTTP */
+            if (is_ipc_traffic(e)) return false;
+        }
     } else {
         /* Basic internal thread filtering (always on) */
         if (strstr(e->comm, "Cache2 I/O") || strstr(e->comm, "Timer") ||
@@ -279,6 +298,19 @@ static int handle_event(void *ctx, void *data, size_t sz) {
     probe_handler_t *handler = (probe_handler_t *)ctx;
     const ssl_data_event_t *e = (const ssl_data_event_t *)data;
 
+    /* Handle NSS SSL_ImportFD tracking events (always process, even if filtered) */
+    if (e->event_type == EVENT_NSS_SSL_FD) {
+        track_nss_ssl_fd(handler, e);
+        /* Don't forward to callback - this is internal tracking */
+        return 0;
+    }
+
+    /* Handle process exit - cleanup NSS SSL FDs */
+    if (e->event_type == EVENT_PROCESS_EXIT) {
+        cleanup_nss_ssl_fds_pid(handler, e->pid);
+        /* Still forward to callback for other cleanup */
+    }
+
     if (!should_display(handler, e)) return 0;
 
     if (handler->callback) {
@@ -286,6 +318,60 @@ static int handle_event(void *ctx, void *data, size_t sz) {
     }
 
     return 0;
+}
+
+/* Track an NSS SSL FD from SSL_ImportFD */
+static void track_nss_ssl_fd(probe_handler_t *handler, const ssl_data_event_t *e) {
+    if (!handler || !e) return;
+
+    /* Check if already tracked */
+    for (int i = 0; i < handler->nss_ssl_fd_count; i++) {
+        if (handler->nss_ssl_fds[i].active &&
+            handler->nss_ssl_fds[i].pid == e->pid &&
+            handler->nss_ssl_fds[i].fd == e->ssl_ctx) {
+            /* Already tracked */
+            return;
+        }
+    }
+
+    /* Find empty slot or evict oldest */
+    int slot = -1;
+    for (int i = 0; i < NSS_CONN_CACHE_SIZE; i++) {
+        if (!handler->nss_ssl_fds[i].active) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        /* Cache full, evict first entry */
+        slot = 0;
+        /* Shift all entries */
+        for (int i = 1; i < NSS_CONN_CACHE_SIZE; i++) {
+            handler->nss_ssl_fds[i-1] = handler->nss_ssl_fds[i];
+        }
+        slot = NSS_CONN_CACHE_SIZE - 1;
+    }
+
+    /* Store the SSL FD info */
+    handler->nss_ssl_fds[slot].pid = e->pid;
+    handler->nss_ssl_fds[slot].fd = e->ssl_ctx;
+    handler->nss_ssl_fds[slot].active = true;
+
+    if (slot >= handler->nss_ssl_fd_count) {
+        handler->nss_ssl_fd_count = slot + 1;
+    }
+}
+
+/* Cleanup NSS SSL FDs for a specific PID */
+static void cleanup_nss_ssl_fds_pid(probe_handler_t *handler, uint32_t pid) {
+    if (!handler) return;
+
+    for (int i = 0; i < handler->nss_ssl_fd_count; i++) {
+        if (handler->nss_ssl_fds[i].active &&
+            handler->nss_ssl_fds[i].pid == pid) {
+            handler->nss_ssl_fds[i].active = false;
+        }
+    }
 }
 
 /* Initialize probe handler */
@@ -302,6 +388,7 @@ int probe_handler_init(probe_handler_t *handler) {
     handler->target_ppid = 0;
     handler->ppid_cache_count = 0;
     handler->filter_ipc = false;
+    handler->nss_ssl_fd_count = 0;
 
     return 0;
 }

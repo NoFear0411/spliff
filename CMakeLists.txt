@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(sslsniff
-    VERSION 0.5.0
+    VERSION 0.5.1
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/example/sslsniff"
     LANGUAGES C
@@ -317,8 +317,8 @@ set(TEST_COMMON_SOURCES
     src/content/signatures.c
 )
 
-# HTTP/1.1 parser tests
-add_executable(test_http1 tests/test_http1.c tests/test_common.c ${TEST_COMMON_SOURCES})
+# HTTP/1.1 parser tests (EXCLUDE_FROM_ALL - only built with 'make test' or explicitly)
+add_executable(test_http1 EXCLUDE_FROM_ALL tests/test_http1.c tests/test_common.c ${TEST_COMMON_SOURCES})
 target_include_directories(test_http1 PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_http1 PRIVATE
     PkgConfig::LLHTTP
@@ -336,8 +336,8 @@ if(BROTLI_FOUND)
 endif()
 add_test(NAME http1_parser_tests COMMAND test_http1)
 
-# HTTP/2 parser tests
-add_executable(test_http2 tests/test_http2.c tests/test_common.c ${TEST_COMMON_SOURCES})
+# HTTP/2 parser tests (EXCLUDE_FROM_ALL - only built with 'make test' or explicitly)
+add_executable(test_http2 EXCLUDE_FROM_ALL tests/test_http2.c tests/test_common.c ${TEST_COMMON_SOURCES})
 target_include_directories(test_http2 PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_http2 PRIVATE
     PkgConfig::LLHTTP

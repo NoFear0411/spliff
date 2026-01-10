@@ -29,6 +29,7 @@
 
 #define MAX_BUF_SIZE 16384
 #define PID_CACHE_SIZE 1024
+#define NSS_CONN_CACHE_SIZE 256  /* Max tracked NSS external connections */
 
 /* Event types */
 enum event_type {
@@ -36,7 +37,8 @@ enum event_type {
     EVENT_SSL_WRITE = 1,
     EVENT_HANDSHAKE = 2,
     EVENT_PROCESS_EXIT = 3,
-    EVENT_ALPN = 4
+    EVENT_ALPN = 4,
+    EVENT_NSS_SSL_FD = 5   /* NSS SSL_ImportFD tracking (verified TLS connection) */
 };
 
 /* SSL data event from BPF (must match BPF side) */
@@ -57,6 +59,13 @@ typedef struct {
 /* Event callback function type */
 typedef void (*event_callback_t)(const ssl_data_event_t *event, void *ctx);
 
+/* Tracked NSS SSL FD (from SSL_ImportFD) */
+typedef struct {
+    uint32_t pid;
+    uint64_t fd;         /* PRFileDesc pointer (SSL-wrapped) */
+    bool active;
+} nss_ssl_fd_t;
+
 /* Probe handler state */
 typedef struct {
     struct ring_buffer *rb;
@@ -71,6 +80,10 @@ typedef struct {
     int ppid_cache[PID_CACHE_SIZE];
     int ppid_cache_count;
     bool filter_ipc;        /* Filter out IPC/Unix socket traffic */
+
+    /* NSS SSL FD tracking (for IPC filtering via SSL_ImportFD) */
+    nss_ssl_fd_t nss_ssl_fds[NSS_CONN_CACHE_SIZE];
+    int nss_ssl_fd_count;
 } probe_handler_t;
 
 /* Initialize probe handler - returns 0 on success, -1 on failure */

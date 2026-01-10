@@ -85,13 +85,20 @@ void display_http_request(const http_message_t *msg) {
     /* Determine protocol version string */
     const char *proto_str = (msg->protocol == PROTO_HTTP2) ? "HTTP/2" : "HTTP/1.1";
 
-    /* Format: <timestamp> ← <method> <full URI> <protocol> <process name> <PID> [latency] */
-    printf("%s%s%s %s←%s %s%s%s %s %s%s%s %s%s%s %s(%u)%s",
+    /* Format: <timestamp> ← <method> <full URI> <protocol> [ALPN] <process name> <PID> [latency] */
+    printf("%s%s%s %s←%s %s%s%s %s %s%s%s",
            display_color(C_DIM), ts, display_color(C_RESET),
            display_color(C_GREEN), display_color(C_RESET),
            display_color(C_BOLD), msg->method, display_color(C_RESET),
            full_uri,
-           display_color(C_DIM), proto_str, display_color(C_RESET),
+           display_color(C_DIM), proto_str, display_color(C_RESET));
+
+    /* Show ALPN if available */
+    if (msg->alpn_proto[0]) {
+        printf(" %s[%s]%s", display_color(C_MAGENTA), msg->alpn_proto, display_color(C_RESET));
+    }
+
+    printf(" %s%s%s %s(%u)%s",
            display_color(C_CYAN), msg->comm, display_color(C_RESET),
            display_color(C_DIM), msg->pid, display_color(C_RESET));
 
@@ -113,7 +120,7 @@ void display_http_response(const http_message_t *msg) {
     if (msg->status_code >= 400) status_color = C_RED;
     else if (msg->status_code >= 300) status_color = C_YELLOW;
 
-    /* Format: <timestamp> → <status code> <content-type> <size> <process name> <PID> [latency] */
+    /* Format: <timestamp> → <status code> <content-type> <size> [ALPN] <process name> <PID> [latency] */
     printf("%s%s%s %s→%s %s%d%s",
            display_color(C_DIM), ts, display_color(C_RESET),
            display_color(C_BLUE), display_color(C_RESET),
@@ -125,6 +132,11 @@ void display_http_response(const http_message_t *msg) {
 
     if (msg->content_length > 0) {
         printf(" %s(%zu bytes)%s", display_color(C_DIM), msg->content_length, display_color(C_RESET));
+    }
+
+    /* Show ALPN if available */
+    if (msg->alpn_proto[0]) {
+        printf(" %s[%s]%s", display_color(C_MAGENTA), msg->alpn_proto, display_color(C_RESET));
     }
 
     printf(" %s%s%s %s(%u)%s",
