@@ -37,8 +37,9 @@ clean:
 	@rm -rf $(BUILD_DIR) sslsniff
 	@echo "Build directory cleaned"
 
-# Run tests
+# Run tests (builds test executables then runs them)
 test: debug
+	@cmake --build $(BUILD_DIR) --target test_http1 test_http2
 	@cd $(BUILD_DIR) && ctest --output-on-failure
 
 # Install to system (requires sudo)

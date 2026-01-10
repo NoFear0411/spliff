@@ -68,6 +68,66 @@ static void get_process_name(uint32_t pid, char *buf, size_t bufsize) {
     }
 }
 
+/* ALPN cache - tracks negotiated ALPN protocols per connection */
+#define MAX_ALPN_CACHE 128
+
+typedef struct {
+    uint32_t pid;
+    uint64_t ssl_ctx;
+    char alpn_proto[16];
+    bool active;
+} alpn_cache_entry_t;
+
+static alpn_cache_entry_t g_alpn_cache[MAX_ALPN_CACHE];
+
+static const char *get_alpn_proto(uint32_t pid, uint64_t ssl_ctx) {
+    /* First check H2 sessions (they store ALPN internally) */
+    const char *h2_alpn = http2_get_alpn(pid, ssl_ctx);
+    if (h2_alpn && h2_alpn[0]) {
+        return h2_alpn;
+    }
+    /* Then check our cache (for HTTP/1.1 connections) */
+    for (int i = 0; i < MAX_ALPN_CACHE; i++) {
+        if (g_alpn_cache[i].active &&
+            g_alpn_cache[i].pid == pid &&
+            g_alpn_cache[i].ssl_ctx == ssl_ctx) {
+            return g_alpn_cache[i].alpn_proto;
+        }
+    }
+    return NULL;
+}
+
+static void set_alpn_proto(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
+    /* Find existing or empty slot */
+    alpn_cache_entry_t *slot = NULL;
+    int oldest_idx = 0;
+
+    for (int i = 0; i < MAX_ALPN_CACHE; i++) {
+        if (g_alpn_cache[i].active &&
+            g_alpn_cache[i].pid == pid &&
+            g_alpn_cache[i].ssl_ctx == ssl_ctx) {
+            slot = &g_alpn_cache[i];
+            break;
+        }
+        if (!g_alpn_cache[i].active) {
+            slot = &g_alpn_cache[i];
+            break;
+        }
+    }
+    /* If no slot found, evict oldest (first one) */
+    if (!slot) {
+        slot = &g_alpn_cache[oldest_idx];
+    }
+
+    slot->pid = pid;
+    slot->ssl_ctx = ssl_ctx;
+    slot->active = true;
+    safe_strcpy(slot->alpn_proto, sizeof(slot->alpn_proto), alpn ? alpn : "");
+
+    /* Also store in H2 session if it exists */
+    http2_set_alpn(pid, ssl_ctx, alpn);
+}
+
 /* Pending body state - tracks responses expecting body data */
 #define BODY_ACCUM_SIZE (256 * 1024)  /* 256KB accumulation buffer */
 
@@ -258,7 +318,9 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
         return;
     }
 
-    /* Handle handshake events (no buffer data) */
+    /* Handle handshake events (no buffer data)
+     * NOTE: Handshake events may arrive out of order relative to HTTP data due to
+     * different probe timing. Future improvement: buffer events and sort by timestamp. */
     if (event->event_type == EVENT_HANDSHAKE) {
         if (g_config.show_handshake) {
             char proc_name[TASK_COMM_LEN] = {0};
@@ -274,15 +336,8 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
         if (event->buf_filled > 0 && event->buf_filled <= 255) {
             char alpn_proto[256] = {0};
             memcpy(alpn_proto, event->data, event->buf_filled);
-
-            char proc_name[TASK_COMM_LEN] = {0};
-            get_process_name(event->pid, proc_name, sizeof(proc_name));
-            const char *name = proc_name[0] ? proc_name : event->comm;
-
-            printf("%s[ALPN: %s]%s PID %u (%s) ssl_ctx=0x%llx\n",
-                   display_color(C_YELLOW), alpn_proto,
-                   display_color(C_RESET), event->pid, name,
-                   (unsigned long long)event->ssl_ctx);
+            /* Store ALPN for later inclusion in request/response display */
+            set_alpn_proto(event->pid, event->ssl_ctx, alpn_proto);
         }
         return;
     }
@@ -324,6 +379,12 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
             safe_strcpy(msg.comm, sizeof(msg.comm), proc_name);
         } else {
             safe_strcpy(msg.comm, sizeof(msg.comm), event->comm);
+        }
+
+        /* Get ALPN protocol if available */
+        const char *alpn = get_alpn_proto(event->pid, event->ssl_ctx);
+        if (alpn) {
+            safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
         }
 
         /* Display based on direction (auto-detected by llhttp) */
@@ -512,6 +573,30 @@ show_raw:
         return;
     }
 
+    /* Suppress HTTP/2 control frames in release mode (keep them in debug mode)
+     * HTTP/2 frame header is 9 bytes, control frames have small payloads:
+     * - SETTINGS ACK: 9 bytes (0 payload)
+     * - WINDOW_UPDATE: 13 bytes (4 byte payload)
+     * - PING: 17 bytes (8 byte payload)
+     * - RST_STREAM: 13 bytes (4 byte payload)
+     * - PRIORITY: 14 bytes (5 byte payload)
+     */
+    if (!g_config.debug_mode) {
+        if (len >= 9 && len <= 32) {
+            uint8_t frame_type = data[3];
+            /* Suppress known control frame types (types 0x02-0x08, excluding DATA and HEADERS) */
+            if (frame_type >= 0x02 && frame_type <= 0x08) {
+                return;  /* Suppress control frame output */
+            }
+        }
+
+        /* Also suppress very small writes (< 9 bytes) that can't be valid HTTP/2 frames
+         * and are likely partial control data or TCP-level artifacts */
+        if (len < 9 && http2_has_session(event->pid, event->ssl_ctx)) {
+            return;  /* Suppress tiny writes when HTTP/2 session is active */
+        }
+    }
+
     char ts[32];
     display_get_timestamp(ts, sizeof(ts));
     const char *dir = (event->event_type == EVENT_SSL_WRITE) ? "WRITE" : "READ";
@@ -634,6 +719,7 @@ int main(int argc, char **argv) {
             g_config.use_colors = false;
         } else if (strcmp(argv[i], "-d") == 0) {
             debug_mode = true;
+            g_config.debug_mode = true;
         } else if (strcmp(argv[i], "-b") == 0) {
             g_config.show_body = true;
         } else if (strcmp(argv[i], "-c") == 0) {
@@ -840,6 +926,14 @@ int main(int argc, char **argv) {
                                 "probe_nss_read_enter", false, debug_mode);
         bpf_loader_attach_uprobe(&g_loader, nss_path, "PR_Recv",
                                 "probe_nss_read_exit", true, debug_mode);
+    }
+
+    /* SSL_ImportFD - track verified SSL connections for IPC filtering
+     * This is called when a socket is promoted to SSL in Firefox.
+     * All web traffic must pass through here, but IPC rarely does. */
+    if (nss_ssl_path[0]) {
+        bpf_loader_attach_uprobe(&g_loader, nss_ssl_path, "SSL_ImportFD",
+                                "probe_ssl_import_fd_exit", true, debug_mode);
     }
 
     /* Attach handshake probes if -H is set */

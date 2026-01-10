@@ -25,7 +25,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define SSLSNIFF_VERSION "0.5.0"
+#define SSLSNIFF_VERSION "0.5.1"
 
 /* Debug logging macros - only active in DEBUG builds */
 #ifdef DEBUG
@@ -39,7 +39,7 @@
 #endif
 #define SSLSNIFF_VERSION_MAJOR 0
 #define SSLSNIFF_VERSION_MINOR 5
-#define SSLSNIFF_VERSION_PATCH 0
+#define SSLSNIFF_VERSION_PATCH 1
 
 /* Maximum sizes */
 #define MAX_HEADER_NAME     256
@@ -102,6 +102,9 @@ typedef struct {
     /* HTTP/2 specific */
     int32_t stream_id;
 
+    /* ALPN negotiated protocol (e.g., "h2", "http/1.1") */
+    char alpn_proto[16];
+
     /* Metadata */
     uint32_t pid;
     char comm[TASK_COMM_LEN];
@@ -142,6 +145,7 @@ typedef struct {
     bool hexdump_mode;
     bool use_colors;
     bool filter_ipc;        /* Filter out IPC/Unix socket traffic */
+    bool debug_mode;        /* Debug mode - show raw events */
 
     /* Threading */
     int worker_threads;

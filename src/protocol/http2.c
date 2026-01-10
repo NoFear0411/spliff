@@ -116,6 +116,9 @@ typedef struct {
 
     /* Process name cache */
     char comm[TASK_COMM_LEN];
+
+    /* ALPN negotiated protocol */
+    char alpn_proto[16];
 } h2_connection_t;
 
 /* Context passed to nghttp2 callbacks */
@@ -556,6 +559,12 @@ static void h2_display_request(h2_stream_t *stream) {
                 stream->scheme[0] ? stream->scheme : "https");
     safe_strcpy(msg.comm, sizeof(msg.comm), stream->comm);
 
+    /* Get ALPN protocol from connection */
+    const char *alpn = http2_get_alpn(stream->pid, stream->ssl_ctx);
+    if (alpn && alpn[0]) {
+        safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
+    }
+
     /* Copy headers */
     msg.header_count = stream->header_count;
     for (int i = 0; i < stream->header_count && i < MAX_HEADERS; i++) {
@@ -595,6 +604,12 @@ static void h2_display_response(h2_stream_t *stream) {
     safe_strcpy(msg.content_type, sizeof(msg.content_type), stream->content_type);
     msg.content_length = stream->content_length;
     safe_strcpy(msg.comm, sizeof(msg.comm), stream->comm);
+
+    /* Get ALPN protocol from connection */
+    const char *alpn = http2_get_alpn(stream->pid, stream->ssl_ctx);
+    if (alpn && alpn[0]) {
+        safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
+    }
 
     msg.header_count = stream->header_count;
     for (int i = 0; i < stream->header_count && i < MAX_HEADERS; i++) {
@@ -887,6 +902,25 @@ bool http2_has_session(uint32_t pid, uint64_t ssl_ctx) {
         }
     }
     return false;
+}
+
+void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
+    /* Find existing connection or create one */
+    h2_connection_t *conn = get_h2_connection(pid, ssl_ctx, true);
+    if (conn && alpn) {
+        safe_strcpy(conn->alpn_proto, sizeof(conn->alpn_proto), alpn);
+    }
+}
+
+const char *http2_get_alpn(uint32_t pid, uint64_t ssl_ctx) {
+    for (int i = 0; i < MAX_H2_SESSIONS; i++) {
+        if (g_h2_connections[i].active &&
+            g_h2_connections[i].pid == pid &&
+            g_h2_connections[i].ssl_ctx == ssl_ctx) {
+            return g_h2_connections[i].alpn_proto;
+        }
+    }
+    return "";
 }
 
 /* Process a single decoded header from HPACK inflater */
@@ -1256,16 +1290,21 @@ void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *e
         }
     }
 
-    /* Debug: print frame header if long enough */
+    /* Debug: print potential frame header for WRITE events only
+     * (READ events may be partial frame payloads that get buffered,
+     * so printing raw data as frame header would be misleading) */
 #ifdef DEBUG
-    if (len >= 9) {
+    if (len >= 9 && event->event_type == EVENT_SSL_WRITE) {
         uint32_t frame_len = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | (uint32_t)data[2];
         uint8_t frame_type = data[3];
         uint8_t flags = data[4];
         uint32_t stream_id = ((uint32_t)(data[5] & 0x7f) << 24) | ((uint32_t)data[6] << 16) |
                              ((uint32_t)data[7] << 8) | (uint32_t)data[8];
-        DEBUG_H2("Frame header: len=%u type=%s(%d) flags=0x%02x stream=%u",
-                 frame_len, http2_frame_name(frame_type), frame_type, flags, stream_id);
+        /* Only log if it looks like a valid frame header */
+        if (frame_type <= 9 && frame_len <= 65536) {
+            DEBUG_H2("Frame header: len=%u type=%s(%d) flags=0x%02x stream=%u",
+                     frame_len, http2_frame_name(frame_type), frame_type, flags, stream_id);
+        }
     }
 #endif
 
@@ -1383,6 +1422,18 @@ bool http2_has_session(uint32_t pid, uint64_t ssl_ctx) {
     (void)pid;
     (void)ssl_ctx;
     return false;
+}
+
+void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
+    (void)pid;
+    (void)ssl_ctx;
+    (void)alpn;
+}
+
+const char *http2_get_alpn(uint32_t pid, uint64_t ssl_ctx) {
+    (void)pid;
+    (void)ssl_ctx;
+    return "";
 }
 
 void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *event) {

@@ -2,6 +2,29 @@
 
 All notable changes to sslsniff will be documented in this file.
 
+## [0.5.1] - 2026-01-11
+
+### Fixed
+- **Firefox IPC Filtering**: Removed "Socket Thread" from IPC thread patterns
+  - "Socket Thread" is Firefox's legitimate web traffic thread, not IPC
+  - Fixes issue where `--filter-ipc` filtered out all Firefox web traffic
+
+- **HTTP/2 Preface Detection**: Added partial preface pattern matching
+  - Recognizes `"PRI "` prefix to avoid false IPC classification
+  - Fixes HTTP/2 sessions being filtered before establishment
+
+- **HTTP/2 Control Frame Suppression**: Suppress noisy control frames in release mode
+  - Hides SETTINGS, WINDOW_UPDATE, PING, RST_STREAM, PRIORITY frames
+  - Small writes (< 9 bytes) on active HTTP/2 sessions are suppressed
+  - Debug mode (`-d`) preserves all raw events for protocol development
+
+### Changed
+- Test executables excluded from default build target (use `make test` to build and run)
+- Added `debug_mode` to global config for conditional raw event display
+
+### Removed
+- Unused `is_verified_nss_ssl_fd()` function (cleanup)
+
 ## [0.5.0] - 2026-01-10
 
 ### Added

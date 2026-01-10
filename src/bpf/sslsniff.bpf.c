@@ -31,6 +31,7 @@
 #define EVENT_HANDSHAKE    2
 #define EVENT_PROCESS_EXIT 3
 #define EVENT_ALPN         4
+#define EVENT_NSS_SSL_FD   5  // NSS SSL_ImportFD tracking (verified TLS connection)
 
 // Data structure for SSL events
 struct ssl_data_event {
@@ -66,6 +67,7 @@ struct alpn_query_args {
     __u64 data_ptr;       // Pointer to output data pointer (OpenSSL) or buffer (NSS/GnuTLS)
     __u64 len_ptr;        // Pointer to length output
 };
+
 
 // =============================================================================
 // BPF Maps
@@ -129,6 +131,7 @@ struct {
     __type(value, __u8);   // dummy value (just need existence)
 } tracked_pids SEC(".maps");
 
+
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -168,6 +171,7 @@ static __always_inline void track_pid(__u32 pid) {
     __u8 val = 1;
     bpf_map_update_elem(&tracked_pids, &pid, &val, BPF_ANY);
 }
+
 
 // =============================================================================
 // SSL Read/Write Entry Probe
@@ -1124,6 +1128,67 @@ int BPF_URETPROBE(probe_wolfssl_alpn_exit) {
 
     bpf_map_delete_elem(&alpn_query_map, &tid);
     return 0;
+}
+
+// =============================================================================
+// NSS SSL_ImportFD Probe - Track verified SSL connections
+// PRFileDesc* SSL_ImportFD(PRFileDesc *model, PRFileDesc *fd)
+//
+// This is the bottleneck for all Firefox web traffic - every HTTPS connection
+// must pass through here to get its TLS wrapper. IPC almost never does.
+// By tracking which file descriptors have been promoted to SSL, we can
+// filter out non-SSL IPC traffic.
+// =============================================================================
+
+// Map to track SSL-imported file descriptors
+// Key: PRFileDesc pointer (returned by SSL_ImportFD)
+// Value: 1 (just marks existence)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);  // PRFileDesc pointer
+    __type(value, __u8);
+} nss_ssl_fds SEC(".maps");
+
+SEC("uretprobe/ssl_import_fd")
+int BPF_URETPROBE(probe_ssl_import_fd_exit) {
+    __u32 zero = 0;
+
+    // Get returned PRFileDesc* - this is the SSL-wrapped fd
+    __u64 ssl_fd = (__u64)PT_REGS_RC((struct pt_regs *)ctx);
+
+    if (ssl_fd == 0) {
+        return 0;  // SSL_ImportFD failed
+    }
+
+    // Mark this fd as a verified SSL connection
+    __u8 val = 1;
+    bpf_map_update_elem(&nss_ssl_fds, &ssl_fd, &val, BPF_ANY);
+
+    // Emit event for userspace tracking
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        return 0;
+    }
+
+    fill_event_metadata(event);
+    event->event_type = EVENT_NSS_SSL_FD;
+    event->ssl_ctx = ssl_fd;  // The SSL-wrapped PRFileDesc
+    event->len = 0;
+    event->buf_filled = 0;
+    event->delta_ns = 0;
+
+    track_pid(event->pid);
+
+    bpf_ringbuf_output(&ssl_events, event,
+                       sizeof(struct ssl_data_event) - MAX_BUF_SIZE, 0);
+
+    return 0;
+}
+
+// Helper to check if a PRFileDesc is a verified SSL connection
+static __always_inline bool is_nss_ssl_fd(__u64 fd) {
+    return bpf_map_lookup_elem(&nss_ssl_fds, &fd) != NULL;
 }
 
 // =============================================================================
