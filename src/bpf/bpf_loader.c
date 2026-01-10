@@ -18,7 +18,7 @@
  */
 
 #include "bpf_loader.h"
-#include "../../include/sslsniff.h"
+#include "../include/sslsniff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

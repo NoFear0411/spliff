@@ -25,7 +25,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <bpf/libbpf.h>
-#include "../../include/sslsniff.h"
+#include "../include/sslsniff.h"
 
 #define MAX_BUF_SIZE 16384
 #define PID_CACHE_SIZE 1024

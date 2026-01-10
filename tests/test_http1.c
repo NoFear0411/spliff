@@ -22,7 +22,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include "../include/sslsniff.h"
+#include "../src/include/sslsniff.h"
 #include "../src/protocol/http1.h"
 
 #define TEST(name) printf("TEST: %s... ", name)
@@ -241,7 +241,7 @@ static void test_chunked_response(void) {
     body_buf[body_len] = '\0';
     if (strcmp((char *)body_buf, "HelloWorld!") != 0) {
         char buf[128];
-        snprintf(buf, sizeof(buf), "Wrong body: '%s'", body_buf);
+        snprintf(buf, sizeof(buf), "Wrong body: '%.64s'", body_buf);
         FAIL(buf);
         return;
     }

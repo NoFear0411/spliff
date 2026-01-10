@@ -23,7 +23,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
-#include "../../include/sslsniff.h"
+#include "../include/sslsniff.h"
 
 /* ANSI color codes */
 #define C_RESET   "\033[0m"
