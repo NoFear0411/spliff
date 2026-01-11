@@ -33,6 +33,16 @@
 #define EVENT_ALPN         4
 #define EVENT_NSS_SSL_FD   5  // NSS SSL_ImportFD tracking (verified TLS connection)
 
+// Address families for socket filtering
+#define AF_UNIX     1   // Unix domain socket (IPC - filter out)
+#define AF_INET     2   // IPv4 (web traffic - keep)
+#define AF_INET6    10  // IPv6 (web traffic - keep)
+
+// Protocol types for session tracking
+#define PROTO_UNKNOWN   0
+#define PROTO_HTTP1     1   // HTTP/1.x - route to llhttp
+#define PROTO_HTTP2     2   // HTTP/2   - route to nghttp2
+
 // Data structure for SSL events
 struct ssl_data_event {
     __u64 timestamp_ns;
@@ -66,6 +76,21 @@ struct alpn_query_args {
     __u64 ssl_ctx;        // SSL context pointer
     __u64 data_ptr;       // Pointer to output data pointer (OpenSSL) or buffer (NSS/GnuTLS)
     __u64 len_ptr;        // Pointer to length output
+};
+
+// Session info for tracked web connections
+// Only sessions that pass socket family check (AF_INET/AF_INET6) and have valid ALPN
+struct session_info {
+    __u32 protocol;       // PROTO_HTTP1, PROTO_HTTP2
+    __u16 family;         // AF_INET, AF_INET6
+    __u16 flags;          // Reserved for future use
+    __s32 fd;             // OS file descriptor (for socket family lookup)
+};
+
+// SSL_set_fd arguments (for OpenSSL fd tracking)
+struct ssl_fd_args {
+    __u64 ssl_ctx;        // SSL* pointer
+    __s32 fd;             // OS file descriptor
 };
 
 
@@ -131,6 +156,51 @@ struct {
     __type(value, __u8);   // dummy value (just need existence)
 } tracked_pids SEC(".maps");
 
+// =============================================================================
+// Session Tracking Maps (for IPC filtering and protocol routing)
+// =============================================================================
+
+// Map SSL* (or PRFileDesc*, gnutls_session_t) → session_info
+// Populated on successful handshake + ALPN negotiation
+// Key: ssl_ctx pointer
+// Value: session_info with protocol type and socket family
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);    // SSL* / PRFileDesc* / gnutls_session_t pointer
+    __type(value, struct session_info);
+} tracked_sessions SEC(".maps");
+
+// Map SSL* → OS file descriptor (for OpenSSL)
+// Populated by SSL_set_fd hook
+// Key: SSL* pointer
+// Value: OS fd number
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);    // SSL* pointer
+    __type(value, __s32);  // OS fd
+} ssl_to_fd SEC(".maps");
+
+// Map tid → ssl_fd_args (for SSL_set_fd entry/exit probe)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);    // tid
+    __type(value, struct ssl_fd_args);
+} ssl_fd_args_map SEC(".maps");
+
+// Map to track SSL-imported file descriptors (NSS layer filtering)
+// Populated by SSL_ImportFD hook - marks verified SSL connections
+// Key: PRFileDesc pointer (returned by SSL_ImportFD)
+// Value: 1 (just marks existence)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u64);    // PRFileDesc pointer
+    __type(value, __u8);
+} nss_ssl_fds SEC(".maps");
+
 
 // =============================================================================
 // Helper Functions
@@ -170,6 +240,147 @@ static __always_inline void fill_event_metadata(struct ssl_data_event *event) {
 static __always_inline void track_pid(__u32 pid) {
     __u8 val = 1;
     bpf_map_update_elem(&tracked_pids, &pid, &val, BPF_ANY);
+}
+
+// =============================================================================
+// Socket Family Lookup (CO-RE)
+// Walks: task_struct → files_struct → fdtable → file → socket → sock → skc_family
+// Returns AF_INET (2), AF_INET6 (10), AF_UNIX (1), or 0 on error
+// =============================================================================
+
+static __always_inline __u16 get_socket_family_from_fd(__s32 fd) {
+    if (fd < 0) return 0;
+
+    // Get current task
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) return 0;
+
+    // task → files_struct
+    struct files_struct *files = NULL;
+    if (bpf_core_read(&files, sizeof(files), &task->files) || !files)
+        return 0;
+
+    // files_struct → fdtable
+    struct fdtable *fdt = NULL;
+    if (bpf_core_read(&fdt, sizeof(fdt), &files->fdt) || !fdt)
+        return 0;
+
+    // fdtable → fd array
+    struct file **fd_array = NULL;
+    if (bpf_core_read(&fd_array, sizeof(fd_array), &fdt->fd) || !fd_array)
+        return 0;
+
+    // Bounds check for fd (BPF verifier requirement)
+    if (fd >= 8192) return 0;  // Reasonable upper bound
+
+    // fd_array[fd] → file
+    struct file *file = NULL;
+    if (bpf_core_read(&file, sizeof(file), &fd_array[fd]) || !file)
+        return 0;
+
+    // file → private_data (which is struct socket* for sockets)
+    void *private_data = NULL;
+    if (bpf_core_read(&private_data, sizeof(private_data), &file->private_data) || !private_data)
+        return 0;
+
+    // Cast to socket and get sk
+    struct socket *sock = (struct socket *)private_data;
+    struct sock *sk = NULL;
+    if (bpf_core_read(&sk, sizeof(sk), &sock->sk) || !sk)
+        return 0;
+
+    // sock → __sk_common → skc_family
+    __u16 family = 0;
+    bpf_core_read(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+    return family;
+}
+
+// Check if a session is tracked and get its info
+// Returns: pointer to session_info if tracked, NULL otherwise
+static __always_inline struct session_info *get_session_info(__u64 ssl_ctx) {
+    return bpf_map_lookup_elem(&tracked_sessions, &ssl_ctx);
+}
+
+// Check if SSL* has a known fd mapping and return socket family
+// Returns: AF_INET, AF_INET6, AF_UNIX, or 0 if unknown
+static __always_inline __u16 get_ssl_socket_family(__u64 ssl_ctx) {
+    // First check if we have a tracked session with known family
+    struct session_info *info = get_session_info(ssl_ctx);
+    if (info && info->family != 0) {
+        return info->family;
+    }
+
+    // Try to look up fd from ssl_to_fd map (populated by SSL_set_fd)
+    __s32 *fd_ptr = bpf_map_lookup_elem(&ssl_to_fd, &ssl_ctx);
+    if (!fd_ptr) return 0;
+
+    return get_socket_family_from_fd(*fd_ptr);
+}
+
+// Check if socket family indicates web traffic (not IPC)
+static __always_inline bool is_web_socket_family(__u16 family) {
+    return family == AF_INET || family == AF_INET6;
+}
+
+// Check if a PRFileDesc is a verified SSL connection (NSS layer filtering)
+static __always_inline bool is_nss_ssl_fd(__u64 fd) {
+    return bpf_map_lookup_elem(&nss_ssl_fds, &fd) != NULL;
+}
+
+// Parse ALPN string and return protocol type
+// "h2" → PROTO_HTTP2, "http/1.1" or "http/1.0" → PROTO_HTTP1
+static __always_inline __u32 parse_alpn_protocol(const __u8 *alpn, __u32 len) {
+    if (len == 2 && alpn[0] == 'h' && alpn[1] == '2') {
+        return PROTO_HTTP2;
+    }
+    if (len >= 8 && alpn[0] == 'h' && alpn[1] == 't' && alpn[2] == 't' && alpn[3] == 'p' &&
+        alpn[4] == '/' && alpn[5] == '1' && alpn[6] == '.') {
+        return PROTO_HTTP1;  // http/1.0 or http/1.1
+    }
+    return PROTO_UNKNOWN;
+}
+
+// Update session with protocol type from ALPN negotiation
+// Also validates/updates socket family if we have fd mapping
+static __always_inline void update_session_protocol(__u64 ssl_ctx, __u32 protocol) {
+    struct session_info *info = bpf_map_lookup_elem(&tracked_sessions, &ssl_ctx);
+    if (info) {
+        // Update protocol in existing session
+        info->protocol = protocol;
+
+        // If we don't have family yet, try to get it from fd mapping
+        if (info->family == 0) {
+            __s32 *fd_ptr = bpf_map_lookup_elem(&ssl_to_fd, &ssl_ctx);
+            if (fd_ptr) {
+                __u16 family = get_socket_family_from_fd(*fd_ptr);
+                info->family = family;
+                info->fd = *fd_ptr;
+            }
+        }
+    } else {
+        // Create new session entry
+        __s32 fd = -1;
+        __u16 family = 0;
+
+        // Try to get fd and family from ssl_to_fd map
+        __s32 *fd_ptr = bpf_map_lookup_elem(&ssl_to_fd, &ssl_ctx);
+        if (fd_ptr) {
+            fd = *fd_ptr;
+            family = get_socket_family_from_fd(fd);
+        }
+
+        // Only track if we have valid ALPN (h1/h2)
+        if (protocol != PROTO_UNKNOWN) {
+            struct session_info new_info = {
+                .protocol = protocol,
+                .family = family,
+                .flags = 0,
+                .fd = fd,
+            };
+            bpf_map_update_elem(&tracked_sessions, &ssl_ctx, &new_info, BPF_ANY);
+        }
+    }
 }
 
 
@@ -411,6 +622,74 @@ int BPF_URETPROBE(probe_ssl_handshake_exit) {
 }
 
 // =============================================================================
+// SSL_set_fd Hook (OpenSSL)
+// int SSL_set_fd(SSL *ssl, int fd)
+// Maps SSL* → OS fd for socket family lookup
+// =============================================================================
+
+SEC("uprobe/ssl_set_fd_enter")
+int BPF_UPROBE(probe_ssl_set_fd_enter, void *ssl, int fd) {
+    __u32 tid = get_tid();
+
+    // Save args for exit probe
+    struct ssl_fd_args args = {
+        .ssl_ctx = (__u64)ssl,
+        .fd = fd,
+    };
+
+    bpf_map_update_elem(&ssl_fd_args_map, &tid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/ssl_set_fd_exit")
+int BPF_URETPROBE(probe_ssl_set_fd_exit) {
+    __u32 tid = get_tid();
+
+    struct ssl_fd_args *args = bpf_map_lookup_elem(&ssl_fd_args_map, &tid);
+    if (!args) {
+        return 0;
+    }
+
+    // Check return value (1 = success)
+    int ret = PT_REGS_RC((struct pt_regs *)ctx);
+    if (ret != 1) {
+        bpf_map_delete_elem(&ssl_fd_args_map, &tid);
+        return 0;
+    }
+
+    // Store SSL* → fd mapping
+    __u64 ssl_ctx = args->ssl_ctx;
+    __s32 fd = args->fd;
+    bpf_map_update_elem(&ssl_to_fd, &ssl_ctx, &fd, BPF_ANY);
+
+    // Also update session_info if it exists, with socket family
+    struct session_info *info = bpf_map_lookup_elem(&tracked_sessions, &ssl_ctx);
+    if (info) {
+        __u16 family = get_socket_family_from_fd(fd);
+        if (family != 0) {
+            // Update in-place via map lookup (we have the pointer)
+            info->family = family;
+            info->fd = fd;
+        }
+    } else {
+        // Create new session entry with just fd/family (protocol TBD via ALPN)
+        __u16 family = get_socket_family_from_fd(fd);
+        if (is_web_socket_family(family)) {
+            struct session_info new_info = {
+                .protocol = PROTO_UNKNOWN,
+                .family = family,
+                .flags = 0,
+                .fd = fd,
+            };
+            bpf_map_update_elem(&tracked_sessions, &ssl_ctx, &new_info, BPF_ANY);
+        }
+    }
+
+    bpf_map_delete_elem(&ssl_fd_args_map, &tid);
+    return 0;
+}
+
+// =============================================================================
 // GnuTLS Probes
 // For: gnutls_record_send, gnutls_record_recv
 // =============================================================================
@@ -631,6 +910,17 @@ int BPF_URETPROBE(probe_nss_write_exit) {
         return 0;
     }
 
+    // NSS Layer Filtering: Only process verified SSL connections
+    // PRFileDesc passed through SSL_ImportFD is tracked in nss_ssl_fds map
+    // This filters out IPC, file I/O, and non-SSL NSPR operations
+    if (!is_nss_ssl_fd(args->ssl_ctx)) {
+        // Not a verified SSL connection - skip
+        // Still cleanup to avoid map leaks
+        bpf_map_delete_elem(&ssl_args_map, &tid);
+        bpf_map_delete_elem(&start_ns, &tid);
+        return 0;
+    }
+
     // Get return value (bytes written)
     int ret = (int)PT_REGS_RC((struct pt_regs *)ctx);
     if (ret <= 0) {
@@ -718,6 +1008,14 @@ int BPF_URETPROBE(probe_nss_read_exit) {
     // Lookup saved arguments
     struct ssl_args *args = bpf_map_lookup_elem(&ssl_args_map, &tid);
     if (!args) {
+        return 0;
+    }
+
+    // NSS Layer Filtering: Only process verified SSL connections
+    // This filters out non-SSL PRFileDesc layers (IPC, file I/O, etc.)
+    if (!is_nss_ssl_fd(args->ssl_ctx)) {
+        bpf_map_delete_elem(&ssl_args_map, &tid);
+        bpf_map_delete_elem(&start_ns, &tid);
         return 0;
     }
 
@@ -855,6 +1153,10 @@ int BPF_URETPROBE(probe_openssl_alpn_exit) {
     int err = bpf_probe_read_user(&event->buf, alpn_len & 0xFF, (void *)data_ptr);
     if (err == 0) {
         event->buf_filled = alpn_len;
+
+        // Update session tracking with protocol type
+        __u32 protocol = parse_alpn_protocol(event->buf, alpn_len);
+        update_session_protocol(args->ssl_ctx, protocol);
     }
 
     // Track this PID
@@ -939,6 +1241,10 @@ int BPF_URETPROBE(probe_gnutls_alpn_exit) {
     int err = bpf_probe_read_user(&event->buf, datum.size & 0xFF, (void *)datum.data);
     if (err == 0) {
         event->buf_filled = datum.size;
+
+        // Update session tracking with protocol type
+        __u32 protocol = parse_alpn_protocol(event->buf, datum.size);
+        update_session_protocol(args->ssl_ctx, protocol);
     }
 
     // Track this PID
@@ -1023,6 +1329,10 @@ int BPF_URETPROBE(probe_nss_alpn_exit) {
         int err = bpf_probe_read_user(&event->buf, alpn_len & 0xFF, (void *)args->data_ptr);
         if (err == 0) {
             event->buf_filled = alpn_len;
+
+            // Update session tracking with protocol type
+            __u32 protocol = parse_alpn_protocol(event->buf, alpn_len);
+            update_session_protocol(args->ssl_ctx, protocol);
         }
     }
 
@@ -1114,6 +1424,10 @@ int BPF_URETPROBE(probe_wolfssl_alpn_exit) {
     int err = bpf_probe_read_user(&event->buf, alpn_len & 0xFF, (void *)protocol_ptr);
     if (err == 0) {
         event->buf_filled = alpn_len;
+
+        // Update session tracking with protocol type
+        __u32 protocol = parse_alpn_protocol(event->buf, alpn_len);
+        update_session_protocol(args->ssl_ctx, protocol);
     }
 
     // Track this PID
@@ -1139,16 +1453,6 @@ int BPF_URETPROBE(probe_wolfssl_alpn_exit) {
 // By tracking which file descriptors have been promoted to SSL, we can
 // filter out non-SSL IPC traffic.
 // =============================================================================
-
-// Map to track SSL-imported file descriptors
-// Key: PRFileDesc pointer (returned by SSL_ImportFD)
-// Value: 1 (just marks existence)
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u64);  // PRFileDesc pointer
-    __type(value, __u8);
-} nss_ssl_fds SEC(".maps");
 
 SEC("uretprobe/ssl_import_fd")
 int BPF_URETPROBE(probe_ssl_import_fd_exit) {
@@ -1186,9 +1490,50 @@ int BPF_URETPROBE(probe_ssl_import_fd_exit) {
     return 0;
 }
 
-// Helper to check if a PRFileDesc is a verified SSL connection
-static __always_inline bool is_nss_ssl_fd(__u64 fd) {
-    return bpf_map_lookup_elem(&nss_ssl_fds, &fd) != NULL;
+// =============================================================================
+// Session Cleanup Hooks
+// Clean up BPF maps when SSL sessions are explicitly freed
+// This prevents map exhaustion over time and keeps tracking accurate
+// =============================================================================
+
+// OpenSSL: SSL_free(SSL *ssl) - cleanup when SSL connection is freed
+SEC("uprobe/ssl_free")
+int BPF_UPROBE(probe_ssl_free, void *ssl) {
+    __u64 ssl_ctx = (__u64)ssl;
+
+    // Clean up session tracking
+    bpf_map_delete_elem(&tracked_sessions, &ssl_ctx);
+
+    // Clean up SSL* → fd mapping
+    bpf_map_delete_elem(&ssl_to_fd, &ssl_ctx);
+
+    return 0;
+}
+
+// NSS: PR_Close(PRFileDesc *fd) - cleanup when PRFileDesc is closed
+// This cleans up both SSL-imported fds and potentially session tracking
+SEC("uprobe/pr_close")
+int BPF_UPROBE(probe_pr_close, void *fd) {
+    __u64 fd_ptr = (__u64)fd;
+
+    // Clean up NSS SSL fd tracking
+    bpf_map_delete_elem(&nss_ssl_fds, &fd_ptr);
+
+    // Also try to clean up session tracking (PRFileDesc used as ssl_ctx for NSS)
+    bpf_map_delete_elem(&tracked_sessions, &fd_ptr);
+
+    return 0;
+}
+
+// GnuTLS: gnutls_deinit(gnutls_session_t session) - cleanup when session is freed
+SEC("uprobe/gnutls_deinit")
+int BPF_UPROBE(probe_gnutls_deinit, void *session) {
+    __u64 ssl_ctx = (__u64)session;
+
+    // Clean up session tracking
+    bpf_map_delete_elem(&tracked_sessions, &ssl_ctx);
+
+    return 0;
 }
 
 // =============================================================================

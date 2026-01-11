@@ -271,22 +271,20 @@ static bool should_display(probe_handler_t *handler, const ssl_data_event_t *e) 
     /* Filter truly internal threads (non-HTTP traffic like file cache) */
     if (e->buf_filled <= 1) return false;
 
-    /* Enhanced IPC filtering (opt-in via --filter-ipc) */
-    if (handler->filter_ipc) {
-        /* Check for known internal thread patterns */
-        if (is_internal_thread(e->comm)) return false;
+    /*
+     * Enhanced IPC filtering (always on - BPF handles kernel-level socket family
+     * filtering, this provides additional userspace heuristics as backup)
+     */
 
-        /* Content-based IPC detection for all traffic.
-         * Skip if this connection has an active HTTP/2 session (definitely web traffic) */
-        bool has_h2 = http2_has_session(e->pid, e->ssl_ctx);
-        if (!has_h2) {
-            /* Check if data looks like IPC rather than HTTP */
-            if (is_ipc_traffic(e)) return false;
-        }
-    } else {
-        /* Basic internal thread filtering (always on) */
-        if (strstr(e->comm, "Cache2 I/O") || strstr(e->comm, "Timer") ||
-            strstr(e->comm, "LS Thread") || strstr(e->comm, "BgIOThr")) return false;
+    /* Check for known internal thread patterns */
+    if (is_internal_thread(e->comm)) return false;
+
+    /* Content-based IPC detection for all traffic.
+     * Skip if this connection has an active HTTP/2 session (definitely web traffic) */
+    bool has_h2 = http2_has_session(e->pid, e->ssl_ctx);
+    if (!has_h2) {
+        /* Check if data looks like IPC rather than HTTP */
+        if (is_ipc_traffic(e)) return false;
     }
 
     return true;
