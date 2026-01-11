@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to sslsniff will be documented in this file.
+All notable changes to spliff will be documented in this file.
 
 ## [0.5.3] - 2026-01-11
 

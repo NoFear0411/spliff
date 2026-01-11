@@ -1,8 +1,8 @@
 /*
  * SPDX-License-Identifier: GPL-3.0-only
  *
- * sslsniff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 sslsniff authors
+ * spliff - eBPF-based SSL/TLS traffic sniffer
+ * Copyright (C) 2025-2026 spliff authors
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -25,7 +25,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
-#include "include/sslsniff.h"
+#include "include/spliff.h"
 #include "bpf/bpf_loader.h"
 #include "bpf/probe_handler.h"
 #include "output/display.h"
@@ -619,7 +619,7 @@ show_raw:
 
 /* Print usage */
 static void print_usage(const char *prog) {
-    printf("sslsniff v%s - SSL/TLS Traffic Sniffer\n\n", SSLSNIFF_VERSION);
+    printf("spliff v%s - SSL/TLS Traffic Sniffer\n\n", SPLIFF_VERSION);
     printf("Usage: %s [options]\n\n", prog);
     printf("Options:\n");
     printf("  -p, --pid PID   Filter by PID(s), comma-separated\n");
@@ -677,7 +677,7 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             return 0;
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
-            printf("sslsniff version %s\n", SSLSNIFF_VERSION);
+            printf("spliff version %s\n", SPLIFF_VERSION);
             return 0;
         } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--pid") == 0) {
             if (i + 1 >= argc) {
@@ -775,8 +775,8 @@ int main(int argc, char **argv) {
 
     printf("\n%s╔════════════════════════════════════════╗%s\n",
            display_color(C_CYAN), display_color(C_RESET));
-    printf("%s║      sslsniff v%-6s                  ║%s\n",
-           display_color(C_CYAN), SSLSNIFF_VERSION, display_color(C_RESET));
+    printf("%s║      spliff v%-6s                  ║%s\n",
+           display_color(C_CYAN), SPLIFF_VERSION, display_color(C_RESET));
     printf("%s╚════════════════════════════════════════╝%s\n\n",
            display_color(C_CYAN), display_color(C_RESET));
 
@@ -868,10 +868,10 @@ int main(int argc, char **argv) {
 
     /* Load BPF program - try multiple paths */
     static const char *bpf_paths[] = {
-        "build/sslsniff.bpf.o",           /* CMake build directory */
-        "sslsniff.bpf.o",                 /* Current directory */
-        "src/bpf/sslsniff.bpf.o",         /* Source directory (legacy) */
-        "/usr/lib/sslsniff/sslsniff.bpf.o", /* Installed path */
+        "build/spliff.bpf.o",           /* CMake build directory */
+        "spliff.bpf.o",                 /* Current directory */
+        "src/bpf/spliff.bpf.o",         /* Source directory (legacy) */
+        "/usr/lib/spliff/spliff.bpf.o", /* Installed path */
         NULL
     };
     int bpf_loaded = 0;

@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-This document outlines a comprehensive high-performance architecture for sslsniff that supports multiple packet capture modes from development to 100Gbps production environments. The design creates a **Dual-View Visibility** system:
+This document outlines a comprehensive high-performance architecture for spliff that supports multiple packet capture modes from development to 100Gbps production environments. The design creates a **Dual-View Visibility** system:
 
 - **Packet Layer (XDP/DPDK)**: Raw encrypted packets, timing, metadata, protocol detection
 - **Application Layer (Uprobes)**: Decrypted plaintext content
@@ -1310,8 +1310,8 @@ dpdk-devbind.py --status
 # Bind to vfio-pci (replace with your PCIe address):
 dpdk-devbind.py -b vfio-pci 0000:03:00.0
 
-# 4. Run sslsniff with DPDK
-sslsniff --mode dpdk -w 0000:03:00.0 --lcores 1-4,5-12
+# 4. Run spliff with DPDK
+spliff --mode dpdk -w 0000:03:00.0 --lcores 1-4,5-12
 ```
 
 ---
@@ -1477,7 +1477,7 @@ struct rte_mempool *create_numa_aware_pool(int numa_node) {
 
 **Files:**
 - `src/protocol/detect.c` (new)
-- `src/bpf/sslsniff.bpf.c` (update)
+- `src/bpf/spliff.bpf.c` (update)
 
 **Deliverable:** Protocol detection works on any port.
 
@@ -1581,7 +1581,7 @@ struct rte_mempool *create_numa_aware_pool(int numa_node) {
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
-project(sslsniff C)
+project(spliff C)
 
 # Options
 option(ENABLE_XDP    "Enable XDP support" ON)
@@ -1626,7 +1626,7 @@ if(ENABLE_DPDK)
 endif()
 
 # Build
-add_executable(sslsniff
+add_executable(spliff
     src/main.c
     src/threading/worker.c
     src/threading/pool.c
@@ -1643,14 +1643,14 @@ add_executable(sslsniff
     # ... other sources
 )
 
-target_include_directories(sslsniff PRIVATE
+target_include_directories(spliff PRIVATE
     ${LIBBPF_INCLUDE_DIRS}
     ${CK_INCLUDE_DIRS}
     ${URCU_INCLUDE_DIRS}
     ${EXTRA_INCLUDES}
 )
 
-target_link_libraries(sslsniff
+target_link_libraries(spliff
     ${LIBBPF_LIBRARIES}
     ${CK_LIBRARIES}
     ${URCU_LIBRARIES}
@@ -1664,7 +1664,7 @@ target_link_libraries(sslsniff
 ## 15. CLI Interface
 
 ```
-sslsniff [OPTIONS]
+spliff [OPTIONS]
 
 Capture Modes:
   --mode <mode>           Capture mode: kernel, xdp, af_xdp, dpdk
@@ -1704,16 +1704,16 @@ Output Options:
 
 Examples:
   # Development (low bandwidth)
-  sslsniff --mode kernel -i eth0
+  spliff --mode kernel -i eth0
 
   # Production (10-25 Gbps)
-  sslsniff --mode xdp -i eth0 --workers 8
+  spliff --mode xdp -i eth0 --workers 8
 
   # High-performance (25-50 Gbps)
-  sslsniff --mode af_xdp -i eth0 --queues 4 --workers 12
+  spliff --mode af_xdp -i eth0 --queues 4 --workers 12
 
   # Extreme (100 Gbps)
-  sudo sslsniff --mode dpdk -w 0000:03:00.0 --lcores 1-4,5-12 --huge-pages 8192
+  sudo spliff --mode dpdk -w 0000:03:00.0 --lcores 1-4,5-12 --huge-pages 8192
 ```
 
 ---
@@ -1783,4 +1783,4 @@ Examples:
 
 *Document created: 2026-01-11*
 *Last updated: 2026-01-11*
-*Author: sslsniff development*
+*Author: spliff development*

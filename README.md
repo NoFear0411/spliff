@@ -1,4 +1,4 @@
-# sslsniff
+# spliff
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
@@ -6,7 +6,7 @@
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
-Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. sslsniff uses eBPF uprobes to hook SSL/TLS library functions, intercepting data after decryption but before it reaches the application.
+Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. spliff uses eBPF uprobes to hook SSL/TLS library functions, intercepting data after decryption but before it reaches the application.
 
 ## Features
 
@@ -54,8 +54,8 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 
 ```bash
 # Clone the repository
-git clone https://github.com/example/sslsniff.git
-cd sslsniff
+git clone https://github.com/NoFear0411/spliff.git
+cd spliff
 
 # Build (debug mode with sanitizers)
 make
@@ -94,33 +94,33 @@ cmake --build build
 
 ```bash
 # Basic usage (captures all SSL traffic)
-sudo ./sslsniff
+sudo ./spliff
 
 # Filter by process
-sudo ./sslsniff -p 1234                    # By PID
-sudo ./sslsniff --comm curl                # By process name
-sudo ./sslsniff --ppid 1234                # By parent PID (includes descendants)
+sudo ./spliff -p 1234                    # By PID
+sudo ./spliff --comm curl                # By process name
+sudo ./spliff --ppid 1234                # By parent PID (includes descendants)
 
 # Filter by SSL library
-sudo ./sslsniff --openssl                  # OpenSSL only
-sudo ./sslsniff --gnutls                   # GnuTLS only
-sudo ./sslsniff --nss                      # NSS only
+sudo ./spliff --openssl                  # OpenSSL only
+sudo ./spliff --gnutls                   # GnuTLS only
+sudo ./spliff --nss                      # NSS only
 
 # Output options
-sudo ./sslsniff -c                         # Compact mode (one line per request)
-sudo ./sslsniff -b                         # Show response bodies
-sudo ./sslsniff -x                         # Hexdump body with file signatures
-sudo ./sslsniff -l                         # Show latency
-sudo ./sslsniff -H                         # Show TLS handshakes
-sudo ./sslsniff -C                         # Disable colors
+sudo ./spliff -c                         # Compact mode (one line per request)
+sudo ./spliff -b                         # Show response bodies
+sudo ./spliff -x                         # Hexdump body with file signatures
+sudo ./spliff -l                         # Show latency
+sudo ./spliff -H                         # Show TLS handshakes
+sudo ./spliff -C                         # Disable colors
 
 # Browser-specific
-sudo ./sslsniff --comm firefox --filter-ipc    # Firefox without IPC noise
-sudo ./sslsniff --comm chrome --filter-ipc     # Chrome without IPC noise
+sudo ./spliff --comm firefox --filter-ipc    # Firefox without IPC noise
+sudo ./spliff --comm chrome --filter-ipc     # Chrome without IPC noise
 
 # Debugging
-sudo ./sslsniff -d                         # Debug mode (raw events)
-sudo ./sslsniff --show-libs                # Show discovered SSL libraries
+sudo ./spliff -d                         # Debug mode (raw events)
+sudo ./spliff --show-libs                # Show discovered SSL libraries
 ```
 
 ## Example Output
@@ -162,7 +162,7 @@ sudo ./sslsniff --show-libs                # Show discovered SSL libraries
 │               └─────────────┬─────────────┘                             │
 │                             │                                           │
 │               ┌─────────────▼─────────────┐                             │
-│               │      sslsniff             │                             │
+│               │      spliff             │                             │
 │               │  ┌─────────────────────┐  │                             │
 │               │  │  HTTP/1.1 Parser    │  │                             │
 │               │  │  (llhttp)           │  │                             │
@@ -179,7 +179,7 @@ sudo ./sslsniff --show-libs                # Show discovered SSL libraries
 │                              Kernel Space                                │
 │                                                                         │
 │   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │                    eBPF Program (sslsniff.bpf.c)                 │  │
+│   │                    eBPF Program (spliff.bpf.c)                 │  │
 │   │                                                                  │  │
 │   │   • Captures SSL_read/SSL_write arguments and return values     │  │
 │   │   • Copies decrypted data to perf buffer                        │  │
@@ -194,15 +194,15 @@ sudo ./sslsniff --show-libs                # Show discovered SSL libraries
 ## Project Structure
 
 ```
-sslsniff/
+spliff/
 ├── CMakeLists.txt          # CMake build configuration
 ├── Makefile                # Convenience wrapper for CMake
 ├── src/
 │   ├── main.c              # Entry point, CLI parsing, event loop
 │   ├── include/
-│   │   └── sslsniff.h      # Public header, shared types
+│   │   └── spliff.h      # Public header, shared types
 │   ├── bpf/
-│   │   ├── sslsniff.bpf.c  # eBPF program (kernel space)
+│   │   ├── spliff.bpf.c  # eBPF program (kernel space)
 │   │   ├── bpf_loader.c    # BPF program loader
 │   │   ├── probe_handler.c # Event filtering and processing
 │   │   └── vmlinux.h       # Kernel type definitions
@@ -239,18 +239,16 @@ See [docs/](docs/) for detailed implementation plans.
 
 ## Known Limitations
 
-- HPACK dynamic table not fully maintained (static table only)
-- HTTP/2 CONTINUATION frames have basic support only
 - NSS captures all NSPR I/O (includes non-HTTP traffic, use `--filter-ipc`)
-- Requires kernel 5.x+ with BTF support
+- Requires Linux kernel 5.x+ with BTF support
 - QUIC/HTTP/3 not yet supported (planned for v0.6.0)
 
 ## Troubleshooting
 
 ### "Operation not permitted"
 ```bash
-# sslsniff requires root for eBPF
-sudo ./sslsniff
+# spliff requires root for eBPF
+sudo ./spliff
 ```
 
 ### "Failed to load BPF program"
@@ -265,16 +263,16 @@ ls /sys/kernel/btf/vmlinux
 ### No traffic captured
 ```bash
 # Check if SSL libraries are found
-sudo ./sslsniff --show-libs
+sudo ./spliff --show-libs
 
 # Try specific library flag
-sudo ./sslsniff --openssl -d
+sudo ./spliff --openssl -d
 ```
 
 ### Firefox shows no traffic
 ```bash
 # Firefox uses multiple processes - use process name filter
-sudo ./sslsniff --comm firefox --filter-ipc
+sudo ./spliff --comm firefox --filter-ipc
 ```
 
 ## Contributing
@@ -285,7 +283,7 @@ Contributions are welcome! Please see the [CHANGELOG.md](CHANGELOG.md) for recen
 
 GPL-3.0-only - See [LICENSE](LICENSE) for details.
 
-BPF code (`src/bpf/sslsniff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel requirement).
+BPF code (`src/bpf/spliff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel requirement).
 
 ## Acknowledgments
 

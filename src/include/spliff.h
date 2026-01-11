@@ -1,8 +1,8 @@
 /*
  * SPDX-License-Identifier: GPL-3.0-only
  *
- * sslsniff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 sslsniff authors
+ * spliff - eBPF-based SSL/TLS traffic sniffer
+ * Copyright (C) 2025-2026 spliff authors
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -17,15 +17,15 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef SSLSNIFF_H
-#define SSLSNIFF_H
+#ifndef SPLIFF_H
+#define SPLIFF_H
 
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
 
-#define SSLSNIFF_VERSION "0.5.2"
+#define SPLIFF_VERSION "0.5.2"
 
 /* Debug logging macros - only active in DEBUG builds */
 #ifdef DEBUG
@@ -37,9 +37,9 @@
 #define DEBUG_H2(fmt, ...) ((void)0)
 #define DEBUG_MAIN(fmt, ...) ((void)0)
 #endif
-#define SSLSNIFF_VERSION_MAJOR 0
-#define SSLSNIFF_VERSION_MINOR 5
-#define SSLSNIFF_VERSION_PATCH 2
+#define SPLIFF_VERSION_MAJOR 0
+#define SPLIFF_VERSION_MINOR 5
+#define SPLIFF_VERSION_PATCH 2
 
 /* Maximum sizes */
 #define MAX_HEADER_NAME     256
@@ -158,4 +158,4 @@ typedef struct {
 /* Global config (set by main, read by all) */
 extern config_t g_config;
 
-#endif /* SSLSNIFF_H */
+#endif /* SPLIFF_H */
