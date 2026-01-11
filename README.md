@@ -8,6 +8,8 @@
 
 Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. spliff uses eBPF uprobes to hook SSL/TLS library functions, intercepting data after decryption but before it reaches the application.
 
+**The project is entirely coded by claude opus and the goal is to build a full EDR/XDR open-soruce agent/platform with the help of AI**
+
 ## Features
 
 ### SSL/TLS Library Support
@@ -145,16 +147,16 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                              User Space                                  │
+│                              User Space                                 │
 │                                                                         │
-│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                │
-│   │   curl      │    │   Firefox   │    │   Chrome    │                │
-│   └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                │
+│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                 │
+│   │   curl      │    │   Firefox   │    │   Chrome    │                 │
+│   └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                 │
 │          │                  │                  │                        │
-│   ┌──────▼──────┐    ┌──────▼──────┐    ┌──────▼──────┐                │
-│   │   OpenSSL   │    │    NSS      │    │  BoringSSL  │                │
-│   │ SSL_read()  │    │  PR_Read()  │    │ SSL_read()  │                │
-│   └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                │
+│   ┌──────▼──────┐    ┌──────▼──────┐    ┌──────▼──────┐                 │
+│   │   OpenSSL   │    │    NSS      │    │  BoringSSL  │                 │
+│   │ SSL_read()  │    │  PR_Read()  │    │ SSL_read()  │                 │
+│   └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                 │
 │          │                  │                  │                        │
 │          │    ┌─────────────┴─────────────┐    │                        │
 │          │    │      eBPF Uprobes         │    │                        │
@@ -162,7 +164,7 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │               └─────────────┬─────────────┘                             │
 │                             │                                           │
 │               ┌─────────────▼─────────────┐                             │
-│               │      spliff             │                             │
+│               │      spliff             │                               │
 │               │  ┌─────────────────────┐  │                             │
 │               │  │  HTTP/1.1 Parser    │  │                             │
 │               │  │  (llhttp)           │  │                             │
@@ -176,17 +178,17 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │               └───────────────────────────┘                             │
 │                                                                         │
 ├─────────────────────────────────────────────────────────────────────────┤
-│                              Kernel Space                                │
+│                              Kernel Space                               │
 │                                                                         │
-│   ┌─────────────────────────────────────────────────────────────────┐  │
-│   │                    eBPF Program (spliff.bpf.c)                 │  │
-│   │                                                                  │  │
-│   │   • Captures SSL_read/SSL_write arguments and return values     │  │
-│   │   • Copies decrypted data to perf buffer                        │  │
-│   │   • Tracks process/thread info                                  │  │
-│   │   • Tracks SSL context for session correlation                  │  │
-│   │                                                                  │  │
-│   └─────────────────────────────────────────────────────────────────┘  │
+│   ┌─────────────────────────────────────────────────────────────────┐   │
+│   │                    eBPF Program (spliff.bpf.c)                  │   │
+│   │                                                                 │   │
+│   │   • Captures SSL_read/SSL_write arguments and return values     │   │
+│   │   • Copies decrypted data to perf buffer                        │   │
+│   │   • Tracks process/thread info                                  │   │
+│   │   • Tracks SSL context for session correlation                  │   │
+│   │                                                                 │   │
+│   └─────────────────────────────────────────────────────────────────┘   │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
