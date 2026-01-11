@@ -38,6 +38,8 @@ _CPack_Packages/
 
 # Claude Code
 .claude/
+CLAUDE.md
+**/CLAUDE.md
 
 # OS files
 .DS_Store
