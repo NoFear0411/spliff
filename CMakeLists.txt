@@ -1,12 +1,12 @@
-# sslsniff - eBPF-based SSL/TLS Traffic Sniffer
+# spliff - eBPF-based SSL/TLS Traffic Sniffer
 # CMake build configuration
 
 cmake_minimum_required(VERSION 3.20)
 
-project(sslsniff
+project(spliff
     VERSION 0.5.3
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
-    HOMEPAGE_URL "https://github.com/example/sslsniff"
+    HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C
 )
 
@@ -209,7 +209,7 @@ message(STATUS "Found clang: ${CLANG_EXECUTABLE}")
 # Source Files
 # ============================================================================
 
-set(SSLSNIFF_SOURCES
+set(SPLIFF_SOURCES
     src/main.c
     src/util/safe_str.c
     src/content/signatures.c
@@ -225,8 +225,8 @@ set(SSLSNIFF_SOURCES
 # BPF Program Compilation
 # ============================================================================
 
-set(BPF_SOURCE ${CMAKE_SOURCE_DIR}/src/bpf/sslsniff.bpf.c)
-set(BPF_OBJECT ${CMAKE_BINARY_DIR}/sslsniff.bpf.o)
+set(BPF_SOURCE ${CMAKE_SOURCE_DIR}/src/bpf/spliff.bpf.c)
+set(BPF_OBJECT ${CMAKE_BINARY_DIR}/spliff.bpf.o)
 
 # Get system include path for BPF
 execute_process(
@@ -255,18 +255,18 @@ add_custom_target(bpf_object ALL DEPENDS ${BPF_OBJECT})
 # Main Executable
 # ============================================================================
 
-add_executable(sslsniff ${SSLSNIFF_SOURCES})
+add_executable(spliff ${SPLIFF_SOURCES})
 
 # Add dependency on BPF object
-add_dependencies(sslsniff bpf_object)
+add_dependencies(spliff bpf_object)
 
 # Include directories
-target_include_directories(sslsniff PRIVATE
+target_include_directories(spliff PRIVATE
     ${CMAKE_SOURCE_DIR}/src/include
 )
 
 # Link required libraries
-target_link_libraries(sslsniff PRIVATE
+target_link_libraries(spliff PRIVATE
     PkgConfig::LIBBPF
     PkgConfig::LIBELF
     PkgConfig::ZLIB
@@ -276,28 +276,28 @@ target_link_libraries(sslsniff PRIVATE
 )
 
 # Compile definitions
-target_compile_definitions(sslsniff PRIVATE
+target_compile_definitions(spliff PRIVATE
     HAVE_LLHTTP
     HAVE_NGHTTP2
 )
 
 # Optional zstd support
 if(ZSTD_FOUND)
-    target_link_libraries(sslsniff PRIVATE PkgConfig::ZSTD)
-    target_compile_definitions(sslsniff PRIVATE HAVE_ZSTD)
+    target_link_libraries(spliff PRIVATE PkgConfig::ZSTD)
+    target_compile_definitions(spliff PRIVATE HAVE_ZSTD)
 endif()
 
 # Optional brotli support
 if(BROTLI_FOUND)
-    target_link_libraries(sslsniff PRIVATE PkgConfig::BROTLI)
-    target_compile_definitions(sslsniff PRIVATE HAVE_BROTLI)
+    target_link_libraries(spliff PRIVATE PkgConfig::BROTLI)
+    target_compile_definitions(spliff PRIVATE HAVE_BROTLI)
 endif()
 
 # Strip release builds
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_custom_command(TARGET sslsniff POST_BUILD
-        COMMAND ${CMAKE_STRIP} --strip-all $<TARGET_FILE:sslsniff>
-        COMMENT "Stripping sslsniff binary..."
+    add_custom_command(TARGET spliff POST_BUILD
+        COMMAND ${CMAKE_STRIP} --strip-all $<TARGET_FILE:spliff>
+        COMMENT "Stripping spliff binary..."
     )
 endif()
 
@@ -362,23 +362,23 @@ add_test(NAME http2_parser_tests COMMAND test_http2)
 include(GNUInstallDirs)
 
 # Install binary
-install(TARGETS sslsniff
+install(TARGETS spliff
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
 # Install BPF object
 install(FILES ${BPF_OBJECT}
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/sslsniff
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/spliff
 )
 
 # ============================================================================
 # CPack Configuration for Packaging
 # ============================================================================
 
-set(CPACK_PACKAGE_NAME "sslsniff")
+set(CPACK_PACKAGE_NAME "spliff")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
-set(CPACK_PACKAGE_VENDOR "sslsniff developers")
+set(CPACK_PACKAGE_VENDOR "spliff developers")
 set(CPACK_PACKAGE_CONTACT "maintainer@example.com")
 
 # License file (optional - only set if exists)
@@ -407,7 +407,7 @@ include(CPack)
 # ============================================================================
 
 message(STATUS "")
-message(STATUS "=== sslsniff ${PROJECT_VERSION} Configuration ===")
+message(STATUS "=== spliff ${PROJECT_VERSION} Configuration ===")
 message(STATUS "Build type:       ${CMAKE_BUILD_TYPE}")
 message(STATUS "C compiler:       ${CMAKE_C_COMPILER}")
 message(STATUS "C standard:       C${CMAKE_C_STANDARD}")

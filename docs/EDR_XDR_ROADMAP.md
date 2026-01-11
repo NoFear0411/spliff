@@ -1,4 +1,4 @@
-# sslsniff EDR/XDR Evolution Roadmap
+# spliff EDR/XDR Evolution Roadmap
 
 **Status:** Strategic Planning
 **Document Version:** 1.0
@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-This document outlines the evolution of sslsniff from an SSL/TLS traffic inspection tool into a lightweight, high-performance EDR/XDR agent capable of:
+This document outlines the evolution of spliff from an SSL/TLS traffic inspection tool into a lightweight, high-performance EDR/XDR agent capable of:
 
 - **Deep Packet Inspection** of encrypted traffic (pre-encryption interception)
 - **Dual-view visibility** (network packets + decrypted content)
@@ -22,7 +22,7 @@ This document outlines the evolution of sslsniff from an SSL/TLS traffic inspect
 │                         AGENT/PLATFORM ARCHITECTURE                          │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│   HOST (Agent - sslsniff)              PLATFORM (Collector/Analyzer)        │
+│   HOST (Agent - spliff)              PLATFORM (Collector/Analyzer)        │
 │   ════════════════════════             ═══════════════════════════════      │
 │                                                                             │
 │   Responsibilities:                    Responsibilities:                    │
@@ -113,7 +113,7 @@ v0.5.3 ──► v0.6.0 ──► v0.7.0 ──► v0.8.0 ──► v0.9.0 ─�
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐       │
-│  │   Process   │────►│  SSL_read/  │────►│   sslsniff  │       │
+│  │   Process   │────►│  SSL_read/  │────►│   spliff  │       │
 │  │  (Firefox,  │     │  SSL_write  │     │   eBPF      │       │
 │  │   curl...)  │     │   uprobes   │     │   program   │       │
 │  └─────────────┘     └─────────────┘     └──────┬──────┘       │
@@ -243,7 +243,7 @@ typedef struct {
     natsOptions *opts;
 
     // Subject prefixes
-    const char *subject_prefix;  // e.g., "sslsniff.events"
+    const char *subject_prefix;  // e.g., "spliff.events"
 
     // Agent identity
     char agent_id[64];           // Unique agent identifier
@@ -323,15 +323,15 @@ nats_publisher_t* nats_publisher_create(const nats_config_t *config) {
 ```c
 // Subject hierarchy for event routing
 //
-// sslsniff.{agent_id}.{event_type}.{protocol}
+// spliff.{agent_id}.{event_type}.{protocol}
 //
 // Examples:
-//   sslsniff.agent-1a2b3c.http.request
-//   sslsniff.agent-1a2b3c.http.response
-//   sslsniff.agent-1a2b3c.tls.handshake
-//   sslsniff.agent-1a2b3c.flow.start
-//   sslsniff.agent-1a2b3c.flow.end
-//   sslsniff.agent-1a2b3c.packet.metadata
+//   spliff.agent-1a2b3c.http.request
+//   spliff.agent-1a2b3c.http.response
+//   spliff.agent-1a2b3c.tls.handshake
+//   spliff.agent-1a2b3c.flow.start
+//   spliff.agent-1a2b3c.flow.end
+//   spliff.agent-1a2b3c.packet.metadata
 
 typedef enum {
     EVENT_HTTP_REQUEST,
@@ -477,7 +477,7 @@ int jetstream_create_stream(natsConnection *conn, const char *stream_name) {
 
     jsStreamConfig_Init(&cfg);
     cfg.Name = stream_name;
-    cfg.Subjects = (const char*[]){"sslsniff.>", NULL};
+    cfg.Subjects = (const char*[]){"spliff.>", NULL};
     cfg.Storage = js_FileStorage;
     cfg.Retention = js_LimitsPolicy;
     cfg.MaxBytes = 10 * 1024 * 1024 * 1024LL;  // 10GB
@@ -506,7 +506,7 @@ int jetstream_publish_event(jetstream_ctx_t *ctx,
     jsPubOptions_Init(&pubOpts);
     pubOpts.MaxWait = 1000;  // 1 second timeout
 
-    snprintf(subject, sizeof(subject), "sslsniff.events.%s",
+    snprintf(subject, sizeof(subject), "spliff.events.%s",
              event_type_to_string(type));
 
     natsStatus s = js_Publish(&ack, ctx->js, subject, data, len, &pubOpts, NULL);
@@ -530,7 +530,7 @@ int jetstream_publish_event(jetstream_ctx_t *ctx,
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                         SSLSNIFF AGENT                               │   │
+│  │                         SPLIFF AGENT                               │   │
 │  │                                                                      │   │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                           │   │
 │  │  │  XDP/    │  │  Uprobe  │  │  Flow    │                           │   │
@@ -565,7 +565,7 @@ int jetstream_publish_event(jetstream_ctx_t *ctx,
 │  │                                                                      │   │
 │  │   JetStream (optional - persistence)                                 │   │
 │  │   ┌─────────────────────────────────────────────┐                   │   │
-│  │   │  Stream: sslsniff-events                     │                   │   │
+│  │   │  Stream: spliff-events                     │                   │   │
 │  │   │  Retention: 7 days                           │                   │   │
 │  │   │  Replicas: 3                                 │                   │   │
 │  │   └─────────────────────────────────────────────┘                   │   │
@@ -603,7 +603,7 @@ NATS Streaming Options:
   --nats-ca <file>           CA certificate for NATS TLS
   --nats-cert <file>         Client certificate for NATS TLS
   --nats-key <file>          Client key for NATS TLS
-  --nats-subject <prefix>    Subject prefix (default: sslsniff.events)
+  --nats-subject <prefix>    Subject prefix (default: spliff.events)
   --nats-buffer-size <n>     Local buffer size in KB (default: 1024)
   --nats-jetstream           Use JetStream for persistence
   --nats-stream <name>       JetStream stream name
@@ -898,7 +898,7 @@ int agent_load_config_from_platform(agent_config_t *config,
     char subject[256];
 
     snprintf(subject, sizeof(subject),
-             "sslsniff.config.request.%s", config->agent_id);
+             "spliff.config.request.%s", config->agent_id);
 
     // Request configuration
     natsStatus s = natsConnection_RequestString(&reply, conn,
@@ -965,7 +965,7 @@ void* heartbeat_thread(void *arg) {
         strncpy(hb.agent_id, ctx->config->agent_id, sizeof(hb.agent_id));
         hb.timestamp = time(NULL);
         hb.uptime_seconds = hb.timestamp - ctx->start_time;
-        strncpy(hb.version, SSLSNIFF_VERSION, sizeof(hb.version));
+        strncpy(hb.version, SPLIFF_VERSION, sizeof(hb.version));
 
         // Collect stats
         collect_capture_stats(ctx, &hb);
@@ -978,7 +978,7 @@ void* heartbeat_thread(void *arg) {
 
         char subject[256];
         snprintf(subject, sizeof(subject),
-                 "sslsniff.heartbeat.%s", ctx->config->agent_id);
+                 "spliff.heartbeat.%s", ctx->config->agent_id);
 
         natsConnection_Publish(ctx->nats->conn, subject, buf, len);
 
@@ -1007,10 +1007,10 @@ The platform receives events from agents and provides:
 │  │                       NATS CLUSTER                                   │   │
 │  │                                                                      │   │
 │  │   Subjects:                                                          │   │
-│  │   • sslsniff.events.>        (all agent events)                      │   │
-│  │   • sslsniff.heartbeat.>     (agent heartbeats)                      │   │
-│  │   • sslsniff.alerts.>        (agent-generated alerts)                │   │
-│  │   • sslsniff.config.>        (config requests/responses)             │   │
+│  │   • spliff.events.>        (all agent events)                      │   │
+│  │   • spliff.heartbeat.>     (agent heartbeats)                      │   │
+│  │   • spliff.alerts.>        (agent-generated alerts)                │   │
+│  │   • spliff.config.>        (config requests/responses)             │   │
 │  │                                                                      │   │
 │  └──────────────────────────────────┬──────────────────────────────────┘   │
 │                                     │                                       │
@@ -1487,10 +1487,10 @@ static redaction_rule_t default_redactions[] = {
 ## Appendix A: CLI Reference (v1.0.0)
 
 ```
-sslsniff - eBPF-based SSL/TLS traffic inspector and EDR agent
+spliff - eBPF-based SSL/TLS traffic inspector and EDR agent
 
 USAGE:
-    sslsniff [OPTIONS] [COMMAND]
+    spliff [OPTIONS] [COMMAND]
 
 COMMANDS:
     capture         Capture and output traffic (default)
@@ -1538,18 +1538,18 @@ DPDK OPTIONS:
 
 EXAMPLES:
     # Basic capture
-    sslsniff -p 1234 -f json
+    spliff -p 1234 -f json
 
     # XDP mode with classification
-    sslsniff --mode xdp -i eth0 --classify
+    spliff --mode xdp -i eth0 --classify
 
     # Agent mode
-    sslsniff agent --nats-url nats://nats.example.com:4222 \
-                   --nats-creds /etc/sslsniff/agent.creds \
+    spliff agent --nats-url nats://nats.example.com:4222 \
+                   --nats-creds /etc/spliff/agent.creds \
                    --classify
 
     # High-performance DPDK mode
-    sslsniff --mode dpdk --dpdk-args "-l 0-3 -n 4" \
+    spliff --mode dpdk --dpdk-args "-l 0-3 -n 4" \
              --dpdk-port 0 --dpdk-queues 4
 ```
 
@@ -1754,7 +1754,7 @@ void termination_handler(int sig, siginfo_t *info, void *context) {
     // Send via pre-established UDP socket (faster than TCP)
     // Uses separate "emergency" NATS connection
     nats_publish_emergency(g_agent->emergency_conn,
-                           "sslsniff.tamper.signal",
+                           "spliff.tamper.signal",
                            &event, sizeof(event));
 
     // If SIGTERM, allow graceful shutdown
@@ -1909,9 +1909,9 @@ int trace_openat(struct trace_event_raw_sys_enter *ctx) {
 │              │         NATS CLUSTER              │                          │
 │              │                                   │                          │
 │              │  Subjects:                        │                          │
-│              │  • sslsniff.heartbeat.{id}        │                          │
-│              │  • sslsniff.watchdog.{id}         │                          │
-│              │  • sslsniff.tamper.{id}           │                          │
+│              │  • spliff.heartbeat.{id}        │                          │
+│              │  • spliff.watchdog.{id}         │                          │
+│              │  • spliff.tamper.{id}           │                          │
 │              └───────────────────────────────────┘                          │
 │                                                                             │
 │  WATCHDOG IMPLEMENTATION:                                                   │
@@ -1955,11 +1955,11 @@ typedef struct {
 } protected_file_t;
 
 static protected_file_t protected_files[] = {
-    {"/usr/bin/sslsniff", {/* hash */}, 0, 0755, 0, 0},
-    {"/usr/bin/sslsniff-watchdog", {/* hash */}, 0, 0755, 0, 0},
-    {"/etc/sslsniff/agent.conf", {/* hash */}, 0, 0600, 0, 0},
+    {"/usr/bin/spliff", {/* hash */}, 0, 0755, 0, 0},
+    {"/usr/bin/spliff-watchdog", {/* hash */}, 0, 0755, 0, 0},
+    {"/etc/spliff/agent.conf", {/* hash */}, 0, 0600, 0, 0},
     // eBPF objects
-    {"/usr/lib/sslsniff/sslsniff.bpf.o", {/* hash */}, 0, 0644, 0, 0},
+    {"/usr/lib/spliff/spliff.bpf.o", {/* hash */}, 0, 0644, 0, 0},
 };
 
 int verify_binary_integrity(agent_ctx_t *ctx) {
@@ -2537,7 +2537,7 @@ Inspired by Cilium Tetragon and Falco, runtime policies define what behavior to 
 
 ```yaml
 # Example: Detect reverse shell attempts
-apiVersion: sslsniff.io/v1
+apiVersion: spliff.io/v1
 kind: TracingPolicy
 metadata:
   name: detect-reverse-shell
@@ -2597,7 +2597,7 @@ spec:
 
 ---
 # Example: Protect sensitive files
-apiVersion: sslsniff.io/v1
+apiVersion: spliff.io/v1
 kind: TracingPolicy
 metadata:
   name: protect-sensitive-files
@@ -2630,7 +2630,7 @@ spec:
 
 ---
 # Example: Container escape detection
-apiVersion: sslsniff.io/v1
+apiVersion: spliff.io/v1
 kind: TracingPolicy
 metadata:
   name: container-escape-detection
@@ -2807,7 +2807,7 @@ int reload_policy(agent_ctx_t *ctx, const char *policy_name,
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    SSLSNIFF v3.0: FULL ENDPOINT PROTECTION                   │
+│                    SPLIFF v3.0: FULL ENDPOINT PROTECTION                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
@@ -2937,7 +2937,7 @@ void export_mitre_layer(attack_chain_t *chain, char *json_out, size_t len) {
 
 ```yaml
 # Example: Ransomware response playbook
-apiVersion: sslsniff.io/v1
+apiVersion: spliff.io/v1
 kind: ResponsePlaybook
 metadata:
   name: ransomware-response
@@ -2959,7 +2959,7 @@ actions:
     type: NetworkIsolate
     params:
       allow:
-        - sslsniff-platform  # Maintain agent communication
+        - spliff-platform  # Maintain agent communication
       block:
         - all
 
@@ -3008,4 +3008,4 @@ actions:
 
 *Document created: 2026-01-11*
 *Last updated: 2026-01-11*
-*Author: sslsniff development team*
+*Author: spliff development team*

@@ -1,4 +1,4 @@
-# sslsniff Makefile - CMake wrapper for backward compatibility
+# spliff Makefile - CMake wrapper for backward compatibility
 #
 # This Makefile wraps CMake for users accustomed to running 'make'.
 # For full CMake functionality, use cmake directly:
@@ -18,23 +18,23 @@ all: debug
 debug:
 	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
 	@cmake --build $(BUILD_DIR) --parallel
-	@ln -sf $(BUILD_DIR)/sslsniff sslsniff 2>/dev/null || cp $(BUILD_DIR)/sslsniff sslsniff
+	@ln -sf $(BUILD_DIR)/spliff spliff 2>/dev/null || cp $(BUILD_DIR)/spliff spliff
 
 # Release build (optimized, stripped)
 release:
 	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
 	@cmake --build $(BUILD_DIR) --parallel
-	@ln -sf $(BUILD_DIR)/sslsniff sslsniff 2>/dev/null || cp $(BUILD_DIR)/sslsniff sslsniff
+	@ln -sf $(BUILD_DIR)/spliff spliff 2>/dev/null || cp $(BUILD_DIR)/spliff spliff
 
 # Release build with sanitizers (optimized + ASan/UBSan)
 relsan:
 	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithSan -DENABLE_SANITIZERS=ON
 	@cmake --build $(BUILD_DIR) --parallel
-	@ln -sf $(BUILD_DIR)/sslsniff sslsniff 2>/dev/null || cp $(BUILD_DIR)/sslsniff sslsniff
+	@ln -sf $(BUILD_DIR)/spliff spliff 2>/dev/null || cp $(BUILD_DIR)/spliff spliff
 
 # Clean build artifacts
 clean:
-	@rm -rf $(BUILD_DIR) sslsniff
+	@rm -rf $(BUILD_DIR) spliff
 	@echo "Build directory cleaned"
 
 # Run tests (builds test executables then runs them)
@@ -45,7 +45,7 @@ test: debug
 # Install to system (requires sudo)
 install: release
 	@sudo cmake --install $(BUILD_DIR)
-	@echo "Installed to /usr/local/bin/sslsniff"
+	@echo "Installed to /usr/local/bin/spliff"
 
 # Create Debian package
 package-deb: release
@@ -64,7 +64,7 @@ legacy:
 
 # Help
 help:
-	@echo "sslsniff - eBPF-based SSL/TLS Traffic Sniffer"
+	@echo "spliff - eBPF-based SSL/TLS Traffic Sniffer"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  all          Build debug version (default)"

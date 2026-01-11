@@ -6,7 +6,7 @@
 
 ## Overview
 
-Add an interactive TUI (Text User Interface) mode to sslsniff that provides:
+Add an interactive TUI (Text User Interface) mode to spliff that provides:
 - Live-updating table of captured requests/responses
 - Scrolling and filtering capabilities
 - Detailed view for individual request/response pairs
@@ -53,7 +53,7 @@ After evaluating options, **notcurses** is the recommended choice.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ sslsniff v0.6.0 TUI | Captured: 142 | Filter: [________________]  [F1] │
+│ spliff v0.6.0 TUI | Captured: 142 | Filter: [________________]  [F1] │
 ├────┬────────┬──────────────────────┬─────────────────┬───────┬──────────┤
 │ #  │ Method │ Host                 │ Path            │ Status│ Size     │
 ├────┼────────┼──────────────────────┼─────────────────┼───────┼──────────┤
@@ -254,7 +254,7 @@ void tui_run(struct bpf_context *ctx) {
 ## CLI Interface
 
 ```
-Usage: sslsniff [OPTIONS]
+Usage: spliff [OPTIONS]
 
 Mode selection:
   (default)         Stream mode - print to stdout
@@ -277,7 +277,7 @@ if(ENABLE_TUI)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(NOTCURSES REQUIRED notcurses>=3.0)
 
-    target_sources(sslsniff PRIVATE
+    target_sources(spliff PRIVATE
         src/tui/tui.c
         src/tui/tui_table.c
         src/tui/tui_detail.c
@@ -286,9 +286,9 @@ if(ENABLE_TUI)
         src/tui/capture_ring.c
     )
 
-    target_include_directories(sslsniff PRIVATE ${NOTCURSES_INCLUDE_DIRS})
-    target_link_libraries(sslsniff PRIVATE ${NOTCURSES_LIBRARIES})
-    target_compile_definitions(sslsniff PRIVATE HAVE_NOTCURSES)
+    target_include_directories(spliff PRIVATE ${NOTCURSES_INCLUDE_DIRS})
+    target_link_libraries(spliff PRIVATE ${NOTCURSES_LIBRARIES})
+    target_compile_definitions(spliff PRIVATE HAVE_NOTCURSES)
 endif()
 ```
 

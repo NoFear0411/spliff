@@ -1,8 +1,8 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-only
  *
- * sslsniff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 sslsniff authors
+ * spliff - eBPF-based SSL/TLS traffic sniffer
+ * Copyright (C) 2025-2026 spliff authors
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -13,7 +13,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * sslsniff.bpf.c - eBPF probes for SSL/TLS interception
+ * spliff.bpf.c - eBPF probes for SSL/TLS interception
  * Supports OpenSSL, GnuTLS, and NSS (via NSPR)
  */
 

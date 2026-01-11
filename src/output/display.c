@@ -1,8 +1,8 @@
 /*
  * SPDX-License-Identifier: GPL-3.0-only
  *
- * sslsniff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 sslsniff authors
+ * spliff - eBPF-based SSL/TLS traffic sniffer
+ * Copyright (C) 2025-2026 spliff authors
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by

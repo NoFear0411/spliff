@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-This document outlines the implementation strategy for adding HTTP/3 and QUIC protocol support to sslsniff. HTTP/3 uses QUIC (UDP-based) instead of TCP+TLS, requiring significant architectural changes to the current session tracking model.
+This document outlines the implementation strategy for adding HTTP/3 and QUIC protocol support to spliff. HTTP/3 uses QUIC (UDP-based) instead of TCP+TLS, requiring significant architectural changes to the current session tracking model.
 
 ---
 
@@ -77,7 +77,7 @@ Current Key: (PID, ssl_ctx)
 ```
 SSL Library Function (e.g., SSL_write)
         ↓ [uprobe]
-eBPF Probe (sslsniff.bpf.c)
+eBPF Probe (spliff.bpf.c)
         ↓ [ring buffer]
 User-space Handler (probe_handler.c)
         ↓ [callback]
@@ -164,7 +164,7 @@ Application
 └─────────────────────────────────────┘
     ↓ [HOOK HERE - stream read/write]
 ┌─────────────────────────────────────┐
-│  sslsniff eBPF probe                │
+│  spliff eBPF probe                │
 │  • Capture decrypted HTTP/3 frames  │
 │  • Extract Connection ID            │
 │  • Submit to ring buffer            │
@@ -602,7 +602,7 @@ static int on_h3_recv_data(nghttp3_conn *conn, int64_t stream_id,
 - Test with curl built with quiche
 
 **Files to create/modify:**
-- `src/bpf/sslsniff.bpf.c` (new probes)
+- `src/bpf/spliff.bpf.c` (new probes)
 - `src/bpf/bpf_loader.c` (quiche discovery)
 - `src/protocol/http3.c` (session management)
 
@@ -695,10 +695,10 @@ autoreconf -fi
 ./configure --prefix=/usr/local
 make && sudo make install
 
-# Update sslsniff CMakeLists.txt
+# Update spliff CMakeLists.txt
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(NGHTTP3 REQUIRED libnghttp3)
-target_link_libraries(sslsniff ${NGHTTP3_LIBRARIES})
+target_link_libraries(spliff ${NGHTTP3_LIBRARIES})
 ```
 
 ### Test with curl + quiche
@@ -718,4 +718,4 @@ make
 ---
 
 *Document created: 2026-01-11*
-*Author: sslsniff development*
+*Author: spliff development*
