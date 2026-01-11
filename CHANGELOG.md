@@ -2,6 +2,46 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.7.0] - 2026-01-12
+
+### Added
+- **BPF-Level Socket Family Filtering**: Kernel-level IPC traffic elimination
+  - CO-RE helper walks `task_struct → files_struct → fdtable → file → socket → sock → skc_family`
+  - Filters AF_UNIX (IPC) traffic at BPF level before reaching userspace
+  - Keeps only AF_INET/AF_INET6 (web) traffic for processing
+
+- **SSL_set_fd Hook for OpenSSL**: Maps SSL* to OS file descriptor
+  - Enables socket family lookup for OpenSSL connections
+  - `tracked_sessions` map stores protocol type and socket family per connection
+  - `ssl_to_fd` map tracks SSL context to fd mapping
+
+- **NSS SSL Layer Verification**: Filters non-SSL PRFileDesc traffic
+  - `SSL_ImportFD` hook tracks verified SSL connections
+  - `is_nss_ssl_fd()` check in PR_Write/PR_Read exit probes
+  - Eliminates Firefox IPC noise from non-SSL NSPR layers
+
+- **Session Cleanup Hooks**: Prevents BPF map exhaustion
+  - `SSL_free` (OpenSSL): Cleans up `tracked_sessions` and `ssl_to_fd`
+  - `PR_Close` (NSS): Cleans up `nss_ssl_fds` and `tracked_sessions`
+  - `gnutls_deinit` (GnuTLS): Cleans up `tracked_sessions`
+
+### Changed
+- **HPACK Mid-Stream Recovery**: Improved error handling strategy
+  - Removed aggressive table reset that corrupted subsequent decodes
+  - New approach: Skip first few errors, recreate inflater after 5+ persistent errors
+  - Tracks `hpack_error_count` and `hpack_success_count` per connection
+  - `mid_stream_joined` flag for detected mid-stream connections
+
+- **IPC Filtering Always-On**: Removed `--filter-ipc` CLI option
+  - BPF kernel-level filtering handles socket family checks
+  - Userspace heuristics provide additional backup filtering
+  - Simplifies user experience - optimal filtering is automatic
+
+### Technical Details
+- New BPF maps: `tracked_sessions`, `ssl_to_fd`, `ssl_fd_args_map`
+- ALPN parsing in BPF: Routes connections to correct parser (llhttp vs nghttp2)
+- Session state machine with protocol detection (PROTO_HTTP1, PROTO_HTTP2)
+
 ## [0.6.1] - 2026-01-12
 
 ### Fixed
@@ -30,7 +70,7 @@ All notable changes to spliff will be documented in this file.
 ### Changed
 - Enhanced IPC/noise filtering for raw READ/WRITE events
   - Small writes (≤13 bytes) on HTTP/2 connections suppressed as control frames
-  - Block-sized reads (4096, 8192, etc.) without HTTP signatures filtered with --filter-ipc
+  - Block-sized reads (4096, 8192, etc.) without HTTP signatures filtered
   - Common control frame sizes (4, 8, 9, 13 bytes) automatically suppressed
 
 ## [0.6.0] - 2026-01-11

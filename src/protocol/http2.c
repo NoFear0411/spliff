@@ -111,6 +111,11 @@ typedef struct {
     uint8_t *response_buf;
     size_t response_buf_len;
 
+    /* HPACK error tracking for mid-stream recovery */
+    uint16_t hpack_error_count;    /* Consecutive HPACK decode errors */
+    uint16_t hpack_success_count;  /* Consecutive successful decodes */
+    bool mid_stream_joined;        /* Detected mid-stream join */
+
     /* Timestamp for cleanup */
     uint64_t last_activity_ns;
 
@@ -1056,13 +1061,33 @@ static void h2_process_complete_response_frame(h2_connection_t *conn, const uint
                 if (consumed < 0) {
                     DEBUG_H2("HPACK inflate error: %zd (%s)",
                              consumed, nghttp2_strerror((int)consumed));
-                    /* Reset inflater state on error by clearing dynamic table.
-                     * This helps recover when we join mid-stream and miss
-                     * headers that populated the dynamic table. */
+
+                    conn->hpack_error_count++;
+                    conn->hpack_success_count = 0;
+
+                    /* End current header block properly */
                     nghttp2_hd_inflate_end_headers(conn->response_inflater);
-                    /* Clear dynamic table to recover from corruption */
-                    nghttp2_hd_inflate_change_table_size(conn->response_inflater, 0);
-                    nghttp2_hd_inflate_change_table_size(conn->response_inflater, 4096);
+
+                    /*
+                     * Mid-stream HPACK recovery strategy:
+                     * - First few errors: Just skip this header block, don't reset table
+                     *   (subsequent headers may decode fine if they don't need missing entries)
+                     * - Persistent errors (5+): Recreate inflater with fresh state
+                     *   This is the nuclear option for severely corrupted state
+                     *
+                     * This is better than the old approach which reset the table on every
+                     * error, corrupting state for subsequent decodes.
+                     */
+                    if (conn->hpack_error_count >= 5) {
+                        DEBUG_H2("Persistent HPACK errors, recreating inflater");
+                        nghttp2_hd_inflater *new_inflater = NULL;
+                        if (nghttp2_hd_inflate_new(&new_inflater) == 0) {
+                            nghttp2_hd_inflate_del(conn->response_inflater);
+                            conn->response_inflater = new_inflater;
+                            conn->hpack_error_count = 0;
+                            conn->mid_stream_joined = true;
+                        }
+                    }
                     break;
                 }
 
@@ -1071,6 +1096,12 @@ static void h2_process_complete_response_frame(h2_connection_t *conn, const uint
 
                 if (inflate_flags & NGHTTP2_HD_INFLATE_EMIT) {
                     h2_process_response_header(stream, &nv);
+                    /* Successful decode - track for error recovery */
+                    conn->hpack_success_count++;
+                    if (conn->hpack_success_count >= 3) {
+                        /* Reset error count after consecutive successes */
+                        conn->hpack_error_count = 0;
+                    }
                 }
 
                 if (inflate_flags & NGHTTP2_HD_INFLATE_FINAL) {
