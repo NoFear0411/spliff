@@ -587,6 +587,13 @@ static void h2_display_response(h2_stream_t *stream) {
     DEBUG_H2("h2_display_response: stream=%d status=%d content_type='%s'",
              stream->stream_id, stream->status_code, stream->content_type);
 
+    /* Skip displaying if status is 0 (indicates HPACK decode failure) */
+    if (stream->status_code == 0) {
+        DEBUG_H2("Skipping display of stream %d with status=0 (decode failure)",
+                 stream->stream_id);
+        return;
+    }
+
     http_message_t msg = {0};
 
     msg.protocol = PROTO_HTTP2;
@@ -1049,8 +1056,13 @@ static void h2_process_complete_response_frame(h2_connection_t *conn, const uint
                 if (consumed < 0) {
                     DEBUG_H2("HPACK inflate error: %zd (%s)",
                              consumed, nghttp2_strerror((int)consumed));
-                    /* Reset inflater on error */
+                    /* Reset inflater state on error by clearing dynamic table.
+                     * This helps recover when we join mid-stream and miss
+                     * headers that populated the dynamic table. */
                     nghttp2_hd_inflate_end_headers(conn->response_inflater);
+                    /* Clear dynamic table to recover from corruption */
+                    nghttp2_hd_inflate_change_table_size(conn->response_inflater, 0);
+                    nghttp2_hd_inflate_change_table_size(conn->response_inflater, 4096);
                     break;
                 }
 
@@ -1154,6 +1166,33 @@ bool http2_is_valid_frame_header(const uint8_t *data) {
     /* Stream ID must be reasonable (not in the billions) */
     if (stream_id > H2_MAX_SANE_STREAM_ID) {
         return false;
+    }
+
+    /* Validate frame type vs stream_id per HTTP/2 spec:
+     * - DATA (0x00) and HEADERS (0x01) must have stream_id > 0
+     * - SETTINGS (0x04), PING (0x06), GOAWAY (0x07) must have stream_id == 0
+     * - WINDOW_UPDATE (0x08) can be on any stream */
+    switch (frame_type) {
+    case 0x00: /* DATA */
+    case 0x01: /* HEADERS */
+    case 0x02: /* PRIORITY */
+    case 0x03: /* RST_STREAM */
+    case 0x05: /* PUSH_PROMISE */
+    case 0x09: /* CONTINUATION */
+        if (stream_id == 0) {
+            return false;  /* Stream-specific frames must have stream_id > 0 */
+        }
+        break;
+    case 0x04: /* SETTINGS */
+    case 0x06: /* PING */
+    case 0x07: /* GOAWAY */
+        if (stream_id != 0) {
+            return false;  /* Connection-level frames must have stream_id == 0 */
+        }
+        break;
+    case 0x08: /* WINDOW_UPDATE */
+        /* Can be on stream 0 (connection) or any stream */
+        break;
     }
 
     return true;
