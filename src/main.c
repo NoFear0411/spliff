@@ -53,8 +53,11 @@ static bool g_threading_initialized = false;
 static bool g_threading_enabled = false;  /* Set by CLI or auto-detect */
 #endif
 
-/* Configuration */
-config_t g_config = {0};
+/* Configuration - IPC filtering enabled by default (BPF handles kernel-level filtering) */
+config_t g_config = {
+    .filter_ipc = true,  /* Always on - BPF does socket family filtering */
+    .use_colors = true,  /* Colors on by default */
+};
 
 /* Forward declarations for cleanup */
 static void cleanup_pending_bodies(void);
@@ -1097,7 +1100,6 @@ static void print_usage(const char *prog) {
     printf("  --openssl       Only attach to OpenSSL\n");
     printf("  --gnutls        Only attach to GnuTLS\n");
     printf("  --nss           Only attach to NSS\n");
-    printf("  --filter-ipc    Filter out IPC/internal browser traffic\n");
     printf("  -b              Show response/request bodies\n");
     printf("  -x              Show body as hexdump with file signature detection\n");
     printf("  -c              Compact mode (hide headers)\n");
@@ -1218,8 +1220,6 @@ int main(int argc, char **argv) {
             use_openssl = use_nss = false;
         } else if (strcmp(argv[i], "--nss") == 0) {
             use_openssl = use_gnutls = false;
-        } else if (strcmp(argv[i], "--filter-ipc") == 0) {
-            g_config.filter_ipc = true;
         } else if (strcmp(argv[i], "--show-libs") == 0) {
             show_libs = true;
 #ifdef HAVE_THREADING
@@ -1399,6 +1399,17 @@ int main(int argc, char **argv) {
                                 "probe_ssl_rw_enter", false, debug_mode);
         bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_read",
                                 "probe_ssl_read_exit", true, debug_mode);
+
+        /* SSL_set_fd - track SSL* → OS fd mapping for socket family filtering
+         * This enables kernel-level IPC filtering by checking AF_INET vs AF_UNIX */
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_set_fd",
+                                "probe_ssl_set_fd_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_set_fd",
+                                "probe_ssl_set_fd_exit", true, debug_mode);
+
+        /* SSL_free - cleanup session tracking when SSL connection is freed */
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_free",
+                                "probe_ssl_free", false, debug_mode);
     }
 
     if (gnutls_path[0]) {
@@ -1410,6 +1421,10 @@ int main(int argc, char **argv) {
                                 "probe_gnutls_recv_enter", false, debug_mode);
         bpf_loader_attach_uprobe(&g_loader, gnutls_path, "gnutls_record_recv",
                                 "probe_gnutls_recv_exit", true, debug_mode);
+
+        /* gnutls_deinit - cleanup session tracking when GnuTLS session is freed */
+        bpf_loader_attach_uprobe(&g_loader, gnutls_path, "gnutls_deinit",
+                                "probe_gnutls_deinit", false, debug_mode);
     }
 
     if (nss_path[0]) {
@@ -1430,6 +1445,10 @@ int main(int argc, char **argv) {
                                 "probe_nss_read_enter", false, debug_mode);
         bpf_loader_attach_uprobe(&g_loader, nss_path, "PR_Recv",
                                 "probe_nss_read_exit", true, debug_mode);
+
+        /* PR_Close - cleanup session tracking when PRFileDesc is closed */
+        bpf_loader_attach_uprobe(&g_loader, nss_path, "PR_Close",
+                                "probe_pr_close", false, debug_mode);
     }
 
     /* SSL_ImportFD - track verified SSL connections for IPC filtering
@@ -1545,9 +1564,7 @@ int main(int argc, char **argv) {
     if (target_ppid > 0) {
         probe_handler_set_filter_ppid(&g_handler, target_ppid);
     }
-    if (g_config.filter_ipc) {
-        probe_handler_set_filter_ipc(&g_handler, true);
-    }
+    /* Note: IPC filtering is always on (BPF kernel-level + userspace heuristics) */
 
 #ifdef HAVE_THREADING
     /* Initialize threading if enabled (default: auto-detect unless --no-threading) */
@@ -1578,8 +1595,8 @@ int main(int argc, char **argv) {
     }
     g_probe_initialized = true;
 
-    /* Show active filters */
-    if (target_comm[0] || num_target_pids > 0 || target_ppid > 0 || g_config.filter_ipc) {
+    /* Show active filters (IPC filtering always on via BPF, not shown) */
+    if (target_comm[0] || num_target_pids > 0 || target_ppid > 0) {
         printf("  %sFilters:%s", display_color(C_YELLOW), display_color(C_RESET));
         if (target_comm[0]) {
             printf(" comm=%s", target_comm);
@@ -1592,9 +1609,6 @@ int main(int argc, char **argv) {
         }
         if (target_ppid > 0) {
             printf(" ppid=%d (+children)", target_ppid);
-        }
-        if (g_config.filter_ipc) {
-            printf(" ipc-filter=on");
         }
         printf("\n\n");
     }

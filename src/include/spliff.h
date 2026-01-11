@@ -25,7 +25,7 @@
 #include <stddef.h>
 #include <stdio.h>
 
-#define SPLIFF_VERSION "0.6.1"
+#define SPLIFF_VERSION "0.7.0"
 
 /* Debug logging macros - only active in DEBUG builds */
 #ifdef DEBUG
@@ -38,8 +38,8 @@
 #define DEBUG_MAIN(fmt, ...) ((void)0)
 #endif
 #define SPLIFF_VERSION_MAJOR 0
-#define SPLIFF_VERSION_MINOR 6
-#define SPLIFF_VERSION_PATCH 1
+#define SPLIFF_VERSION_MINOR 7
+#define SPLIFF_VERSION_PATCH 0
 
 /* Maximum sizes */
 #define MAX_HEADER_NAME     256
