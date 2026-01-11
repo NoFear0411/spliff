@@ -2,6 +2,74 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.6.1] - 2026-01-12
+
+### Fixed
+- **Segmentation Fault in Multi-Threaded Mode**: Fixed format string mismatch in `output_write`
+  - Format string had 14 `%s` specifiers but only 13 string arguments
+  - `msg.pid` (uint32_t) was being interpreted as a pointer, causing SEGV
+
+- **HTTP/2 Requests Displayed as Responses**: Fixed `event_type` not passed to HTTP/2 processor
+  - `ssl_data_event_t.event_type` field now correctly set in all bpf_event initializers
+  - Requests no longer misidentified as responses with status 0
+
+- **HTTP/2 HPACK Error Recovery**: Reset dynamic table on decompression failure
+  - Mid-stream capture causes HPACK dynamic table desync (unavoidable limitation)
+  - On inflate error, now clears and reinitializes the HPACK dynamic table
+  - Prevents cascading decode failures after joining existing connection
+
+- **HTTP/2 Frame Validation**: Added frame type vs stream_id validation per RFC 7540
+  - DATA, HEADERS, PRIORITY, RST_STREAM, PUSH_PROMISE, CONTINUATION require stream_id > 0
+  - SETTINGS, PING, GOAWAY require stream_id == 0
+  - WINDOW_UPDATE allowed on both connection (0) and streams
+
+- **Suppress HPACK Decode Failures**: Skip display of responses with status=0
+  - Status code 0 indicates HPACK decompression failed (mid-stream capture)
+  - Prevents confusing "← 0" output in response display
+
+### Changed
+- Enhanced IPC/noise filtering for raw READ/WRITE events
+  - Small writes (≤13 bytes) on HTTP/2 connections suppressed as control frames
+  - Block-sized reads (4096, 8192, etc.) without HTTP signatures filtered with --filter-ipc
+  - Common control frame sizes (4, 8, 9, 13 bytes) automatically suppressed
+
+## [0.6.0] - 2026-01-11
+
+### Added
+- **Multi-Threaded Event Processing**: Complete lock-free threading infrastructure
+  - Dispatcher thread polls BPF ring buffer and routes events to workers
+  - Worker threads process HTTP/1.1 and HTTP/2 with per-worker isolated state
+  - Output thread serializes formatted output to prevent interleaving
+  - Connection affinity: `hash(pid, ssl_ctx) % num_workers` ensures same connection always routes to same worker
+  - Auto-detects optimal worker count: `max(1, CPUs-3)` capped at 16 workers
+
+- **Lock-Free Data Structures**: Uses Concurrency Kit (ck) library
+  - SPSC rings for dispatcher→worker and worker→output communication
+  - Lock-free object pools for event and output message allocation
+  - Adaptive wait strategy: spin (1000 iters) → yield (10 iters) → eventfd sleep (10ms)
+
+- **Per-Worker State Isolation**: Thread-safe protocol processing
+  - Per-worker ALPN cache for protocol negotiation tracking
+  - Per-worker pending body buffers for HTTP/1.1 response reassembly
+  - Per-worker decompression buffers (eliminates static buffer races)
+  - Per-worker HTTP/2 session and stream tracking
+
+- **New CLI Options**:
+  - `-t, --threads N`: Set worker thread count (0=auto, default: auto)
+  - `--no-threading`: Disable multi-threading for single-threaded mode
+
+### Changed
+- CMake now shows CK library in dependencies and threading status in options
+- Both HTTP/1.1 and HTTP/2 protocols use the threading infrastructure
+- Graceful shutdown drains all queues before exiting
+- Statistics printed at shutdown showing events processed/dropped per worker
+
+### Dependencies
+- New optional dependency: `ck` (Concurrency Kit) library
+  - Fedora: `sudo dnf install ck-devel`
+  - Ubuntu/Debian: `sudo apt install libck-dev`
+  - Falls back to single-threaded mode if ck is not available
+
 ## [0.5.3] - 2026-01-11
 
 ### Added

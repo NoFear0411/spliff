@@ -35,6 +35,10 @@
 #include "protocol/http2.h"
 #include "util/safe_str.h"
 
+#ifdef HAVE_THREADING
+#include "threading/threading.h"
+#endif
+
 /* Global state */
 static volatile sig_atomic_t g_exiting = 0;
 static bpf_loader_t g_loader;
@@ -42,6 +46,12 @@ static probe_handler_t g_handler;
 static bool g_modules_initialized = false;
 static bool g_bpf_initialized = false;
 static bool g_probe_initialized = false;
+
+#ifdef HAVE_THREADING
+static threading_mgr_t g_threading;
+static bool g_threading_initialized = false;
+static bool g_threading_enabled = false;  /* Set by CLI or auto-detect */
+#endif
 
 /* Configuration */
 config_t g_config = {0};
@@ -68,17 +78,21 @@ static void get_process_name(uint32_t pid, char *buf, size_t bufsize) {
     }
 }
 
-/* ALPN cache - tracks negotiated ALPN protocols per connection */
-#define MAX_ALPN_CACHE 128
+/* ALPN cache - tracks negotiated ALPN protocols per connection
+ * Used by single-threaded event processing (process_event)
+ * Note: In multi-threaded mode, per-worker ALPN cache is used instead
+ */
+#define ST_MAX_ALPN_CACHE 128
 
-typedef struct {
+/* Use a different name to avoid conflict with threading.h's alpn_cache_entry_t */
+typedef struct st_alpn_cache_entry {
     uint32_t pid;
     uint64_t ssl_ctx;
     char alpn_proto[16];
     bool active;
-} alpn_cache_entry_t;
+} st_alpn_cache_entry_t;
 
-static alpn_cache_entry_t g_alpn_cache[MAX_ALPN_CACHE];
+static st_alpn_cache_entry_t g_alpn_cache[ST_MAX_ALPN_CACHE];
 
 static const char *get_alpn_proto(uint32_t pid, uint64_t ssl_ctx) {
     /* First check H2 sessions (they store ALPN internally) */
@@ -87,7 +101,7 @@ static const char *get_alpn_proto(uint32_t pid, uint64_t ssl_ctx) {
         return h2_alpn;
     }
     /* Then check our cache (for HTTP/1.1 connections) */
-    for (int i = 0; i < MAX_ALPN_CACHE; i++) {
+    for (int i = 0; i < ST_MAX_ALPN_CACHE; i++) {
         if (g_alpn_cache[i].active &&
             g_alpn_cache[i].pid == pid &&
             g_alpn_cache[i].ssl_ctx == ssl_ctx) {
@@ -99,10 +113,10 @@ static const char *get_alpn_proto(uint32_t pid, uint64_t ssl_ctx) {
 
 static void set_alpn_proto(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
     /* Find existing or empty slot */
-    alpn_cache_entry_t *slot = NULL;
+    st_alpn_cache_entry_t *slot = NULL;
     int oldest_idx = 0;
 
-    for (int i = 0; i < MAX_ALPN_CACHE; i++) {
+    for (int i = 0; i < ST_MAX_ALPN_CACHE; i++) {
         if (g_alpn_cache[i].active &&
             g_alpn_cache[i].pid == pid &&
             g_alpn_cache[i].ssl_ctx == ssl_ctx) {
@@ -264,6 +278,16 @@ static void cleanup_pending_bodies_pid(uint32_t pid) {
 
 /* Master cleanup function registered with atexit() */
 static void cleanup_all_resources(void) {
+#ifdef HAVE_THREADING
+    /* Shutdown threading first (waits for workers to drain) */
+    if (g_threading_initialized) {
+        threading_shutdown(&g_threading);
+        threading_print_stats(&g_threading);
+        threading_cleanup(&g_threading);
+        g_threading_initialized = false;
+    }
+#endif
+
     /* Cleanup probe handler (ring buffer) */
     if (g_probe_initialized) {
         probe_handler_cleanup(&g_handler);
@@ -276,8 +300,13 @@ static void cleanup_all_resources(void) {
         g_bpf_initialized = false;
     }
 
-    /* Cleanup pending body buffers */
-    cleanup_pending_bodies();
+    /* Cleanup pending body buffers (only in non-threaded mode) */
+#ifdef HAVE_THREADING
+    if (!g_threading_enabled)
+#endif
+    {
+        cleanup_pending_bodies();
+    }
 
     /* Cleanup modules in reverse order of initialization */
     if (g_modules_initialized) {
@@ -617,6 +646,446 @@ show_raw:
     printf("\n");
 }
 
+#ifdef HAVE_THREADING
+/* ============================================================================
+ * Multi-Threaded Event Processing
+ *
+ * This section contains the threaded version of event processing.
+ * Key differences from single-threaded mode:
+ * - Uses per-worker state (ALPN cache, pending bodies, buffers)
+ * - HTTP/2 sessions are per-worker (no global state)
+ * - Output is serialized through the output thread
+ * ============================================================================ */
+
+/*
+ * Process an event in worker thread context
+ * Uses per-worker state for thread-safe operation
+ */
+void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
+    if (!worker || !event) {
+        return;
+    }
+
+    worker_state_t *state = &worker->state;
+
+    /* Handle process exit events - cleanup resources */
+    if (event->event_type == EVENT_PROCESS_EXIT) {
+        /* Cleanup HTTP/2 sessions for this PID */
+        for (int i = 0; i < state->h2_connection_count; i++) {
+            if (state->h2_connections[i].active &&
+                state->h2_connections[i].pid == event->pid) {
+                worker_cleanup_h2_connection(state, &state->h2_connections[i]);
+            }
+        }
+        worker_cleanup_h2_streams_for_connection(state, event->pid, 0);
+        worker_cleanup_pending_bodies_pid(state, event->pid);
+        return;
+    }
+
+    /* Handle handshake events */
+    if (event->event_type == EVENT_HANDSHAKE) {
+        if (g_config.show_handshake) {
+            char proc_name[TASK_COMM_LEN] = {0};
+            get_process_name(event->pid, proc_name, sizeof(proc_name));
+            const char *name = proc_name[0] ? proc_name : event->comm;
+
+            output_write(worker, "%s[TLS Handshake]%s %s%s%s (PID %u) %.3fms\n",
+                        display_color(C_YELLOW), display_color(C_RESET),
+                        display_color(C_CYAN), name, display_color(C_RESET),
+                        event->pid, event->delta_ns / 1000000.0);
+        }
+        return;
+    }
+
+    /* Handle ALPN protocol negotiation */
+    if (event->event_type == EVENT_ALPN) {
+        if (event->data_len > 0 && event->data_len <= 255) {
+            char alpn_proto[256] = {0};
+            memcpy(alpn_proto, event->data, event->data_len);
+            worker_set_alpn(state, event->pid, event->ssl_ctx, alpn_proto);
+        }
+        return;
+    }
+
+    if (event->data_len == 0) return;
+
+    const uint8_t *data = event->data;
+    size_t len = event->data_len;
+
+    /* Try HTTP/1.1 parsing first */
+    if (http1_is_request(data, len) || http1_is_response(data, len)) {
+        /* Clear any pending body from this connection */
+        pending_body_entry_t *old_pending = worker_find_pending_body(state,
+                                                event->pid, event->ssl_ctx);
+        if (old_pending) {
+            worker_clear_pending_body(state, old_pending);
+        }
+
+        http_message_t msg = {0};
+        size_t body_len = 0;
+
+        /* Use per-worker body buffer */
+        uint8_t *body_buf = g_config.show_body ? state->body_buf : NULL;
+        size_t body_buf_size = g_config.show_body ? state->body_buf_size : 0;
+
+        int result = http1_parse(data, len, &msg, body_buf, body_buf_size, &body_len);
+
+        if (result < 0) {
+            goto show_raw;
+        }
+
+        /* Set metadata */
+        msg.pid = event->pid;
+        msg.timestamp_ns = event->timestamp_ns;
+        msg.delta_ns = event->delta_ns;
+
+        char proc_name[TASK_COMM_LEN] = {0};
+        get_process_name(event->pid, proc_name, sizeof(proc_name));
+        safe_strcpy(msg.comm, sizeof(msg.comm),
+                   proc_name[0] ? proc_name : event->comm);
+
+        /* Get ALPN from per-worker cache */
+        const char *alpn = worker_get_alpn(state, event->pid, event->ssl_ctx);
+        if (alpn) {
+            safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
+        }
+
+        /* Format output through output thread */
+        char ts[32];
+        display_get_timestamp(ts, sizeof(ts));
+        const char *dir_str = (msg.direction == DIR_REQUEST) ? "REQ" : "RSP";
+        const char *dir_color = (msg.direction == DIR_REQUEST) ?
+                                display_color(C_GREEN) : display_color(C_CYAN);
+
+        if (msg.direction == DIR_REQUEST) {
+            output_write(worker, "%s%s%s %s[%s]%s %s%s%s %s %s%s%s (PID %u)\n",
+                        display_color(C_DIM), ts, display_color(C_RESET),
+                        dir_color, dir_str, display_color(C_RESET),
+                        display_color(C_GREEN), msg.method, display_color(C_RESET),
+                        msg.path,
+                        display_color(C_DIM), msg.comm, display_color(C_RESET),
+                        msg.pid);
+        } else {
+            const char *status_color = (msg.status_code >= 200 && msg.status_code < 300) ?
+                                       display_color(C_GREEN) :
+                                       (msg.status_code >= 400) ?
+                                       display_color(C_RED) : display_color(C_YELLOW);
+            output_write(worker, "%s%s%s %s[%s]%s %s%d %s%s %.3fms\n",
+                        display_color(C_DIM), ts, display_color(C_RESET),
+                        dir_color, dir_str, display_color(C_RESET),
+                        status_color, msg.status_code, msg.status_text,
+                        display_color(C_RESET),
+                        msg.delta_ns / 1000000.0);
+        }
+
+        /* Show headers unless compact mode */
+        if (!g_config.compact_mode && msg.header_count > 0) {
+            for (int i = 0; i < msg.header_count; i++) {
+                output_write(worker, "  %s%s:%s %s\n",
+                            display_color(C_DIM),
+                            msg.headers[i].name, display_color(C_RESET),
+                            msg.headers[i].value);
+            }
+        }
+
+        /* Show body if present */
+        if (g_config.show_body && body_len > 0) {
+            const uint8_t *body_data = body_buf;
+            size_t display_len = body_len;
+
+            /* Use per-worker decompression buffer */
+            if (msg.content_encoding[0]) {
+                int decomp_len = decompress_body(body_data, body_len,
+                                                msg.content_encoding,
+                                                state->decomp_buf,
+                                                state->decomp_buf_size);
+                if (decomp_len > 0) {
+                    body_data = state->decomp_buf;
+                    display_len = decomp_len;
+                }
+            }
+
+            output_write(worker, "%s─── Body (%zu bytes) ───%s\n",
+                        display_color(C_DIM), display_len, display_color(C_RESET));
+
+            /* Output body (truncate if too long for output buffer) */
+            output_msg_t *body_msg = output_alloc(worker);
+            if (body_msg) {
+                size_t copy_len = (display_len < OUTPUT_MSG_MAX_SIZE - 1) ?
+                                  display_len : OUTPUT_MSG_MAX_SIZE - 1;
+                memcpy(body_msg->data, body_data, copy_len);
+                body_msg->len = copy_len;
+                output_enqueue(worker, body_msg);
+            }
+            output_write(worker, "\n%s────────────%s\n",
+                        display_color(C_DIM), display_color(C_RESET));
+        } else if (g_config.show_body && msg.direction == DIR_RESPONSE &&
+                   (msg.content_length > 0 || msg.is_chunked)) {
+            /* Body will arrive in next event - track with per-worker state */
+            worker_create_pending_body(state, event->pid, event->ssl_ctx,
+                                       msg.content_length > 0 ? msg.content_length : 0,
+                                       msg.content_type, msg.content_encoding);
+        }
+
+        output_write(worker, "\n");
+        return;
+    }
+
+    /* Check for existing HTTP/2 session (per-worker) */
+    h2_connection_local_t *h2_conn = worker_get_h2_connection(state,
+                                        event->pid, event->ssl_ctx, false);
+    if (h2_conn && h2_conn->active) {
+        /* Process HTTP/2 frame with per-worker session */
+        /* TODO: Integrate with http2_process_frame using worker state */
+        /* For now, fall back to global HTTP/2 processing */
+        ssl_data_event_t bpf_event = {
+            .timestamp_ns = event->timestamp_ns,
+            .delta_ns = event->delta_ns,
+            .ssl_ctx = event->ssl_ctx,
+            .pid = event->pid,
+            .tid = event->tid,
+            .uid = event->uid,
+            .event_type = event->event_type,
+            .buf_filled = event->data_len,
+        };
+        memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+        memcpy(bpf_event.data, event->data, event->data_len);
+
+        http2_process_frame(data, len, &bpf_event);
+        return;
+    }
+
+    /* Check for HTTP/2 connection preface */
+    if (http2_is_preface(data, len)) {
+        output_write(worker, "%s[HTTP/2 connection]%s PID %u (%s)\n",
+                    display_color(C_YELLOW), display_color(C_RESET),
+                    event->pid, event->comm);
+
+        /* Create per-worker H2 connection */
+        h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
+        if (h2_conn) {
+            h2_conn->client_preface_seen = true;
+            safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
+        }
+
+        /* Process frames after preface */
+        if (len > 24) {
+            ssl_data_event_t bpf_event = {
+                .timestamp_ns = event->timestamp_ns,
+                .delta_ns = event->delta_ns,
+                .ssl_ctx = event->ssl_ctx,
+                .pid = event->pid,
+                .tid = event->tid,
+                .uid = event->uid,
+                .event_type = event->event_type,
+                .buf_filled = len - 24,
+            };
+            memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+            memcpy(bpf_event.data, data + 24, len - 24);
+            http2_process_frame(data + 24, len - 24, &bpf_event);
+        }
+        return;
+    }
+
+    /* Check for HTTP/2 frames (mid-connection attach) */
+    if (len >= 9) {
+        uint32_t frame_len = ((uint32_t)data[0] << 16) |
+                             ((uint32_t)data[1] << 8) |
+                             (uint32_t)data[2];
+        uint8_t frame_type = data[3];
+        uint32_t stream_id = ((uint32_t)(data[5] & 0x7f) << 24) |
+                             ((uint32_t)data[6] << 16) |
+                             ((uint32_t)data[7] << 8) |
+                             (uint32_t)data[8];
+
+        if (frame_type <= 0x09 && frame_len <= 16384) {
+            bool is_valid_h2 = false;
+            if (frame_type == H2_FRAME_SETTINGS && stream_id == 0) is_valid_h2 = true;
+            else if (frame_type == H2_FRAME_HEADERS && (stream_id & 1) != 0) is_valid_h2 = true;
+            else if (frame_type == H2_FRAME_WINDOW_UPDATE && stream_id == 0) is_valid_h2 = true;
+            else if (frame_type == H2_FRAME_DATA && (stream_id & 1) != 0 && frame_len > 0) is_valid_h2 = true;
+
+            if (is_valid_h2 && (9 + frame_len) <= len) {
+                output_write(worker, "%s[HTTP/2 connection]%s PID %u (%s)\n",
+                            display_color(C_YELLOW), display_color(C_RESET),
+                            event->pid, event->comm);
+
+                h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
+                if (h2_conn) {
+                    safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
+                }
+
+                ssl_data_event_t bpf_event = {
+                    .timestamp_ns = event->timestamp_ns,
+                    .delta_ns = event->delta_ns,
+                    .ssl_ctx = event->ssl_ctx,
+                    .pid = event->pid,
+                    .tid = event->tid,
+                    .uid = event->uid,
+                    .event_type = event->event_type,
+                    .buf_filled = len,
+                };
+                memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+                memcpy(bpf_event.data, data, len);
+                http2_process_frame(data, len, &bpf_event);
+                return;
+            }
+        }
+    }
+
+    /* Check for pending body data (per-worker) */
+    if (g_config.show_body) {
+        pending_body_entry_t *pending = worker_find_pending_body(state,
+                                            event->pid, event->ssl_ctx);
+        if (pending && pending->active) {
+            pending->received_len += len;
+
+            if (pending->needs_decompression && pending->accum_buf) {
+                if (pending->accum_len + len <= pending->accum_capacity) {
+                    memcpy(pending->accum_buf + pending->accum_len, data, len);
+                    pending->accum_len += len;
+                }
+                if (pending->expected_len > 0 &&
+                    pending->received_len >= pending->expected_len) {
+                    /* Decompress and output */
+                    int decomp_len = decompress_body(pending->accum_buf,
+                                                    pending->accum_len,
+                                                    pending->content_encoding,
+                                                    state->decomp_buf,
+                                                    state->decomp_buf_size);
+                    if (decomp_len > 0) {
+                        if (!pending->header_printed) {
+                            output_write(worker, "%s─── Body ───%s\n",
+                                        display_color(C_DIM), display_color(C_RESET));
+                        }
+                        output_msg_t *body_msg = output_alloc(worker);
+                        if (body_msg) {
+                            size_t copy_len = (decomp_len < OUTPUT_MSG_MAX_SIZE - 1) ?
+                                              decomp_len : OUTPUT_MSG_MAX_SIZE - 1;
+                            memcpy(body_msg->data, state->decomp_buf, copy_len);
+                            body_msg->len = copy_len;
+                            output_enqueue(worker, body_msg);
+                        }
+                        output_write(worker, "\n%s────────────%s\n\n",
+                                    display_color(C_DIM), display_color(C_RESET));
+                    }
+                    worker_clear_pending_body(state, pending);
+                }
+                return;
+            }
+
+            /* Non-compressed: stream directly */
+            if (!pending->header_printed) {
+                output_write(worker, "%s─── Body ───%s\n",
+                            display_color(C_DIM), display_color(C_RESET));
+                pending->header_printed = true;
+            }
+
+            bool is_text = (strstr(pending->content_type, "text/") != NULL ||
+                           strstr(pending->content_type, "json") != NULL ||
+                           strstr(pending->content_type, "xml") != NULL);
+
+            if (is_text) {
+                output_msg_t *body_msg = output_alloc(worker);
+                if (body_msg) {
+                    size_t copy_len = (len < OUTPUT_MSG_MAX_SIZE - 1) ?
+                                      len : OUTPUT_MSG_MAX_SIZE - 1;
+                    memcpy(body_msg->data, data, copy_len);
+                    body_msg->len = copy_len;
+                    output_enqueue(worker, body_msg);
+                }
+            } else {
+                output_write(worker, "[binary chunk: %zu bytes]\n", len);
+            }
+
+            if (pending->expected_len > 0 &&
+                pending->received_len >= pending->expected_len) {
+                output_write(worker, "%s────────────%s\n\n",
+                            display_color(C_DIM), display_color(C_RESET));
+                worker_clear_pending_body(state, pending);
+            }
+            return;
+        }
+    }
+
+show_raw:
+    /* Unknown/binary data */
+    ;
+
+    const char *sig = signature_detect(data, len);
+    if (signature_is_local_file(sig)) {
+        return;
+    }
+
+    /* Suppress HTTP/2 control frames and noise in non-debug mode */
+    if (!g_config.debug_mode) {
+        /* HTTP/2 control frames (types 0x02-0x08) in small packets */
+        if (len >= 9 && len <= 32) {
+            uint8_t frame_type = data[3];
+            if (frame_type >= 0x02 && frame_type <= 0x08) {
+                return;
+            }
+        }
+
+        /* Small writes (<= 13 bytes) are likely HTTP/2 control frames:
+         * - 9 bytes: frame header only (e.g., SETTINGS ACK)
+         * - 13 bytes: frame header + 4 byte payload (e.g., WINDOW_UPDATE)
+         * - 8 bytes: partial frame or GOAWAY body
+         * - 4 bytes: partial WINDOW_UPDATE payload
+         * Suppress these when event looks like it could be HTTP/2 traffic */
+        if (len <= 13 && event->event_type == EVENT_SSL_WRITE) {
+            /* Check if this process has any H2 activity */
+            h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, false);
+            if (h2_conn) {
+                return;  /* Known H2 connection - suppress noise */
+            }
+            /* Also suppress small writes that look like H2 frames */
+            if (len == 4 || len == 8 || len == 9 || len == 13) {
+                return;  /* Common H2 control frame sizes */
+            }
+        }
+
+        /* Small reads on active H2 connections are partial frames */
+        if (len <= 9 && event->event_type == EVENT_SSL_READ) {
+            h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, false);
+            if (h2_conn && h2_conn->active) {
+                return;
+            }
+        }
+
+        /* Block-sized reads without signatures are likely file I/O (when IPC filter on) */
+        if (g_config.filter_ipc && !sig) {
+            /* Common block sizes: 4096, 8192, 16384, 32768 */
+            if (len == 4096 || len == 8192 || len == 16384 || len == 32768 ||
+                len == 32 || len == 64 || len == 128 || len == 256) {
+                return;
+            }
+        }
+    }
+
+    char ts[32];
+    display_get_timestamp(ts, sizeof(ts));
+    const char *dir = (event->event_type == EVENT_SSL_WRITE) ? "WRITE" : "READ";
+
+    char raw_proc_name[TASK_COMM_LEN] = {0};
+    get_process_name(event->pid, raw_proc_name, sizeof(raw_proc_name));
+    const char *display_name = raw_proc_name[0] ? raw_proc_name : event->comm;
+
+    if (sig) {
+        output_write(worker, "%s%s%s [%s%s%s] %s (PID %u) %u bytes %s[%s]%s\n",
+                    display_color(C_DIM), ts, display_color(C_RESET),
+                    display_color(C_CYAN), dir, display_color(C_RESET),
+                    display_name, event->pid, event->data_len,
+                    display_color(C_YELLOW), sig, display_color(C_RESET));
+    } else {
+        output_write(worker, "%s%s%s [%s%s%s] %s (PID %u) %u bytes\n",
+                    display_color(C_DIM), ts, display_color(C_RESET),
+                    display_color(C_CYAN), dir, display_color(C_RESET),
+                    display_name, event->pid, event->data_len);
+    }
+}
+#endif /* HAVE_THREADING */
+
 /* Print usage */
 static void print_usage(const char *prog) {
     printf("spliff v%s - SSL/TLS Traffic Sniffer\n\n", SPLIFF_VERSION);
@@ -637,6 +1106,12 @@ static void print_usage(const char *prog) {
     printf("  -d              Debug mode (verbose output)\n");
     printf("  --show-libs     Show all discovered SSL libraries\n");
     printf("  -C              Disable colored output\n");
+#ifdef HAVE_THREADING
+    printf("\nThreading Options:\n");
+    printf("  -t, --threads N Worker threads (0=auto, default: auto)\n");
+    printf("                  Auto: max(1, CPUs-3), capped at 16\n");
+    printf("  --no-threading  Disable multi-threading (single-threaded mode)\n");
+#endif
     printf("  -v, --version   Show version\n");
     printf("  -h, --help      Show this help\n");
     printf("\nExamples:\n");
@@ -658,6 +1133,11 @@ int main(int argc, char **argv) {
     bool use_wolfssl = true;       /* WolfSSL auto-detection */
     bool debug_mode = false;
     bool show_libs = false;        /* Show all discovered libraries */
+
+#ifdef HAVE_THREADING
+    int num_threads = 0;           /* 0 = auto-detect based on CPU count */
+    bool disable_threading = false;
+#endif
 
     /* Filter options */
     char target_comm[64] = {0};
@@ -742,6 +1222,23 @@ int main(int argc, char **argv) {
             g_config.filter_ipc = true;
         } else if (strcmp(argv[i], "--show-libs") == 0) {
             show_libs = true;
+#ifdef HAVE_THREADING
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "Error: %s requires a number argument\n", argv[i]);
+                return 1;
+            }
+            char *endptr;
+            long threads = strtol(argv[++i], &endptr, 10);
+            if (*endptr != '\0' || threads < 0 || threads > MAX_WORKERS) {
+                fprintf(stderr, "Error: Invalid thread count '%s' (0=auto, max=%d)\n",
+                        argv[i], MAX_WORKERS);
+                return 1;
+            }
+            num_threads = (int)threads;
+        } else if (strcmp(argv[i], "--no-threading") == 0) {
+            disable_threading = true;
+#endif
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -1052,7 +1549,27 @@ int main(int argc, char **argv) {
         probe_handler_set_filter_ipc(&g_handler, true);
     }
 
-    probe_handler_set_callback(&g_handler, process_event, NULL);
+#ifdef HAVE_THREADING
+    /* Initialize threading if enabled (default: auto-detect unless --no-threading) */
+    if (!disable_threading) {
+        if (threading_init(&g_threading, num_threads, false) == 0) {
+            g_threading_initialized = true;
+            g_threading_enabled = true;
+            printf("  %sMulti-threading:%s %d workers%s\n",
+                   display_color(C_GREEN), display_color(C_RESET),
+                   g_threading.num_workers,
+                   num_threads == 0 ? " (auto)" : "");
+        } else {
+            fprintf(stderr, "Warning: Failed to initialize threading, falling back to single-threaded mode\n");
+        }
+    }
+
+    if (!g_threading_enabled)
+#endif
+    {
+        /* Single-threaded mode: use direct callback */
+        probe_handler_set_callback(&g_handler, process_event, NULL);
+    }
 
     if (probe_handler_setup_ringbuf(&g_handler, bpf_loader_get_object(&g_loader)) < 0) {
         fprintf(stderr, "%sError:%s Cannot setup ring buffer\n",
@@ -1088,11 +1605,30 @@ int main(int argc, char **argv) {
     printf("%s════════════════════════════════════════════%s\n\n",
            display_color(C_DIM), display_color(C_RESET));
 
-    /* Main event loop */
-    while (!g_exiting) {
-        err = probe_handler_poll(&g_handler, 100);
-        if (err == -EINTR) continue;
-        if (err < 0) break;
+#ifdef HAVE_THREADING
+    if (g_threading_enabled) {
+        /* Multi-threaded mode: start threading and wait */
+        if (threading_start(&g_threading, &g_handler) != 0) {
+            fprintf(stderr, "%sError:%s Failed to start threading\n",
+                    display_color(C_RED), display_color(C_RESET));
+            return 1;
+        }
+
+        /* Wait for signal (Ctrl+C) */
+        while (!g_exiting) {
+            usleep(100000);  /* 100ms sleep */
+        }
+
+        /* Shutdown handled by cleanup_all_resources via atexit */
+    } else
+#endif
+    {
+        /* Single-threaded main event loop */
+        while (!g_exiting) {
+            err = probe_handler_poll(&g_handler, 100);
+            if (err == -EINTR) continue;
+            if (err < 0) break;
+        }
     }
 
     printf("\n%sDone.%s\n", display_color(C_GREEN), display_color(C_RESET));

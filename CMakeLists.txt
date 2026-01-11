@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(spliff
-    VERSION 0.5.3
+    VERSION 0.6.1
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C
@@ -201,6 +201,27 @@ if(ENABLE_BROTLI)
     endif()
 endif()
 
+# Concurrency Kit (ck) - lock-free data structures for threading
+pkg_check_modules(CK IMPORTED_TARGET ck)
+if(NOT CK_FOUND)
+    # Fallback: try to find header and library directly
+    find_path(CK_INCLUDE_DIR ck_ring.h PATH_SUFFIXES ck)
+    find_library(CK_LIBRARY NAMES ck)
+    if(CK_INCLUDE_DIR AND CK_LIBRARY)
+        message(STATUS "Found ck via direct search")
+        set(CK_FOUND TRUE)
+        add_library(PkgConfig::CK INTERFACE IMPORTED)
+        target_include_directories(PkgConfig::CK INTERFACE ${CK_INCLUDE_DIR})
+        target_link_libraries(PkgConfig::CK INTERFACE ${CK_LIBRARY})
+    else()
+        message(STATUS "ck not found - multi-threading disabled")
+        set(CK_FOUND FALSE)
+    endif()
+endif()
+if(CK_FOUND)
+    message(STATUS "Found ck: ${CK_VERSION}")
+endif()
+
 # Find clang for BPF compilation
 find_program(CLANG_EXECUTABLE clang REQUIRED)
 message(STATUS "Found clang: ${CLANG_EXECUTABLE}")
@@ -220,6 +241,18 @@ set(SPLIFF_SOURCES
     src/bpf/probe_handler.c
     src/output/display.c
 )
+
+# Threading sources (optional, requires ck library)
+if(CK_FOUND)
+    list(APPEND SPLIFF_SOURCES
+        src/threading/pool.c
+        src/threading/state.c
+        src/threading/worker.c
+        src/threading/dispatcher.c
+        src/threading/output.c
+        src/threading/manager.c
+    )
+endif()
 
 # ============================================================================
 # BPF Program Compilation
@@ -291,6 +324,12 @@ endif()
 if(BROTLI_FOUND)
     target_link_libraries(spliff PRIVATE PkgConfig::BROTLI)
     target_compile_definitions(spliff PRIVATE HAVE_BROTLI)
+endif()
+
+# Threading support (requires ck library)
+if(CK_FOUND)
+    target_link_libraries(spliff PRIVATE PkgConfig::CK)
+    target_compile_definitions(spliff PRIVATE HAVE_THREADING)
 endif()
 
 # Strip release builds
@@ -429,9 +468,19 @@ if(BROTLI_FOUND)
 else()
     message(STATUS "  brotli:         not found (optional)")
 endif()
+if(CK_FOUND)
+    message(STATUS "  ck:             ${CK_VERSION}")
+else()
+    message(STATUS "  ck:             not found (threading disabled)")
+endif()
 message(STATUS "")
 message(STATUS "Options:")
 message(STATUS "  Sanitizers:     ${ENABLE_SANITIZERS}")
 message(STATUS "  ZSTD support:   ${ENABLE_ZSTD}")
 message(STATUS "  Brotli support: ${ENABLE_BROTLI}")
+if(CK_FOUND)
+    message(STATUS "  Threading:      ON (multi-threaded mode available)")
+else()
+    message(STATUS "  Threading:      OFF (single-threaded mode only)")
+endif()
 message(STATUS "")
