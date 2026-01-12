@@ -259,6 +259,21 @@ typedef struct {
 } pending_body_entry_t;
 
 /* ============================================================================
+ * HTTP/1.1 Request Cache Entry (per-worker)
+ * ============================================================================ */
+
+#define MAX_H1_REQUEST_CACHE_PER_WORKER 16
+
+typedef struct {
+    uint32_t pid;
+    uint64_t ssl_ctx;
+    char method[16];
+    char path[512];
+    char host[256];      /* From Host header */
+    bool active;
+} h1_request_entry_t;
+
+/* ============================================================================
  * Per-Worker State
  * ============================================================================ */
 
@@ -286,6 +301,10 @@ typedef struct worker_state {
     /* Pending bodies */
     pending_body_entry_t pending_bodies[MAX_PENDING_BODIES_PER_WORKER];
     int pending_body_count;
+
+    /* HTTP/1.1 request cache (for request-response correlation) */
+    h1_request_entry_t h1_request_cache[MAX_H1_REQUEST_CACHE_PER_WORKER];
+    int h1_request_count;
 
     /* Decompression buffer (per-worker to avoid static buffer races) */
     uint8_t *decomp_buf;
@@ -510,6 +529,13 @@ pending_body_entry_t *worker_create_pending_body(worker_state_t *state,
                                                     const char *content_encoding);
 void worker_clear_pending_body(worker_state_t *state, pending_body_entry_t *entry);
 void worker_cleanup_pending_bodies_pid(worker_state_t *state, uint32_t pid);
+
+/* HTTP/1.1 request cache management (for request-response correlation) */
+h1_request_entry_t *worker_find_h1_request(worker_state_t *state,
+                                            uint32_t pid, uint64_t ssl_ctx);
+void worker_set_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
+                           const char *method, const char *path, const char *host);
+void worker_clear_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx);
 
 /* ============================================================================
  * Statistics Functions

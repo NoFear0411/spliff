@@ -17,6 +17,7 @@
  */
 
 #include "threading.h"
+#include "../util/safe_str.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -632,5 +633,71 @@ void worker_cleanup_pending_bodies_pid(worker_state_t *state, uint32_t pid) {
             state->pending_bodies[i].pid == pid) {
             worker_clear_pending_body(state, &state->pending_bodies[i]);
         }
+    }
+}
+
+/* ============================================================================
+ * HTTP/1.1 Request Cache Functions
+ * ============================================================================ */
+
+/*
+ * Find cached HTTP/1.1 request for a connection
+ */
+h1_request_entry_t *worker_find_h1_request(worker_state_t *state,
+                                            uint32_t pid, uint64_t ssl_ctx) {
+    if (!state) {
+        return NULL;
+    }
+
+    for (int i = 0; i < MAX_H1_REQUEST_CACHE_PER_WORKER; i++) {
+        if (state->h1_request_cache[i].active &&
+            state->h1_request_cache[i].pid == pid &&
+            state->h1_request_cache[i].ssl_ctx == ssl_ctx) {
+            return &state->h1_request_cache[i];
+        }
+    }
+    return NULL;
+}
+
+/*
+ * Store HTTP/1.1 request for response correlation
+ */
+void worker_set_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
+                           const char *method, const char *path, const char *host) {
+    if (!state) {
+        return;
+    }
+
+    /* Find existing or empty slot */
+    h1_request_entry_t *slot = worker_find_h1_request(state, pid, ssl_ctx);
+    if (!slot) {
+        for (int i = 0; i < MAX_H1_REQUEST_CACHE_PER_WORKER; i++) {
+            if (!state->h1_request_cache[i].active) {
+                slot = &state->h1_request_cache[i];
+                break;
+            }
+        }
+    }
+
+    /* Evict first slot if full */
+    if (!slot) {
+        slot = &state->h1_request_cache[0];
+    }
+
+    slot->pid = pid;
+    slot->ssl_ctx = ssl_ctx;
+    slot->active = true;
+    safe_strcpy(slot->method, sizeof(slot->method), method ? method : "");
+    safe_strcpy(slot->path, sizeof(slot->path), path ? path : "");
+    safe_strcpy(slot->host, sizeof(slot->host), host ? host : "");
+}
+
+/*
+ * Clear cached HTTP/1.1 request
+ */
+void worker_clear_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx) {
+    h1_request_entry_t *entry = worker_find_h1_request(state, pid, ssl_ctx);
+    if (entry) {
+        entry->active = false;
     }
 }

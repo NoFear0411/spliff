@@ -2,6 +2,31 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.7.1] - 2026-01-12
+
+### Added
+- **HTTP/1.1 Request-Response Correlation**: Responses now show associated request URL
+  - Request cache tracks (pid, ssl_ctx) → (method, path, host) per connection
+  - Response display includes URL from cached request for correlation
+  - Both single-threaded and multi-threaded modes supported
+
+- **ALPN Protocol Indicator**: Display shows negotiated protocol
+  - Format: `ALPN:h2` or `ALPN:http/1.1`
+  - Shown for both requests and responses
+  - Uses actual ALPN from TLS negotiation when available
+
+### Changed
+- **Unified Display Format**: Consistent output regardless of HTTP version
+  - Request: `→ METHOD https://host/path ALPN:protocol process (PID) [latency] [stream N]`
+  - Response: `← STATUS https://host/path ALPN:protocol content-type (size) process (PID) [latency] [stream N]`
+  - Arrow direction: `→` for outgoing requests, `←` for incoming responses
+
+### Fixed
+- **TLS Handshake Probe Duplication**: Removed redundant `SSL_do_handshake` probes
+  - `SSL_connect` internally calls `SSL_do_handshake`, causing duplicate events
+  - Now only attaches to `SSL_connect` for OpenSSL handshake detection
+  - Note: Multiple handshakes per connection are still possible (session resumption)
+
 ## [0.7.0] - 2026-01-12
 
 ### Added
