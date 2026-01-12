@@ -145,6 +145,57 @@ static void set_alpn_proto(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
     http2_set_alpn(pid, ssl_ctx, alpn);
 }
 
+/* HTTP/1.1 request tracking - for request/response correlation
+ * Stores the last request URL per connection for display on responses
+ */
+#define MAX_H1_REQUEST_CACHE 32
+
+typedef struct {
+    uint32_t pid;
+    uint64_t ssl_ctx;
+    char method[16];
+    char path[512];
+    char host[256];      /* From Host header */
+    bool active;
+} h1_request_cache_t;
+
+static h1_request_cache_t g_h1_request_cache[MAX_H1_REQUEST_CACHE];
+
+static h1_request_cache_t *find_h1_request(uint32_t pid, uint64_t ssl_ctx) {
+    for (int i = 0; i < MAX_H1_REQUEST_CACHE; i++) {
+        if (g_h1_request_cache[i].active &&
+            g_h1_request_cache[i].pid == pid &&
+            g_h1_request_cache[i].ssl_ctx == ssl_ctx) {
+            return &g_h1_request_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static void set_h1_request(uint32_t pid, uint64_t ssl_ctx, const char *method,
+                           const char *path, const char *host) {
+    h1_request_cache_t *slot = find_h1_request(pid, ssl_ctx);
+    if (!slot) {
+        for (int i = 0; i < MAX_H1_REQUEST_CACHE; i++) {
+            if (!g_h1_request_cache[i].active) {
+                slot = &g_h1_request_cache[i];
+                break;
+            }
+        }
+    }
+    /* Evict first slot if full */
+    if (!slot) {
+        slot = &g_h1_request_cache[0];
+    }
+
+    slot->pid = pid;
+    slot->ssl_ctx = ssl_ctx;
+    slot->active = true;
+    safe_strcpy(slot->method, sizeof(slot->method), method ? method : "");
+    safe_strcpy(slot->path, sizeof(slot->path), path ? path : "");
+    safe_strcpy(slot->host, sizeof(slot->host), host ? host : "");
+}
+
 /* Pending body state - tracks responses expecting body data */
 #define BODY_ACCUM_SIZE (256 * 1024)  /* 256KB accumulation buffer */
 
@@ -421,8 +472,29 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
 
         /* Display based on direction (auto-detected by llhttp) */
         if (msg.direction == DIR_REQUEST) {
+            /* Extract Host header for HTTP/1.1 and store for response correlation */
+            const char *host = NULL;
+            for (int i = 0; i < msg.header_count; i++) {
+                if (strcasecmp(msg.headers[i].name, "Host") == 0) {
+                    host = msg.headers[i].value;
+                    break;
+                }
+            }
+            /* Store request for response correlation */
+            set_h1_request(event->pid, event->ssl_ctx, msg.method, msg.path, host);
+            /* Copy host to authority for unified display */
+            if (host && !msg.authority[0]) {
+                safe_strcpy(msg.authority, sizeof(msg.authority), host);
+            }
             display_http_request(&msg);
         } else {
+            /* Look up cached request for URL correlation */
+            h1_request_cache_t *cached_req = find_h1_request(event->pid, event->ssl_ctx);
+            if (cached_req) {
+                safe_strcpy(msg.authority, sizeof(msg.authority), cached_req->host);
+                safe_strcpy(msg.path, sizeof(msg.path), cached_req->path);
+                safe_strcpy(msg.scheme, sizeof(msg.scheme), "https");
+            }
             display_http_response(&msg);
         }
 
@@ -688,14 +760,23 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
     /* Handle handshake events */
     if (event->event_type == EVENT_HANDSHAKE) {
         if (g_config.show_handshake) {
+            char ts[32];
+            display_get_timestamp(ts, sizeof(ts));
+
             char proc_name[TASK_COMM_LEN] = {0};
             get_process_name(event->pid, proc_name, sizeof(proc_name));
             const char *name = proc_name[0] ? proc_name : event->comm;
 
-            output_write(worker, "%s[TLS Handshake]%s %s%s%s (PID %u) %.3fms\n",
-                        display_color(C_YELLOW), display_color(C_RESET),
+            char lat[32];
+            display_format_latency(event->delta_ns, lat, sizeof(lat));
+
+            output_write(worker, "%s%s%s %s\xf0\x9f\x94\x92%s TLS handshake %scomplete%s %s[%s]%s %s%s%s %s(%u)%s\n",
+                        display_color(C_DIM), ts, display_color(C_RESET),
+                        display_color(C_MAGENTA), display_color(C_RESET),
+                        display_color(C_GREEN), display_color(C_RESET),
+                        display_color(C_YELLOW), lat, display_color(C_RESET),
                         display_color(C_CYAN), name, display_color(C_RESET),
-                        event->pid, event->delta_ns / 1000000.0);
+                        display_color(C_DIM), event->pid, display_color(C_RESET));
         }
         return;
     }
@@ -753,32 +834,86 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
             safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
         }
 
-        /* Format output through output thread */
+        /* Format output through output thread - unified with display_http_* functions */
         char ts[32];
         display_get_timestamp(ts, sizeof(ts));
-        const char *dir_str = (msg.direction == DIR_REQUEST) ? "REQ" : "RSP";
-        const char *dir_color = (msg.direction == DIR_REQUEST) ?
-                                display_color(C_GREEN) : display_color(C_CYAN);
+
+        /* Determine ALPN protocol string */
+        const char *alpn_str = alpn ? alpn : "http/1.1";
 
         if (msg.direction == DIR_REQUEST) {
-            output_write(worker, "%s%s%s %s[%s]%s %s%s%s %s %s%s%s (PID %u)\n",
+            /* Extract Host header for URL display and store for response correlation */
+            const char *host = NULL;
+            for (int i = 0; i < msg.header_count; i++) {
+                if (strcasecmp(msg.headers[i].name, "Host") == 0) {
+                    host = msg.headers[i].value;
+                    break;
+                }
+            }
+            /* Store request for response correlation */
+            worker_set_h1_request(state, event->pid, event->ssl_ctx,
+                                  msg.method, msg.path, host);
+
+            /* Build full URI - sized for host(256) + path(2048) + https:// prefix */
+            char full_uri[2560];
+            if (host && host[0]) {
+                snprintf(full_uri, sizeof(full_uri), "https://%s%s", host, msg.path);
+            } else {
+                snprintf(full_uri, sizeof(full_uri), "%s", msg.path);
+            }
+
+            /* Format: <timestamp> -> <METHOD> <full URI> ALPN:<protocol> <process> (<PID>) [latency] */
+            output_write(worker, "%s%s%s %s\xe2\x86\x92%s %s%s%s %s %sALPN:%s%s %s%s%s %s(%u)%s",
                         display_color(C_DIM), ts, display_color(C_RESET),
-                        dir_color, dir_str, display_color(C_RESET),
-                        display_color(C_GREEN), msg.method, display_color(C_RESET),
-                        msg.path,
-                        display_color(C_DIM), msg.comm, display_color(C_RESET),
-                        msg.pid);
+                        display_color(C_GREEN), display_color(C_RESET),
+                        display_color(C_BOLD), msg.method, display_color(C_RESET),
+                        full_uri,
+                        display_color(C_DIM), alpn_str, display_color(C_RESET),
+                        display_color(C_CYAN), msg.comm, display_color(C_RESET),
+                        display_color(C_DIM), msg.pid, display_color(C_RESET));
+            if (msg.delta_ns > 0) {
+                char lat[32];
+                display_format_latency(msg.delta_ns, lat, sizeof(lat));
+                output_write(worker, " %s[%s]%s",
+                            display_color(C_YELLOW), lat, display_color(C_RESET));
+            }
+            output_write(worker, "\n");
         } else {
+            /* Look up cached request for URL correlation */
+            h1_request_entry_t *cached_req = worker_find_h1_request(state, event->pid, event->ssl_ctx);
+
+            /* Format: <timestamp> <- <STATUS> <URL> ALPN:<protocol> <content-type> (<size>) <process> (<PID>) [latency] */
             const char *status_color = (msg.status_code >= 200 && msg.status_code < 300) ?
-                                       display_color(C_GREEN) :
-                                       (msg.status_code >= 400) ?
-                                       display_color(C_RED) : display_color(C_YELLOW);
-            output_write(worker, "%s%s%s %s[%s]%s %s%d %s%s %.3fms\n",
+                                       C_GREEN : (msg.status_code >= 400) ? C_RED : C_YELLOW;
+            output_write(worker, "%s%s%s %s\xe2\x86\x90%s %s%d%s",
                         display_color(C_DIM), ts, display_color(C_RESET),
-                        dir_color, dir_str, display_color(C_RESET),
-                        status_color, msg.status_code, msg.status_text,
-                        display_color(C_RESET),
-                        msg.delta_ns / 1000000.0);
+                        display_color(C_BLUE), display_color(C_RESET),
+                        display_color(status_color), msg.status_code, display_color(C_RESET));
+            /* Show URL from cached request for correlation */
+            if (cached_req && cached_req->host[0]) {
+                output_write(worker, " https://%s%s", cached_req->host, cached_req->path);
+            }
+            /* Show ALPN after URL */
+            output_write(worker, " %sALPN:%s%s",
+                        display_color(C_DIM), alpn_str, display_color(C_RESET));
+            if (msg.content_type[0]) {
+                output_write(worker, " %s%s%s",
+                            display_color(C_DIM), msg.content_type, display_color(C_RESET));
+            }
+            if (msg.content_length > 0) {
+                output_write(worker, " %s(%zu bytes)%s",
+                            display_color(C_DIM), msg.content_length, display_color(C_RESET));
+            }
+            output_write(worker, " %s%s%s %s(%u)%s",
+                        display_color(C_CYAN), msg.comm, display_color(C_RESET),
+                        display_color(C_DIM), msg.pid, display_color(C_RESET));
+            if (msg.delta_ns > 0) {
+                char lat[32];
+                display_format_latency(msg.delta_ns, lat, sizeof(lat));
+                output_write(worker, " %s[%s]%s",
+                            display_color(C_YELLOW), lat, display_color(C_RESET));
+            }
+            output_write(worker, "\n");
         }
 
         /* Show headers unless compact mode */
@@ -1462,16 +1597,13 @@ int main(int argc, char **argv) {
     /* Attach handshake probes if -H is set */
     if (g_config.show_handshake) {
         if (openssl_path[0]) {
-            /* SSL_connect - client-side handshake (most common for curl, wget, etc.) */
+            /* SSL_connect - client-side handshake (internally calls SSL_do_handshake) */
             bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_connect",
                                     "probe_ssl_handshake_enter", false, debug_mode);
             bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_connect",
                                     "probe_ssl_handshake_exit", true, debug_mode);
-            /* SSL_do_handshake - generic handshake */
-            bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_do_handshake",
-                                    "probe_ssl_handshake_enter", false, debug_mode);
-            bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_do_handshake",
-                                    "probe_ssl_handshake_exit", true, debug_mode);
+            /* Note: SSL_do_handshake probes removed - SSL_connect calls it internally,
+             * which was causing duplicate handshake events */
         }
         if (gnutls_path[0]) {
             bpf_loader_attach_uprobe(&g_loader, gnutls_path, "gnutls_handshake",

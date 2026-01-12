@@ -608,6 +608,12 @@ static void h2_display_response(h2_stream_t *stream) {
     msg.status_code = stream->status_code;
     msg.timestamp_ns = stream->response_time_ns;
 
+    /* Copy request info for correlation - this lets us show which URL this response is for */
+    safe_strcpy(msg.method, sizeof(msg.method), stream->method);
+    safe_strcpy(msg.path, sizeof(msg.path), stream->path);
+    safe_strcpy(msg.authority, sizeof(msg.authority), stream->authority);
+    safe_strcpy(msg.scheme, sizeof(msg.scheme), stream->scheme[0] ? stream->scheme : "https");
+
     /* Calculate latency from request to response */
     if (stream->request_time_ns > 0 && stream->response_time_ns > 0) {
         msg.delta_ns = stream->response_time_ns - stream->request_time_ns;
