@@ -28,6 +28,13 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
+#include <stdarg.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/utsname.h>
+#include <linux/if_link.h>
+#include <fcntl.h>
 
 /* Initialize BPF loader */
 int bpf_loader_init(bpf_loader_t *loader) {
@@ -36,6 +43,22 @@ int bpf_loader_init(bpf_loader_t *loader) {
     memset(loader, 0, sizeof(*loader));
     loader->obj = NULL;
     loader->link_count = 0;
+
+    /* Initialize XDP state */
+    loader->xdp.xdp_prog = NULL;
+    loader->xdp.interface_count = 0;
+    loader->xdp.xdp_rb = NULL;
+    loader->xdp.event_callback = NULL;
+    loader->xdp.callback_ctx = NULL;
+    loader->xdp.xdp_events_fd = -1;
+    loader->xdp.session_registry_fd = -1;
+    loader->xdp.flow_states_fd = -1;
+    loader->xdp.xdp_stats_fd = -1;
+    loader->xdp.cookie_to_ssl_fd = -1;
+    loader->xdp.flow_cookie_map_fd = -1;
+    loader->xdp.enabled = false;
+    loader->xdp.sockops_link = NULL;
+    loader->xdp.cgroup_fd = -1;
 
     /* Set memory limits for BPF */
     struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
@@ -466,6 +489,29 @@ int bpf_loader_get_link_count(bpf_loader_t *loader) {
 void bpf_loader_cleanup(bpf_loader_t *loader) {
     if (!loader) return;
 
+    /* Detach XDP from all interfaces first */
+    bpf_loader_xdp_detach_all(loader, false);
+
+    /* Detach sock_ops program */
+    bpf_loader_sockops_detach(loader, false);
+
+    /* Free XDP ring buffer */
+    if (loader->xdp.xdp_rb) {
+        ring_buffer__free(loader->xdp.xdp_rb);
+        loader->xdp.xdp_rb = NULL;
+    }
+
+    /* Reset XDP state */
+    loader->xdp.xdp_prog = NULL;
+    loader->xdp.interface_count = 0;
+    loader->xdp.xdp_events_fd = -1;
+    loader->xdp.session_registry_fd = -1;
+    loader->xdp.flow_states_fd = -1;
+    loader->xdp.xdp_stats_fd = -1;
+    loader->xdp.cookie_to_ssl_fd = -1;
+    loader->xdp.flow_cookie_map_fd = -1;
+    loader->xdp.enabled = false;
+
     /* Close all links */
     for (int i = 0; i < MAX_LINKS; i++) {
         if (loader->links[i]) {
@@ -481,4 +527,896 @@ void bpf_loader_cleanup(bpf_loader_t *loader) {
     }
 
     loader->link_count = 0;
+}
+
+// =============================================================================
+// XDP Implementation
+// =============================================================================
+
+/* Helper to set XDP error */
+static void xdp_set_error(xdp_loader_t *xdp, xdp_error_t *err_out,
+                          int code, const char *fmt, ...) {
+    char msg[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+
+    if (xdp) {
+        xdp->last_error.code = code;
+        strncpy(xdp->last_error.message, msg, sizeof(xdp->last_error.message) - 1);
+        xdp->last_error.message[sizeof(xdp->last_error.message) - 1] = '\0';
+    }
+    if (err_out) {
+        err_out->code = code;
+        strncpy(err_out->message, msg, sizeof(err_out->message) - 1);
+        err_out->message[sizeof(err_out->message) - 1] = '\0';
+    }
+}
+
+/* Get XDP mode name for display */
+const char *bpf_loader_xdp_mode_name(xdp_mode_t mode) {
+    switch (mode) {
+        case XDP_MODE_SKB:     return "skb";
+        case XDP_MODE_NATIVE:  return "native";
+        case XDP_MODE_OFFLOAD: return "offload";
+        default:               return "unknown";
+    }
+}
+
+/* Convert our mode enum to libbpf XDP flags */
+static __u32 mode_to_xdp_flags(xdp_mode_t mode) {
+    switch (mode) {
+        case XDP_MODE_NATIVE:  return XDP_FLAGS_DRV_MODE;
+        case XDP_MODE_OFFLOAD: return XDP_FLAGS_HW_MODE;
+        case XDP_MODE_SKB:
+        default:               return XDP_FLAGS_SKB_MODE;
+    }
+}
+
+/* Check kernel support for XDP features */
+int bpf_loader_xdp_check_kernel_support(xdp_error_t *err_out) {
+    struct utsname uts;
+    if (uname(&uts) != 0) {
+        if (err_out) {
+            err_out->code = -errno;
+            snprintf(err_out->message, sizeof(err_out->message),
+                     "Failed to get kernel version: %s", strerror(errno));
+        }
+        return -1;
+    }
+
+    /* Parse kernel version (major.minor.patch) */
+    int major = 0, minor = 0;
+    sscanf(uts.release, "%d.%d", &major, &minor);
+
+    /* Require Linux >= 5.8 for XDP socket lookup (bpf_skc_lookup_tcp) */
+    if (major < 5 || (major == 5 && minor < 8)) {
+        if (err_out) {
+            err_out->code = -ENOTSUP;
+            snprintf(err_out->message, sizeof(err_out->message),
+                     "Kernel %d.%d too old for XDP socket lookup (need >= 5.8)",
+                     major, minor);
+        }
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Ring buffer callback wrapper */
+static int xdp_rb_callback(void *ctx, void *data, size_t data_sz) {
+    bpf_loader_t *loader = (bpf_loader_t *)ctx;
+    if (!loader || !loader->xdp.event_callback) {
+        return 0;  /* Discard event if no callback */
+    }
+    return loader->xdp.event_callback(loader->xdp.callback_ctx, data, data_sz);
+}
+
+/* Initialize XDP subsystem */
+int bpf_loader_xdp_init(bpf_loader_t *loader, bool debug, xdp_error_t *err_out) {
+    if (!loader || !loader->obj) {
+        if (err_out) {
+            xdp_set_error(NULL, err_out, -EINVAL, "Loader or BPF object not initialized");
+        }
+        return -1;
+    }
+
+    xdp_loader_t *xdp = &loader->xdp;
+
+    /* Find XDP program */
+    xdp->xdp_prog = bpf_object__find_program_by_name(loader->obj, "xdp_flow_tracker");
+    if (!xdp->xdp_prog) {
+        xdp_set_error(xdp, err_out, -ENOENT, "XDP program 'xdp_flow_tracker' not found");
+        return -1;
+    }
+
+    if (debug) {
+        printf("  [XDP] Found program: xdp_flow_tracker\n");
+    }
+
+    /* Find required maps */
+    struct bpf_map *map;
+
+    map = bpf_object__find_map_by_name(loader->obj, "flow_states");
+    if (!map) {
+        xdp_set_error(xdp, err_out, -ENOENT, "Required map 'flow_states' not found");
+        return -1;
+    }
+    xdp->flow_states_fd = bpf_map__fd(map);
+
+    map = bpf_object__find_map_by_name(loader->obj, "session_registry");
+    if (!map) {
+        xdp_set_error(xdp, err_out, -ENOENT, "Required map 'session_registry' not found");
+        return -1;
+    }
+    xdp->session_registry_fd = bpf_map__fd(map);
+
+    map = bpf_object__find_map_by_name(loader->obj, "xdp_events");
+    if (!map) {
+        xdp_set_error(xdp, err_out, -ENOENT, "Required map 'xdp_events' not found");
+        return -1;
+    }
+    xdp->xdp_events_fd = bpf_map__fd(map);
+
+    if (debug) {
+        printf("  [XDP] Found required maps: flow_states, session_registry, xdp_events\n");
+    }
+
+    /* Find optional maps */
+    map = bpf_object__find_map_by_name(loader->obj, "cookie_to_ssl");
+    if (map) {
+        xdp->cookie_to_ssl_fd = bpf_map__fd(map);
+        if (debug) printf("  [XDP] Found optional map: cookie_to_ssl\n");
+    }
+
+    map = bpf_object__find_map_by_name(loader->obj, "flow_cookie_map");
+    if (map) {
+        xdp->flow_cookie_map_fd = bpf_map__fd(map);
+        if (debug) printf("  [XDP] Found map: flow_cookie_map (for cookie caching)\n");
+    }
+
+    map = bpf_object__find_map_by_name(loader->obj, "xdp_stats_map");
+    if (map) {
+        xdp->xdp_stats_fd = bpf_map__fd(map);
+        if (debug) printf("  [XDP] Found optional map: xdp_stats_map\n");
+    }
+
+    xdp->enabled = true;
+    if (debug) {
+        printf("  [XDP] Initialization complete\n");
+    }
+
+    return 0;
+}
+
+/* Register callback for XDP ring buffer events */
+int bpf_loader_xdp_set_event_callback(bpf_loader_t *loader,
+                                       xdp_event_callback_t callback,
+                                       void *ctx) {
+    if (!loader || !loader->xdp.enabled) {
+        return -1;
+    }
+
+    loader->xdp.event_callback = callback;
+    loader->xdp.callback_ctx = ctx;
+
+    /* Create ring buffer if not already created */
+    if (!loader->xdp.xdp_rb && loader->xdp.xdp_events_fd >= 0) {
+        loader->xdp.xdp_rb = ring_buffer__new(loader->xdp.xdp_events_fd,
+                                               xdp_rb_callback,
+                                               loader, NULL);
+        if (!loader->xdp.xdp_rb) {
+            xdp_set_error(&loader->xdp, NULL, -ENOMEM, "Failed to create ring buffer");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/* Check if interface is virtual (veth, docker, virbr, etc.)
+ * Note: /sys/class/net/{name}/device check is more reliable for physical detection,
+ * but this prefix list handles common edge cases where device symlink exists
+ * but the interface is still logically virtual.
+ */
+static bool is_virtual_interface(const char *name) {
+    const char *virtual_prefixes[] = {
+        "veth", "docker", "virbr", "br-", "vlan", "bond",
+        "tun", "tap", "vxlan", "geneve", "wg",
+        "ipvlan", "macvlan", "xfrm",  /* Additional virtual types */
+        NULL
+    };
+
+    for (int i = 0; virtual_prefixes[i]; i++) {
+        if (strncmp(name, virtual_prefixes[i], strlen(virtual_prefixes[i])) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Discover active network interfaces */
+int bpf_loader_xdp_discover_interfaces(xdp_iface_info_t *ifaces, int max,
+                                        int *count, int flags, bool debug) {
+    if (!ifaces || !count || max <= 0) {
+        return -1;
+    }
+
+    *count = 0;
+    DIR *dir = opendir("/sys/class/net");
+    if (!dir) {
+        return -1;
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        closedir(dir);
+        return -1;
+    }
+
+    int skipped_count = 0;  /* Track skipped interfaces for truncation warning */
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+
+        /* Skip . and .. */
+        if (name[0] == '.') continue;
+
+        /* Skip loopback if requested */
+        if ((flags & XDP_DISCOVER_SKIP_LOOPBACK) && strcmp(name, "lo") == 0) {
+            continue;
+        }
+
+        /* Skip virtual interfaces if requested */
+        if ((flags & XDP_DISCOVER_SKIP_VIRTUAL) && is_virtual_interface(name)) {
+            continue;
+        }
+
+        /* Skip names longer than kernel limit (IFNAMSIZ = 16, max name = 15 chars) */
+        size_t name_len = strlen(name);
+        if (name_len >= IFNAMSIZ) {
+            continue;  /* Invalid interface name length */
+        }
+
+        /* Get interface info via ioctl */
+        struct ifreq ifr;
+        memset(&ifr, 0, sizeof(ifr));
+        memcpy(ifr.ifr_name, name, name_len);  /* name_len < IFNAMSIZ guaranteed */
+
+        if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
+            continue;  /* Skip interfaces we can't query */
+        }
+
+        unsigned int if_flags = ifr.ifr_flags;
+
+        /* Skip interfaces that are down if requested */
+        if ((flags & XDP_DISCOVER_ONLY_UP) && !(if_flags & IFF_UP)) {
+            continue;
+        }
+
+        /* Get interface index */
+        if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
+            continue;
+        }
+        unsigned int ifindex = ifr.ifr_ifindex;
+
+        /* Get MTU */
+        unsigned int mtu = 0;
+        if (ioctl(sock, SIOCGIFMTU, &ifr) == 0) {
+            mtu = ifr.ifr_mtu;
+        } else if (debug) {
+            printf("  [XDP] Warning: Could not get MTU for %s\n", name);
+        }
+
+        /* Check if physical (has a driver in /sys/class/net/<name>/device)
+         * Path length: 15 + name_len(max 15) + 7 + 1 = 38 bytes max */
+        char device_path[64];
+        snprintf(device_path, sizeof(device_path), "/sys/class/net/%.*s/device",
+                 (int)name_len, name);
+        bool is_physical = (access(device_path, F_OK) == 0);
+
+        /* Skip non-physical if only_physical requested */
+        if ((flags & XDP_DISCOVER_ONLY_PHYSICAL) && !is_physical) {
+            continue;
+        }
+
+        /* Check if we have room */
+        if (*count >= max) {
+            skipped_count++;
+            continue;
+        }
+
+        /* Add to result */
+        xdp_iface_info_t *info = &ifaces[*count];
+        strncpy(info->name, name, sizeof(info->name) - 1);
+        info->name[sizeof(info->name) - 1] = '\0';
+        info->ifindex = ifindex;
+        info->mtu = mtu;
+        info->flags = if_flags;
+        info->is_physical = is_physical;
+
+        (*count)++;
+
+        if (debug) {
+            printf("  [XDP] Discovered interface: %s (idx=%u, mtu=%u, %s%s)\n",
+                   name, ifindex, mtu,
+                   (if_flags & IFF_UP) ? "UP" : "DOWN",
+                   is_physical ? ", physical" : ", virtual");
+        }
+    }
+
+    /* Warn if truncated */
+    if (skipped_count > 0 && debug) {
+        printf("  [XDP] Warning: Discovered interfaces truncated, %d skipped (max=%d)\n",
+               skipped_count, max);
+    }
+
+    close(sock);
+    closedir(dir);
+    return 0;
+}
+
+/* Attach XDP program to a specific interface */
+int bpf_loader_xdp_attach(bpf_loader_t *loader, const char *ifname,
+                          xdp_mode_t mode, bool debug, xdp_error_t *err_out) {
+    if (!loader || !loader->xdp.enabled || !ifname) {
+        xdp_set_error(&loader->xdp, err_out, -EINVAL, "Invalid parameters");
+        return -1;
+    }
+
+    xdp_loader_t *xdp = &loader->xdp;
+
+    /* Validate interface name length (kernel limit is IFNAMSIZ=16) */
+    size_t ifname_len = strlen(ifname);
+    if (ifname_len == 0 || ifname_len >= IFNAMSIZ) {
+        xdp_set_error(xdp, err_out, -EINVAL, "Invalid interface name length");
+        return -1;
+    }
+
+    if (xdp->interface_count >= MAX_XDP_INTERFACES) {
+        xdp_set_error(xdp, err_out, -ENOSPC, "Maximum interfaces reached (%d)",
+                      MAX_XDP_INTERFACES);
+        return -1;
+    }
+
+    /* Get interface index */
+    unsigned int ifindex = if_nametoindex(ifname);
+    if (ifindex == 0) {
+        xdp_set_error(xdp, err_out, -ENODEV, "Interface '%s' not found", ifname);
+        return -1;
+    }
+
+    /* Get program fd */
+    int prog_fd = bpf_program__fd(xdp->xdp_prog);
+    if (prog_fd < 0) {
+        xdp_set_error(xdp, err_out, -ENOENT, "XDP program fd not available");
+        return -1;
+    }
+
+    /* Try preferred mode first, fall back to SKB */
+    xdp_mode_t actual_mode = mode;
+    __u32 xdp_flags = mode_to_xdp_flags(mode);
+    int err = bpf_xdp_attach(ifindex, prog_fd, xdp_flags, NULL);
+
+    if (err && mode != XDP_MODE_SKB) {
+        /* Fall back to SKB mode */
+        if (debug) {
+            printf("  [XDP] %s mode failed on %s, falling back to SKB mode\n",
+                   bpf_loader_xdp_mode_name(mode), ifname);
+        }
+        actual_mode = XDP_MODE_SKB;
+        xdp_flags = XDP_FLAGS_SKB_MODE;
+        err = bpf_xdp_attach(ifindex, prog_fd, xdp_flags, NULL);
+    }
+
+    if (err) {
+        xdp_set_error(xdp, err_out, err, "Failed to attach XDP to %s: %s",
+                      ifname, strerror(-err));
+        return -1;
+    }
+
+    /* Record attachment (ifname_len validated < IFNAMSIZ at function start) */
+    xdp_interface_t *iface = &xdp->interfaces[xdp->interface_count];
+    memcpy(iface->name, ifname, ifname_len);
+    iface->name[ifname_len] = '\0';
+    iface->ifindex = ifindex;
+    iface->prog_fd = prog_fd;
+    iface->mode = actual_mode;
+    iface->attached = true;
+    xdp->interface_count++;
+
+    if (debug) {
+        printf("  [XDP] Attached to %s (idx=%u) in %s mode\n",
+               ifname, ifindex, bpf_loader_xdp_mode_name(actual_mode));
+    }
+
+    return (int)actual_mode;
+}
+
+/* Attach XDP program to all suitable network interfaces (auto-discovery) */
+int bpf_loader_xdp_attach_all(bpf_loader_t *loader, bool debug) {
+    if (!loader || !loader->xdp.enabled) {
+        return 0;
+    }
+
+    xdp_iface_info_t ifaces[MAX_XDP_INTERFACES];
+    int count = 0;
+
+    if (bpf_loader_xdp_discover_interfaces(ifaces, MAX_XDP_INTERFACES, &count,
+                                            XDP_DISCOVER_DEFAULT, debug) != 0) {
+        return 0;
+    }
+
+    int attached = 0;
+    for (int i = 0; i < count; i++) {
+        /* Try native mode first (best performance), auto-fallback to SKB */
+        if (bpf_loader_xdp_attach(loader, ifaces[i].name,
+                                   XDP_MODE_NATIVE, debug, NULL) >= 0) {
+            attached++;
+        }
+    }
+
+    if (debug) {
+        printf("  [XDP] Attached to %d of %d discovered interfaces\n",
+               attached, count);
+    }
+
+    return attached;
+}
+
+/* Attach sock_ops program for socket cookie caching */
+int bpf_loader_sockops_attach(bpf_loader_t *loader, bool debug) {
+    if (!loader || !loader->obj) {
+        return -1;
+    }
+
+    xdp_loader_t *xdp = &loader->xdp;
+
+    /* Find the sock_ops program */
+    struct bpf_program *sockops_prog = bpf_object__find_program_by_name(
+        loader->obj, "sockops_cache_cookie");
+    if (!sockops_prog) {
+        if (debug) {
+            printf("  [SOCKOPS] Program 'sockops_cache_cookie' not found\n");
+        }
+        return -1;
+    }
+
+    /* Open root cgroup for attachment
+     * sock_ops programs must be attached to a cgroup.
+     * We use the root cgroup (cgroup2) so all connections are tracked.
+     */
+    const char *cgroup_paths[] = {
+        "/sys/fs/cgroup",           /* cgroup2 unified hierarchy */
+        "/sys/fs/cgroup/unified",   /* cgroup2 on hybrid systems */
+        NULL
+    };
+
+    int cgroup_fd = -1;
+    for (int i = 0; cgroup_paths[i] != NULL; i++) {
+        cgroup_fd = open(cgroup_paths[i], O_RDONLY | O_DIRECTORY);
+        if (cgroup_fd >= 0) {
+            if (debug) {
+                printf("  [SOCKOPS] Using cgroup: %s\n", cgroup_paths[i]);
+            }
+            break;
+        }
+    }
+
+    if (cgroup_fd < 0) {
+        if (debug) {
+            printf("  [SOCKOPS] Cannot open cgroup (cgroup2 required)\n");
+        }
+        return -1;
+    }
+
+    /* Attach sock_ops to the cgroup */
+    xdp->sockops_link = bpf_program__attach_cgroup(sockops_prog, cgroup_fd);
+    if (!xdp->sockops_link || libbpf_get_error(xdp->sockops_link)) {
+        if (debug) {
+            printf("  [SOCKOPS] Failed to attach to cgroup: %s\n",
+                   strerror(errno));
+        }
+        close(cgroup_fd);
+        xdp->sockops_link = NULL;
+        return -1;
+    }
+
+    xdp->cgroup_fd = cgroup_fd;
+
+    if (debug) {
+        printf("  [SOCKOPS] Attached socket cookie caching program\n");
+    }
+
+    return 0;
+}
+
+/* Detach sock_ops program */
+void bpf_loader_sockops_detach(bpf_loader_t *loader, bool debug) {
+    if (!loader) return;
+
+    xdp_loader_t *xdp = &loader->xdp;
+
+    if (xdp->sockops_link) {
+        bpf_link__destroy(xdp->sockops_link);
+        xdp->sockops_link = NULL;
+        if (debug) {
+            printf("  [SOCKOPS] Detached socket cookie caching program\n");
+        }
+    }
+
+    if (xdp->cgroup_fd >= 0) {
+        close(xdp->cgroup_fd);
+        xdp->cgroup_fd = -1;
+    }
+}
+
+/* Detach XDP program from a specific interface */
+int bpf_loader_xdp_detach(bpf_loader_t *loader, const char *ifname, bool debug) {
+    if (!loader || !ifname) {
+        return -1;
+    }
+
+    xdp_loader_t *xdp = &loader->xdp;
+
+    /* Find interface in our list */
+    for (int i = 0; i < xdp->interface_count; i++) {
+        if (strcmp(xdp->interfaces[i].name, ifname) == 0 &&
+            xdp->interfaces[i].attached) {
+
+            /* Detach XDP - pass 0 for flags to auto-detect */
+            int err = bpf_xdp_detach(xdp->interfaces[i].ifindex, 0, NULL);
+            if (err && debug) {
+                printf("  [XDP] Warning: detach from %s failed: %s\n",
+                       ifname, strerror(-err));
+            }
+
+            xdp->interfaces[i].attached = false;
+
+            if (debug) {
+                printf("  [XDP] Detached from %s\n", ifname);
+            }
+            return 0;
+        }
+    }
+
+    return -1;  /* Not found */
+}
+
+/* Detach XDP from all attached interfaces */
+void bpf_loader_xdp_detach_all(bpf_loader_t *loader, bool debug) {
+    if (!loader) return;
+
+    xdp_loader_t *xdp = &loader->xdp;
+
+    for (int i = 0; i < xdp->interface_count; i++) {
+        if (xdp->interfaces[i].attached) {
+            int err = bpf_xdp_detach(xdp->interfaces[i].ifindex, 0, NULL);
+            if (err && debug) {
+                printf("  [XDP] Warning: detach from %s failed: %s\n",
+                       xdp->interfaces[i].name, strerror(-err));
+            }
+            xdp->interfaces[i].attached = false;
+
+            if (debug) {
+                printf("  [XDP] Detached from %s\n", xdp->interfaces[i].name);
+            }
+        }
+    }
+}
+
+/* Check if XDP is attached to a specific interface */
+bool bpf_loader_xdp_is_attached(bpf_loader_t *loader, const char *ifname) {
+    if (!loader || !ifname) return false;
+
+    xdp_loader_t *xdp = &loader->xdp;
+    for (int i = 0; i < xdp->interface_count; i++) {
+        if (strcmp(xdp->interfaces[i].name, ifname) == 0) {
+            return xdp->interfaces[i].attached;
+        }
+    }
+    return false;
+}
+
+/* Get list of currently attached interfaces */
+int bpf_loader_xdp_get_attached_interfaces(bpf_loader_t *loader,
+                                            xdp_interface_t *ifaces, int max) {
+    if (!loader || !ifaces || max <= 0) return 0;
+
+    xdp_loader_t *xdp = &loader->xdp;
+    int count = 0;
+
+    for (int i = 0; i < xdp->interface_count && count < max; i++) {
+        if (xdp->interfaces[i].attached) {
+            memcpy(&ifaces[count], &xdp->interfaces[i], sizeof(xdp_interface_t));
+            count++;
+        }
+    }
+
+    return count;
+}
+
+/* Get the XDP ring buffer */
+struct ring_buffer *bpf_loader_xdp_get_ring_buffer(bpf_loader_t *loader) {
+    if (!loader || !loader->xdp.enabled) return NULL;
+    return loader->xdp.xdp_rb;
+}
+
+/* Poll XDP ring buffer for events */
+int bpf_loader_xdp_poll(bpf_loader_t *loader, int timeout_ms) {
+    if (!loader || !loader->xdp.xdp_rb) return -1;
+    return ring_buffer__poll(loader->xdp.xdp_rb, timeout_ms);
+}
+
+/* Session policy structure for BPF map (matches BPF definition) */
+struct session_policy {
+    uint32_t proto_type;
+    uint8_t silenced;
+    uint8_t _pad[3];
+};
+
+/* Update session registry (the "Gatekeeper") */
+int bpf_loader_xdp_update_policy(bpf_loader_t *loader, uint64_t cookie,
+                                  uint32_t proto_type, bool silenced) {
+    if (!loader || !loader->xdp.enabled || loader->xdp.session_registry_fd < 0) {
+        return -1;
+    }
+
+    struct session_policy policy = {
+        .proto_type = proto_type,
+        .silenced = silenced ? 1 : 0,
+        ._pad = {0}
+    };
+
+    return bpf_map_update_elem(loader->xdp.session_registry_fd,
+                               &cookie, &policy, BPF_ANY);
+}
+
+/* XDP stats structure (matches BPF definition in spliff.bpf.c) */
+struct xdp_stats_kernel {
+    uint64_t packets_total;
+    uint64_t packets_tcp;
+    uint64_t flows_created;
+    uint64_t flows_classified;
+    uint64_t flows_ambiguous;
+    uint64_t flows_terminated;
+    uint64_t gatekeeper_hits;
+    uint64_t cookie_failures;
+    uint64_t ringbuf_drops;
+};
+
+/* Read XDP statistics (aggregates per-CPU counters) */
+int bpf_loader_xdp_read_stats(bpf_loader_t *loader, xdp_stats_t *stats) {
+    if (!loader || !stats || loader->xdp.xdp_stats_fd < 0) {
+        return -1;
+    }
+
+    /* Zero output */
+    memset(stats, 0, sizeof(*stats));
+
+    /* Get number of CPUs */
+    int num_cpus = libbpf_num_possible_cpus();
+    if (num_cpus < 0) {
+        return -1;
+    }
+
+    /* Allocate per-CPU values array */
+    struct xdp_stats_kernel *values = calloc(num_cpus, sizeof(*values));
+    if (!values) {
+        return -1;
+    }
+
+    /* Read from per-CPU array map (key 0) */
+    uint32_t key = 0;
+    if (bpf_map_lookup_elem(loader->xdp.xdp_stats_fd, &key, values) != 0) {
+        free(values);
+        return -1;
+    }
+
+    /* Sum across all CPUs */
+    for (int i = 0; i < num_cpus; i++) {
+        stats->packets_total     += values[i].packets_total;
+        stats->packets_tcp       += values[i].packets_tcp;
+        stats->flows_created     += values[i].flows_created;
+        stats->flows_classified  += values[i].flows_classified;
+        stats->flows_ambiguous   += values[i].flows_ambiguous;
+        stats->flows_terminated  += values[i].flows_terminated;
+        stats->gatekeeper_hits   += values[i].gatekeeper_hits;
+        stats->cookie_failures   += values[i].cookie_failures;
+        stats->ringbuf_drops     += values[i].ringbuf_drops;
+    }
+
+    free(values);
+    return 0;
+}
+
+/* Check if XDP is enabled and has at least one attached interface */
+bool bpf_loader_xdp_is_active(bpf_loader_t *loader) {
+    if (!loader || !loader->xdp.enabled) return false;
+
+    for (int i = 0; i < loader->xdp.interface_count; i++) {
+        if (loader->xdp.interfaces[i].attached) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Get last XDP error */
+const xdp_error_t *bpf_loader_xdp_get_last_error(bpf_loader_t *loader) {
+    if (!loader) return NULL;
+    return &loader->xdp.last_error;
+}
+
+/* ============================================================================
+ * Cookie Warm-up - Seed flow_cookie_map with existing connections
+ * ============================================================================
+ * Uses netlink SOCK_DIAG to enumerate TCP sockets and their cookies.
+ * This allows XDP to correlate with connections established before attachment.
+ *
+ * BYTE ORDER NOTE:
+ * All three sources use NETWORK BYTE ORDER for addresses and ports:
+ *   - XDP: Parses directly from packet headers (network order)
+ *   - sock_ops: ctx->local_ip4, ctx->remote_port, etc. (network order)
+ *   - SOCK_DIAG: inet_diag_msg.id.idiag_src/dst/sport/dport (network order)
+ * We preserve network byte order throughout to ensure map key consistency.
+ */
+
+#include <linux/netlink.h>
+#include <linux/sock_diag.h>
+#include <linux/inet_diag.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <time.h>
+
+/* Flow key structure matching BPF (must match spliff.bpf.c struct flow_key) */
+struct warmup_flow_key {
+    __u32 saddr;      /* Network byte order */
+    __u32 daddr;      /* Network byte order */
+    __u16 sport;      /* Network byte order */
+    __u16 dport;      /* Network byte order */
+    __u8  ip_version;
+    __u8  _pad[3];
+} __attribute__((packed));
+
+/* Cookie entry structure matching BPF (must match struct flow_cookie_entry) */
+struct warmup_cookie_entry {
+    __u64 socket_cookie;
+    __u64 timestamp_ns;
+};
+
+/* Warm-up flow_cookie_map with existing TCP connections */
+int bpf_loader_xdp_warmup_cookies(bpf_loader_t *loader, bool debug) {
+    if (!loader || loader->xdp.flow_cookie_map_fd < 0) {
+        return 0;
+    }
+
+    int seeded = 0;
+
+    /* Create netlink socket for SOCK_DIAG */
+    int nl_sock = socket(AF_NETLINK, SOCK_DGRAM, NETLINK_SOCK_DIAG);
+    if (nl_sock < 0) {
+        if (debug) printf("  [XDP] Warm-up: Cannot create netlink socket\n");
+        return 0;
+    }
+
+    /* Build request for TCP sockets in active states */
+    struct {
+        struct nlmsghdr nlh;
+        struct inet_diag_req_v2 req;
+    } request = {
+        .nlh = {
+            .nlmsg_len = sizeof(request),
+            .nlmsg_type = SOCK_DIAG_BY_FAMILY,
+            .nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP,
+            .nlmsg_seq = 1,
+        },
+        .req = {
+            .sdiag_family = AF_INET,
+            .sdiag_protocol = IPPROTO_TCP,
+            .idiag_ext = 0,
+            .idiag_states = (1 << TCP_ESTABLISHED) | (1 << TCP_SYN_SENT) |
+                            (1 << TCP_SYN_RECV) | (1 << TCP_FIN_WAIT1) |
+                            (1 << TCP_FIN_WAIT2) | (1 << TCP_CLOSE_WAIT),
+        },
+    };
+
+    /* Send request */
+    if (send(nl_sock, &request, sizeof(request), 0) < 0) {
+        if (debug) printf("  [XDP] Warm-up: Netlink send failed\n");
+        close(nl_sock);
+        return 0;
+    }
+
+    /* Receive and process responses */
+    char buf[32768];
+    struct iovec iov = { .iov_base = buf, .iov_len = sizeof(buf) };
+    struct sockaddr_nl sa;
+    struct msghdr msg = {
+        .msg_name = &sa,
+        .msg_namelen = sizeof(sa),
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+    };
+
+    __u64 now_ns = 0;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        now_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+    }
+
+    bool done = false;
+    while (!done) {
+        ssize_t len = recvmsg(nl_sock, &msg, 0);
+        if (len < 0) {
+            break;
+        }
+
+        struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+        while (NLMSG_OK(nlh, len)) {
+            if (nlh->nlmsg_type == NLMSG_DONE) {
+                done = true;
+                break;
+            }
+            if (nlh->nlmsg_type == NLMSG_ERROR) {
+                done = true;
+                break;
+            }
+
+            struct inet_diag_msg *diag = NLMSG_DATA(nlh);
+
+            /* Build flow key - KEEP NETWORK BYTE ORDER
+             * inet_diag_msg provides all values in network byte order,
+             * which matches how XDP and sock_ops construct their keys. */
+            struct warmup_flow_key fkey = {
+                .saddr = diag->id.idiag_src[0],  /* Network order - DO NOT convert */
+                .daddr = diag->id.idiag_dst[0],  /* Network order - DO NOT convert */
+                .sport = diag->id.idiag_sport,   /* Network order - DO NOT convert */
+                .dport = diag->id.idiag_dport,   /* Network order - DO NOT convert */
+                .ip_version = 4,
+            };
+
+            /* Use socket inode as pseudo-cookie
+             * Note: This isn't the real socket cookie from bpf_get_socket_cookie(),
+             * but the inode provides a unique identifier for correlation.
+             * For true cookie matching, sock_ops will overwrite with real cookie
+             * when the connection sends/receives data. */
+            __u64 cookie = diag->idiag_inode;
+
+            if (cookie != 0) {
+                struct warmup_cookie_entry entry = {
+                    .socket_cookie = cookie,
+                    .timestamp_ns = now_ns,
+                };
+
+                /* Update map for client→server direction */
+                if (bpf_map_update_elem(loader->xdp.flow_cookie_map_fd,
+                                        &fkey, &entry, BPF_NOEXIST) == 0) {
+                    seeded++;
+                }
+
+                /* Update map for server→client direction (reverse 5-tuple) */
+                struct warmup_flow_key reverse = {
+                    .saddr = fkey.daddr,
+                    .daddr = fkey.saddr,
+                    .sport = fkey.dport,
+                    .dport = fkey.sport,
+                    .ip_version = 4,
+                };
+                bpf_map_update_elem(loader->xdp.flow_cookie_map_fd,
+                                    &reverse, &entry, BPF_NOEXIST);
+            }
+
+            nlh = NLMSG_NEXT(nlh, len);
+        }
+    }
+
+    close(nl_sock);
+
+    if (debug && seeded > 0) {
+        printf("  [XDP] Warm-up: Seeded %d existing TCP connections\n", seeded);
+    }
+
+    return seeded;
 }
