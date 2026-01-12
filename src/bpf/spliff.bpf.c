@@ -21,6 +21,7 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 
 #define MAX_BUF_SIZE 16384
 #define TASK_COMM_LEN 16
@@ -32,6 +33,7 @@
 #define EVENT_PROCESS_EXIT 3
 #define EVENT_ALPN         4
 #define EVENT_NSS_SSL_FD   5  // NSS SSL_ImportFD tracking (verified TLS connection)
+#define EVENT_XDP_PACKET   6  // XDP packet metadata event
 
 // Address families for socket filtering
 #define AF_UNIX     1   // Unix domain socket (IPC - filter out)
@@ -91,6 +93,77 @@ struct session_info {
 struct ssl_fd_args {
     __u64 ssl_ctx;        // SSL* pointer
     __s32 fd;             // OS file descriptor
+};
+
+// =============================================================================
+// XDP Structures and Constants
+// =============================================================================
+
+// Traffic categories (content-based detection, not port-based)
+#define CAT_UNKNOWN       0
+#define CAT_TLS_TCP       1   // TLS over TCP (H1/H2)
+#define CAT_QUIC          2   // QUIC/H3 over UDP (stub)
+#define CAT_PLAIN_HTTP    3   // Unencrypted HTTP/1.x
+#define CAT_H2_PREFACE    4   // HTTP/2 connection preface ("PRI * HTTP/2.0...")
+#define CAT_OTHER         5
+
+// Ethernet
+#define ETH_HLEN          14
+#define ETH_P_IP          0x0800
+#define ETH_P_IPV6        0x86DD
+
+// IP protocols
+#define IPPROTO_TCP_VAL   6
+#define IPPROTO_UDP_VAL   17
+
+// TLS record types
+#define TLS_CHANGE_CIPHER 0x14
+#define TLS_ALERT         0x15
+#define TLS_HANDSHAKE     0x16
+#define TLS_APP_DATA      0x17
+
+// TCP flags for connection lifecycle
+#define TCP_FLAG_FIN      0x01
+#define TCP_FLAG_SYN      0x02
+#define TCP_FLAG_RST      0x04
+#define TCP_FLAG_PSH      0x08
+#define TCP_FLAG_ACK      0x10
+
+// Flow key (5-tuple) - packed for memcmp consistency
+struct flow_key {
+    __u32 saddr;          // [4] Source IP (v4) or hash (v6)
+    __u32 daddr;          // [4] Dest IP (v4) or hash (v6)
+    __u16 sport;          // [2] Source port
+    __u16 dport;          // [2] Dest port
+    __u8  protocol;       // [1] TCP or UDP
+    __u8  ip_version;     // [1] 4 or 6
+    __u8  _pad[2];        // [2] Align to 16 bytes
+} __attribute__((packed));
+
+// XDP packet event - optimized for cache efficiency
+struct xdp_packet_event {
+    __u64 timestamp_ns;   // [8] Absolute time for latency calcs
+    __u64 socket_cookie;  // [8] The "Golden Thread" to uprobes/L7
+    struct flow_key flow; // [16] Src/Dst IP + Ports
+
+    __u32 pkt_len;        // [4] Wire length
+    __u32 ifindex;        // [4] NIC ID
+    __u32 event_type;     // [4] EVENT_XDP_PACKET (matches uprobe enum)
+
+    __u16 payload_off;    // [2] L4 payload start
+    __u8  category;       // [1] Protocol class
+    __u8  tls_type;       // [1] TLS record type (Handshake vs Data)
+    __u8  direction;      // [1] 0=unknown, 1=ingress, 2=egress
+    __u8  tcp_flags;      // [1] SYN/FIN/RST for flow lifecycle
+    __u8  _pad[2];        // [2] Align to 8-byte boundary
+} __attribute__((packed));
+
+// Socket cookie correlation - bridges uprobe SSL* to XDP 5-tuple
+struct cookie_correlation {
+    __u64 ssl_ctx;        // [8] SSL* from uprobe
+    __u64 timestamp_ns;   // [8] When established
+    __u32 pid;            // [4] Process ID
+    __u32 _pad;           // [4] Alignment
 };
 
 
@@ -200,6 +273,182 @@ struct {
     __type(key, __u64);    // PRFileDesc pointer
     __type(value, __u8);
 } nss_ssl_fds SEC(".maps");
+
+// =============================================================================
+// XDP Maps - Flow Tracking, Socket Cookie Correlation, Session Registry
+// =============================================================================
+//
+// Architecture: 3-Stage State Machine with "Silent Tracking"
+//   Stage 1 (PENDING):    SYN seen → entry created, waiting for first data
+//   Stage 2 (CLASSIFIED): First data packet → structural DPI classifies protocol
+//   Stage 3 (SILENCED):   Userspace PCRE2-JIT confirms → XDP stops sending payloads
+//
+// Memory Budget (~4 MB total):
+//   flow_states:       65K × 36B  = 2.3 MB (5-tuple → state)
+//   session_registry: 131K × 8B  = 1.0 MB (cookie → policy)
+//   cookie_to_ssl:     8K × 24B  = 0.2 MB (cookie → SSL* correlation)
+//   xdp_events:       512 KB ringbuf
+//
+// Why session_registry is 2x flow_states:
+//   Socket cookies persist across TIME_WAIT recycling. A single cookie may
+//   correlate with multiple sequential 5-tuples over its lifetime.
+// =============================================================================
+
+// Flow state machine stages
+#define FLOW_STATE_PENDING     0   // SYN seen, awaiting first data packet
+#define FLOW_STATE_CLASSIFIED  1   // Protocol identified by XDP structural DPI
+#define FLOW_STATE_AMBIGUOUS   2   // Needs userspace PCRE2-JIT classification
+
+// Flow state flags (bitfield)
+#define FLOW_FLAG_NEEDS_PCRE2  0x01  // Ambiguous: send payload to userspace
+#define FLOW_FLAG_HAS_UPROBE   0x02  // SSL_set_fd populated cookie_to_ssl
+#define FLOW_FLAG_TERMINATED   0x04  // FIN/RST seen, pending cleanup
+
+// Timeout for zombie flow cleanup (userspace sweeper checks last_seen_ns)
+#define FLOW_TIMEOUT_NS (30ULL * 1000000000ULL)  // 30 seconds
+
+// Flow state - tracks each 5-tuple through the state machine
+// Fields ordered by size (8→4→1) to minimize padding: 36 bytes total
+struct flow_state {
+    __u64 socket_cookie;      // [8] The "Golden Thread" correlation key
+    __u64 first_seen_ns;      // [8] Connection start (SYN timestamp)
+    __u64 last_seen_ns;       // [8] Last packet seen (for timeout)
+    __u32 pkt_count;          // [4] Packet counter (stats)
+    __u32 byte_count;         // [4] Byte counter (stats)
+    __u8  category;           // [1] CAT_TLS_TCP, CAT_PLAIN_HTTP, CAT_OTHER
+    __u8  state;              // [1] FLOW_STATE_*
+    __u8  direction;          // [1] 0=unknown, 1=client→server, 2=server→client
+    __u8  flags;              // [1] FLOW_FLAG_* bitfield
+} __attribute__((packed));    // 36 bytes, no padding waste
+
+// Flow state map - keyed by 5-tuple
+// LRU: Automatic eviction of oldest flows when full (prevents memory exhaustion)
+// 65,536 entries supports ~65K concurrent connections per host
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_key);      // 16-byte 5-tuple (defined above)
+    __type(value, struct flow_state);  // 36 bytes
+} flow_states SEC(".maps");
+
+// Session policy - the XDP "Gatekeeper" decision cache
+// Once userspace PCRE2-JIT classifies a flow, XDP checks this to fast-pass
+// Fields ordered by size: 8 bytes total, no padding
+struct session_policy {
+    __u32 proto_type;         // [4] PROTO_HTTP1, PROTO_HTTP2, PROTO_UNKNOWN
+    __u8  silenced;           // [1] 1 = stop sending payloads to ringbuf
+    __u8  _pad[3];            // [3] Explicit padding for alignment
+};
+
+// Session registry - indexed by socket_cookie (the universal correlator)
+// Updated by userspace dispatcher after PCRE2-JIT classification completes
+// XDP reads to decide: full processing or fast-pass?
+// 131K entries (2x flow_states) because cookies outlive 5-tuples
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 131072);
+    __type(key, __u64);                // socket_cookie
+    __type(value, struct session_policy);
+} session_registry SEC(".maps");
+
+// Socket cookie → SSL* correlation (the "Golden Thread" bridge)
+// Populated by USERSPACE after correlating XDP and uprobe events:
+//   1. XDP sends event with socket_cookie (from bpf_skc_lookup_tcp)
+//   2. Uprobe sends SSL event with SSL* (ssl_to_fd maps SSL* → fd)
+//   3. Userspace calls getsockopt(fd, SOL_SOCKET, SO_COOKIE) to get cookie
+//   4. Userspace updates this map via bpf_map_update_elem()
+// This enables the "Double View": XDP network metadata + uprobe decrypted content
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);                // socket_cookie
+    __type(value, struct cookie_correlation);  // 24 bytes (defined above)
+} cookie_to_ssl SEC(".maps");
+
+// Per-CPU array for XDP metadata events (avoids 512-byte stack limit)
+// XDP programs have strict stack limits; PERCPU_ARRAY provides safe heap
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct xdp_packet_event);  // 56 bytes (defined above)
+} xdp_event_heap SEC(".maps");
+
+// Ring buffer for XDP events - kernel→userspace channel
+// 512 KB sized for ~10K events in flight (event size ~50 bytes avg)
+// Only sends: Discovery (new flow), Termination (FIN/RST), Ambiguous (needs PCRE2)
+// Silenced flows do NOT write here - that's the whole point of the Gatekeeper
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 512 * 1024);
+} xdp_events SEC(".maps");
+
+// Payload capture size for ambiguous traffic classification
+// 128 bytes captures: full HTTP request line, TLS ClientHello SNI, H2 preface
+// RFC 9112: request-line = method SP request-target SP HTTP-version CRLF
+// Typical: "GET /path HTTP/1.1\r\n" = ~20 bytes, plus Host header ~50 bytes
+#define XDP_PAYLOAD_MAX 128
+
+// XDP payload event - for ambiguous traffic needing PCRE2-JIT classification
+// Sent when XDP structural DPI is uncertain (e.g., non-standard HTTP method)
+// Fields ordered by size: 164 bytes total
+struct xdp_payload_event {
+    __u64 timestamp_ns;                // [8] Event time
+    __u64 socket_cookie;               // [8] Correlation key
+    struct flow_key flow;              // [16] 5-tuple for map lookup
+    __u32 payload_len;                 // [4] Actual bytes captured (≤128)
+    __u32 event_type;                  // [4] EVENT_XDP_PACKET
+    __u8  category;                    // [1] Best-guess category from XDP
+    __u8  _pad[3];                     // [3] Alignment
+    __u8  payload[XDP_PAYLOAD_MAX];    // [128] First bytes for PCRE2-JIT
+} __attribute__((packed));             // 172 bytes
+
+// Per-CPU heap for payload events (avoids stack overflow)
+// 172 bytes exceeds comfortable stack usage; PERCPU_ARRAY is safe
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct xdp_payload_event);
+} xdp_payload_heap SEC(".maps");
+
+// XDP statistics counters (per-CPU for lock-free updates)
+// Userspace sums all CPUs for total; useful for debugging and monitoring
+struct xdp_stats {
+    __u64 packets_total;      // All packets seen
+    __u64 packets_tcp;        // TCP packets processed
+    __u64 flows_created;      // New flow_state entries
+    __u64 flows_classified;   // Successful protocol classification
+    __u64 flows_ambiguous;    // Sent to userspace for PCRE2-JIT
+    __u64 flows_terminated;   // FIN/RST seen
+    __u64 gatekeeper_hits;    // Silenced flows (fast-pass)
+    __u64 cookie_failures;    // Socket cookie lookup failures (IPv6, etc.)
+    __u64 ringbuf_drops;      // Ring buffer full (bpf_ringbuf_output failures)
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct xdp_stats);
+} xdp_stats_map SEC(".maps");
+
+// Flow → Socket Cookie cache (populated by sock_ops, read by XDP)
+// sock_ops runs at socket establishment with full task context, allowing
+// bpf_get_socket_cookie() which is NOT available in XDP context.
+// XDP then looks up the pre-cached cookie for correlation with uprobe data.
+// 65K entries matches flow_states capacity.
+struct flow_cookie_entry {
+    __u64 socket_cookie;      // [8] The "Golden Thread" correlator
+    __u64 timestamp_ns;       // [8] When cached (for staleness detection)
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct flow_key);           // 16-byte 5-tuple
+    __type(value, struct flow_cookie_entry); // 16 bytes
+} flow_cookie_map SEC(".maps");
 
 
 // =============================================================================
@@ -1582,6 +1831,725 @@ int handle_process_exit(void *ctx) {
                        sizeof(struct ssl_data_event) - MAX_BUF_SIZE, 0);
 
     return 0;
+}
+
+// =============================================================================
+// XDP Program - Structural Protocol Detection & Flow Tracking
+// =============================================================================
+//
+// Architecture: 3-Stage State Machine with "Silent Tracking"
+//   Stage 1: Lifecycle management (SYN creates PENDING, FIN/RST terminates)
+//   Stage 2: Gatekeeper - silenced flows fast-pass with zero processing
+//   Stage 3: Classification - structural DPI on first data packet
+//   Stage 4: Event emission - discovery/termination/ambiguous only
+//
+// Protocol Detection (RFC-compliant heuristics):
+//   TLS:     5-byte record header (ContentType 0x14-0x17, Version 0x03xx, Length ≤16384)
+//   HTTP/2:  Connection preface "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (check first 8 bytes)
+//   HTTP/1:  RFC 9112 request-line: [A-Z]{3,8} SP "/" (method + space + path)
+//
+// Limitations:
+//   - IPv6 socket cookie lookup not implemented (falls back to classification-only)
+//   - Stats counters are approximate (no atomic ops, per-CPU summation)
+// =============================================================================
+
+// XDP helper: Check if byte is uppercase ASCII [A-Z]
+static __always_inline bool xdp_is_uppercase(__u8 c) {
+    return c >= 'A' && c <= 'Z';
+}
+
+// XDP helper: Detect TLS record structure (5-byte header validation)
+// TLS Record: [ContentType:1][Version:2][Length:2][Payload:N]
+// Returns: CAT_TLS_TCP if valid TLS record, CAT_UNKNOWN otherwise
+static __always_inline __u8 xdp_detect_tls(void *data, void *data_end,
+                                            __u8 *out_content_type) {
+    *out_content_type = 0;
+
+    // Caller must have validated (data + 5) <= data_end before calling
+    __u8 *p = data;
+    __u8 content_type = p[0];
+    __u8 ver_major = p[1];
+    __u8 ver_minor = p[2];
+    __u16 record_len = ((__u16)p[3] << 8) | p[4];
+
+    // ContentType: 0x14=ChangeCipherSpec, 0x15=Alert, 0x16=Handshake, 0x17=AppData
+    if (content_type < TLS_CHANGE_CIPHER || content_type > TLS_APP_DATA)
+        return CAT_UNKNOWN;
+
+    // Version: 0x0300=SSL3.0, 0x0301=TLS1.0, 0x0302=TLS1.1, 0x0303=TLS1.2/1.3
+    // Some implementations use 0x0301 in record layer even for TLS 1.3
+    if (ver_major != 0x03 || ver_minor > 0x04)
+        return CAT_UNKNOWN;
+
+    // Length: TLS records max 16KB (16384 bytes) per RFC 8446
+    if (record_len > 16384)
+        return CAT_UNKNOWN;
+
+    *out_content_type = content_type;
+    return CAT_TLS_TCP;
+}
+
+// XDP helper: Detect HTTP/2 connection preface
+// The preface is: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" (24 bytes)
+// We check first 8 bytes: "PRI * HT" for efficiency
+// Returns: CAT_H2_PREFACE if detected, CAT_UNKNOWN otherwise
+static __always_inline __u8 xdp_detect_http2_preface(void *data, void *data_end) {
+    // Caller must have validated (data + 8) <= data_end before calling
+    __u8 *p = data;
+    // HTTP/2 connection preface: "PRI * HT" (0x50 0x52 0x49 0x20 0x2A 0x20 0x48 0x54)
+    if (p[0] == 'P' && p[1] == 'R' && p[2] == 'I' && p[3] == ' ' &&
+        p[4] == '*' && p[5] == ' ' && p[6] == 'H' && p[7] == 'T') {
+        return CAT_H2_PREFACE;
+    }
+
+    return CAT_UNKNOWN;
+}
+
+// XDP helper: Detect HTTP/1.x request line using RFC 9112 heuristic
+// Pattern: [A-Z]{3,8} SP "/" (method + space + path starting with /)
+// Captures: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD, CONNECT, PROPFIND, etc.
+// Returns: CAT_PLAIN_HTTP if likely HTTP/1.x request, CAT_UNKNOWN otherwise
+static __always_inline __u8 xdp_detect_http1_request(void *data, void *data_end) {
+    // Caller must have validated (data + 8) <= data_end before calling
+    // This gives us enough for "OPTIONS " (8 chars) + path check needs more
+    __u8 *p = data;
+    __u8 method_len = 0;
+
+    // Count uppercase ASCII characters (HTTP method: 3-8 chars per RFC)
+    // We know we have at least 8 bytes from caller validation
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (xdp_is_uppercase(p[i])) {
+            method_len++;
+        } else {
+            break;
+        }
+    }
+
+    // Valid method length: 3-8 characters
+    // GET=3, PUT=3, HEAD=4, POST=4, PATCH=5, DELETE=6, OPTIONS=7, PROPFIND=8
+    if (method_len < 3 || method_len > 8) return CAT_UNKNOWN;
+
+    // For methods < 7 chars, we need method_len + 2 bytes which is < 8 (already validated)
+    // For 7-8 char methods (OPTIONS, PROPFIND), we need up to 10 bytes
+    // Check additional bounds for longer methods using check-pointer-first pattern
+    if (method_len >= 7) {
+        __u8 *check_extra = p + method_len + 2;
+        asm volatile("" : "+r"(check_extra));  // Barrier: lock in the addition
+        if ((void *)check_extra > data_end)
+            return CAT_UNKNOWN;
+    }
+
+    // Check for SP (0x20) after method
+    if (p[method_len] != ' ') return CAT_UNKNOWN;
+
+    // Check for "/" (0x2F) as path start (or "*" for OPTIONS)
+    __u8 path_start = p[method_len + 1];
+    if (path_start != '/' && path_start != '*') return CAT_UNKNOWN;
+
+    return CAT_PLAIN_HTTP;
+}
+
+// XDP helper: Structural protocol classification (priority order)
+// Caller MUST validate (payload + 8) <= data_end before calling
+// Returns: CAT_TLS_TCP, CAT_H2_PREFACE, CAT_PLAIN_HTTP, or CAT_UNKNOWN
+static __always_inline __u8 xdp_classify_protocol(void *payload, void *data_end,
+                                                   __u8 *out_tls_type) {
+    *out_tls_type = 0;
+
+    // Priority 1: TLS (most common for modern web traffic ~90%)
+    __u8 cat = xdp_detect_tls(payload, data_end, out_tls_type);
+    if (cat == CAT_TLS_TCP)
+        return CAT_TLS_TCP;
+
+    // Priority 2: HTTP/2 preface (binary protocol, distinct from HTTP/1)
+    cat = xdp_detect_http2_preface(payload, data_end);
+    if (cat == CAT_H2_PREFACE)
+        return CAT_H2_PREFACE;
+
+    // Priority 3: HTTP/1.x request line (plaintext)
+    cat = xdp_detect_http1_request(payload, data_end);
+    if (cat == CAT_PLAIN_HTTP)
+        return CAT_PLAIN_HTTP;
+
+    return CAT_UNKNOWN;
+}
+
+// XDP helper: Build flow key from packet headers
+// Parses: Ethernet → IPv4/IPv6 → TCP
+// Returns: 0 on success, -1 if not TCP/IP or malformed
+// Takes pre-cached data/data_end pointers to avoid ctx access issues
+static __always_inline int xdp_parse_packet_cached(void *data, void *data_end,
+                                                    struct flow_key *key,
+                                                    void **payload_out, __u16 *payload_len_out,
+                                                    __u8 *tcp_flags_out) {
+
+    // Ethernet header (14 bytes)
+    struct ethhdr_simple {
+        __u8 h_dest[6];
+        __u8 h_source[6];
+        __be16 h_proto;
+    } *eth = data;
+
+    if ((void *)(eth + 1) > data_end)
+        return -1;
+
+    __u16 eth_proto = bpf_ntohs(eth->h_proto);
+    void *l3_hdr = (void *)(eth + 1);
+    __u8 l4_proto = 0;
+    void *l4_hdr = NULL;
+
+    // IPv4 header
+    if (eth_proto == ETH_P_IP) {
+        struct iphdr_simple {
+            __u8  ihl_version;
+            __u8  tos;
+            __be16 tot_len;
+            __be16 id;
+            __be16 frag_off;
+            __u8  ttl;
+            __u8  protocol;
+            __be16 check;
+            __be32 saddr;
+            __be32 daddr;
+        } *ip = l3_hdr;
+
+        if ((void *)(ip + 1) > data_end)
+            return -1;
+
+        __u8 ihl = (ip->ihl_version & 0x0F) * 4;
+        if (ihl < 20 || (void *)ip + ihl > data_end)
+            return -1;
+
+        key->saddr = ip->saddr;
+        key->daddr = ip->daddr;
+        key->ip_version = 4;
+        l4_proto = ip->protocol;
+        l4_hdr = (void *)ip + ihl;
+    }
+    // IPv6 header (40 bytes, no extension header parsing)
+    else if (eth_proto == ETH_P_IPV6) {
+        struct ipv6hdr_simple {
+            __be32 flow_lbl_ver;
+            __be16 payload_len;
+            __u8   nexthdr;
+            __u8   hop_limit;
+            __u8   saddr[16];
+            __u8   daddr[16];
+        } *ip6 = l3_hdr;
+
+        if ((void *)(ip6 + 1) > data_end)
+            return -1;
+
+        // Hash IPv6 addresses to 32-bit for flow_key (XOR all 4 dwords)
+        // Note: This loses precision but fits in flow_key structure
+        __u32 *s = (__u32 *)ip6->saddr;
+        __u32 *d = (__u32 *)ip6->daddr;
+        if ((void *)(s + 4) > data_end || (void *)(d + 4) > data_end)
+            return -1;
+
+        key->saddr = s[0] ^ s[1] ^ s[2] ^ s[3];
+        key->daddr = d[0] ^ d[1] ^ d[2] ^ d[3];
+        key->ip_version = 6;
+        l4_proto = ip6->nexthdr;
+        l4_hdr = (void *)(ip6 + 1);
+    }
+    else {
+        return -1;  // Not IPv4/IPv6
+    }
+
+    // Only process TCP (UDP/QUIC is stub for now)
+    if (l4_proto != IPPROTO_TCP_VAL)
+        return -1;
+
+    key->protocol = l4_proto;
+
+    // TCP header (20-60 bytes)
+    struct tcphdr_simple {
+        __be16 source;
+        __be16 dest;
+        __be32 seq;
+        __be32 ack_seq;
+        __u8   doff_res;  // data offset (4 bits) + reserved (4 bits)
+        __u8   flags;
+        __be16 window;
+        __be16 check;
+        __be16 urg_ptr;
+    } *tcp = l4_hdr;
+
+    if ((void *)(tcp + 1) > data_end)
+        return -1;
+
+    key->sport = tcp->source;  // Keep network byte order for map key consistency
+    key->dport = tcp->dest;
+    key->_pad[0] = 0;
+    key->_pad[1] = 0;
+
+    *tcp_flags_out = tcp->flags;
+
+    // TCP header length (data offset field × 4, range 20-60 bytes)
+    __u8 tcp_hdr_len = ((tcp->doff_res >> 4) & 0x0F) * 4;
+    if (tcp_hdr_len < 20 || tcp_hdr_len > 60)
+        return -1;
+
+    void *payload = (void *)tcp + tcp_hdr_len;
+
+    // CRITICAL: Do NOT set payload = data_end as fallback!
+    // That contaminates payload with pkt_end() type, causing verifier errors
+    // when we later do arithmetic on it.
+    if (payload > data_end) {
+        // TCP header extends beyond packet - malformed
+        *payload_out = payload;  // Won't be accessed due to 0 length
+        *payload_len_out = 0;
+        return 0;  // Still return success so we track the flow
+    }
+
+    *payload_out = payload;
+
+    // Calculate payload length (bounded to u16)
+    __u64 plen = (__u64)data_end - (__u64)payload;
+    *payload_len_out = plen > 0xFFFF ? 0xFFFF : (__u16)plen;
+
+    return 0;
+}
+
+// XDP helper: Infer direction from port numbers (heuristic for mid-capture)
+// Low port (< 1024) is typically server; high port is typically client
+static __always_inline __u8 xdp_infer_direction(__u16 sport_net, __u16 dport_net) {
+    __u16 sport = bpf_ntohs(sport_net);
+    __u16 dport = bpf_ntohs(dport_net);
+
+    // Well-known ports (< 1024): server side
+    if (dport < 1024 && sport >= 1024)
+        return 1;  // Client → Server
+    if (sport < 1024 && dport >= 1024)
+        return 2;  // Server → Client
+    // Ephemeral range heuristic: higher port is usually client
+    if (sport > dport)
+        return 1;  // Client → Server (guessing client has higher port)
+    if (dport > sport)
+        return 2;  // Server → Client
+
+    return 0;  // Unknown
+}
+
+// Main XDP program - Protocol detection and flow tracking
+// Attach to network interfaces for packet-level visibility
+SEC("xdp")
+int xdp_flow_tracker(struct xdp_md *ctx) {
+    // =========================================================================
+    // CRITICAL: Cache ALL ctx fields at the VERY START - never touch ctx again
+    // The BPF verifier forbids accessing ctx through modified pointers.
+    // If we re-read ctx later, the compiler may optimize using offset math.
+    // =========================================================================
+    void *data = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    __u32 pkt_len = (__u32)(data_end - data);
+    __u32 ifindex = ctx->ingress_ifindex;
+
+    __u32 zero = 0;
+
+    // Get stats counter (per-CPU, no lock contention)
+    struct xdp_stats *stats = bpf_map_lookup_elem(&xdp_stats_map, &zero);
+    if (stats)
+        stats->packets_total++;
+
+    // Parse packet headers into flow key
+    struct flow_key fkey = {};
+    void *payload = NULL;
+    __u16 payload_len = 0;
+    __u8 tcp_flags = 0;
+
+    if (xdp_parse_packet_cached(data, data_end, &fkey, &payload, &payload_len, &tcp_flags) < 0)
+        return XDP_PASS;  // Not TCP/IP, pass through
+
+    if (stats)
+        stats->packets_tcp++;
+
+    __u64 now = bpf_ktime_get_ns();
+
+    // Look up existing flow state by 5-tuple
+    struct flow_state *fs = bpf_map_lookup_elem(&flow_states, &fkey);
+
+    // =========================================================================
+    // Stage 1: Connection Lifecycle (SYN/FIN/RST)
+    // =========================================================================
+
+    // New connection: SYN without ACK
+    if ((tcp_flags & TCP_FLAG_SYN) && !(tcp_flags & TCP_FLAG_ACK)) {
+        struct flow_state new_fs = {
+            .socket_cookie = 0,       // Not available until data packet
+            .first_seen_ns = now,
+            .last_seen_ns = now,
+            .pkt_count = 1,
+            .byte_count = payload_len,
+            .category = CAT_UNKNOWN,
+            .state = FLOW_STATE_PENDING,
+            .direction = 1,           // SYN sender is client
+            .flags = 0,
+        };
+        bpf_map_update_elem(&flow_states, &fkey, &new_fs, BPF_ANY);
+
+        if (stats)
+            stats->flows_created++;
+
+        return XDP_PASS;
+    }
+
+    // Connection termination: FIN or RST
+    if (tcp_flags & (TCP_FLAG_FIN | TCP_FLAG_RST)) {
+        if (fs && fs->socket_cookie != 0) {
+            // Emit termination event for userspace cleanup
+            struct xdp_packet_event *evt = bpf_map_lookup_elem(&xdp_event_heap, &zero);
+            if (evt) {
+                evt->timestamp_ns = now;
+                evt->socket_cookie = fs->socket_cookie;
+                __builtin_memcpy(&evt->flow, &fkey, sizeof(fkey));
+                evt->pkt_len = pkt_len;
+                evt->ifindex = ifindex;
+                evt->event_type = EVENT_XDP_PACKET;
+                evt->payload_off = 0;
+                evt->category = fs->category;
+                evt->tls_type = 0;
+                evt->direction = fs->direction;
+                evt->tcp_flags = tcp_flags;
+                evt->_pad[0] = 0;
+                evt->_pad[1] = 0;
+
+                long ret = bpf_ringbuf_output(&xdp_events, evt, sizeof(*evt), 0);
+                if (ret < 0 && stats)
+                    stats->ringbuf_drops++;
+            }
+
+            fs->flags |= FLOW_FLAG_TERMINATED;
+            fs->last_seen_ns = now;
+
+            if (stats)
+                stats->flows_terminated++;
+        }
+        return XDP_PASS;
+    }
+
+    // =========================================================================
+    // Stage 2: Gatekeeper - Silenced Sessions Fast-Pass
+    // =========================================================================
+
+    if (fs && fs->socket_cookie != 0) {
+        struct session_policy *policy = bpf_map_lookup_elem(&session_registry, &fs->socket_cookie);
+        if (policy) {
+            // Update stats (approximate, no atomic)
+            fs->pkt_count++;
+            fs->byte_count += payload_len;
+            fs->last_seen_ns = now;
+
+            if (policy->silenced) {
+                // FAST PATH: Already classified and silenced
+                // Zero-cost processing - just update counters and pass
+                if (stats)
+                    stats->gatekeeper_hits++;
+                return XDP_PASS;
+            }
+            // Policy exists but not silenced - still in classification window
+            // Fall through to check if we need to emit event
+        }
+    }
+
+    // =========================================================================
+    // Stage 3: Protocol Classification (First Data Packet)
+    // =========================================================================
+
+    // Skip classification if no payload
+    if (payload_len == 0) {
+        if (fs) {
+            fs->pkt_count++;
+            fs->last_seen_ns = now;
+        }
+        return XDP_PASS;
+    }
+
+    // -------------------------------------------------------------------------
+    // CRITICAL: Bounds validation BEFORE map lookups (verifier state is clean)
+    // The verifier loses pointer tracking across map lookups, so we must
+    // validate payload access here while it can still track the bounds.
+    // NOTE: Use 'data_end' cached at function start - never re-read ctx
+    // -------------------------------------------------------------------------
+
+    // Validate we can access at least 8 bytes (max needed for HTTP/2 preface)
+    // CRITICAL: Compute check pointer FIRST, then barrier, then compare.
+    // This prevents Clang from inverting "ptr + N <= end" to "end - ptr >= N"
+    // which would do arithmetic on pkt_end (prohibited by verifier).
+    __u8 tls_type = 0;
+    __u8 category = CAT_UNKNOWN;
+    __u8 *pld = (__u8 *)payload;
+
+    // Check for 8 bytes (HTTP/2 preface detection)
+    __u8 *check8 = pld + 8;
+    asm volatile("" : "+r"(check8));  // Barrier: lock in the addition
+    if ((void *)check8 <= data_end) {
+        // Full classification possible - we have at least 8 bytes
+        category = xdp_classify_protocol(pld, data_end, &tls_type);
+    } else {
+        // Check for 5 bytes (TLS record header)
+        __u8 *check5 = pld + 5;
+        asm volatile("" : "+r"(check5));  // Barrier: lock in the addition
+        if ((void *)check5 <= data_end) {
+            // Can check TLS (5 bytes) but not HTTP/2 preface (8 bytes)
+            category = xdp_detect_tls(pld, data_end, &tls_type);
+        }
+    }
+    // else: payload too small to classify, leave as CAT_UNKNOWN
+
+    // -------------------------------------------------------------------------
+    // Now safe to do map lookups (classification already done above)
+    // -------------------------------------------------------------------------
+
+    // Get socket cookie from sock_ops cache (the "Golden Thread")
+    // sock_ops program caches cookies when connections are established
+    // because bpf_get_socket_cookie() is NOT available in XDP context.
+    // Userspace warm-up seeds this map with existing connections at startup.
+    __u64 cookie = 0;
+
+    struct flow_cookie_entry *cookie_entry = bpf_map_lookup_elem(&flow_cookie_map, &fkey);
+    if (cookie_entry) {
+        cookie = cookie_entry->socket_cookie;
+    } else {
+        // Cookie not cached yet - sock_ops may not have run for this flow
+        // This happens for: mid-connection captures, packets before socket setup,
+        // or connections established before program attachment.
+        // Classification still works, but correlation with uprobes limited.
+        if (stats)
+            stats->cookie_failures++;
+    }
+
+    // Determine if userspace PCRE2-JIT is needed for ambiguous traffic
+    bool needs_pcre2 = (category == CAT_UNKNOWN && payload_len >= 4);
+    bool is_new_classification = false;
+
+    // Update or create flow state
+    if (!fs) {
+        // New flow without SYN (mid-connection capture or missed SYN)
+        struct flow_state new_fs = {
+            .socket_cookie = cookie,
+            .first_seen_ns = now,
+            .last_seen_ns = now,
+            .pkt_count = 1,
+            .byte_count = payload_len,
+            .category = category,
+            .state = (category != CAT_UNKNOWN) ? FLOW_STATE_CLASSIFIED : FLOW_STATE_AMBIGUOUS,
+            .direction = xdp_infer_direction(fkey.sport, fkey.dport),
+            .flags = needs_pcre2 ? FLOW_FLAG_NEEDS_PCRE2 : 0,
+        };
+        bpf_map_update_elem(&flow_states, &fkey, &new_fs, BPF_ANY);
+        fs = bpf_map_lookup_elem(&flow_states, &fkey);
+
+        if (stats)
+            stats->flows_created++;
+
+        is_new_classification = (category != CAT_UNKNOWN);
+    } else if (fs->state == FLOW_STATE_PENDING) {
+        // First data packet on pending flow - classify now
+        fs->socket_cookie = cookie;
+        fs->category = category;
+        fs->state = (category != CAT_UNKNOWN) ? FLOW_STATE_CLASSIFIED : FLOW_STATE_AMBIGUOUS;
+        fs->flags = needs_pcre2 ? FLOW_FLAG_NEEDS_PCRE2 : 0;
+        fs->pkt_count++;
+        fs->byte_count += payload_len;
+        fs->last_seen_ns = now;
+
+        is_new_classification = (category != CAT_UNKNOWN);
+    } else {
+        // Existing classified/ambiguous flow - update stats only
+        fs->pkt_count++;
+        fs->byte_count += payload_len;
+        fs->last_seen_ns = now;
+
+        // Don't re-emit if already classified and not needing PCRE2
+        if (fs->state == FLOW_STATE_CLASSIFIED && !needs_pcre2)
+            return XDP_PASS;
+    }
+
+    // Update stats
+    if (stats) {
+        if (is_new_classification)
+            stats->flows_classified++;
+        if (needs_pcre2)
+            stats->flows_ambiguous++;
+    }
+
+    // =========================================================================
+    // Stage 4: Event Emission (Discovery / Ambiguous)
+    // =========================================================================
+
+    // Only emit if: newly classified OR needs PCRE2-JIT analysis
+    if (!is_new_classification && !needs_pcre2)
+        return XDP_PASS;
+
+    // Use cached 'data_end' from function start - never re-read ctx
+    long ret = 0;
+
+    if (needs_pcre2 && payload_len > 0) {
+        // Get scratch buffer from heap first
+        struct xdp_payload_event *pevt = bpf_map_lookup_elem(&xdp_payload_heap, &zero);
+        if (!pevt)
+            return XDP_PASS;  // CRITICAL: must check immediately
+
+        // Fill event metadata
+        pevt->timestamp_ns = now;
+        pevt->socket_cookie = cookie;
+        __builtin_memcpy(&pevt->flow, &fkey, sizeof(fkey));
+        pevt->event_type = EVENT_XDP_PACKET;
+        pevt->category = category;
+        pevt->_pad[0] = 0;
+        pevt->_pad[1] = 0;
+        pevt->_pad[2] = 0;
+
+        // Zero-init destination first
+        __builtin_memset(pevt->payload, 0, XDP_PAYLOAD_MAX);
+
+        // Bounds check using the check-pointer-first pattern
+        // Compute check pointer, barrier, then compare (no arithmetic on data_end)
+        __u8 *src = (__u8 *)payload;
+        __u8 *check_max = src + XDP_PAYLOAD_MAX;
+        asm volatile("" : "+r"(check_max));  // Barrier: lock in the addition
+
+        if ((void *)check_max <= data_end) {
+            // Unrolled copy - verifier tracks each index
+            pevt->payload_len = XDP_PAYLOAD_MAX;
+            #pragma unroll
+            for (int i = 0; i < XDP_PAYLOAD_MAX; i++) {
+                pevt->payload[i] = src[i];
+            }
+        } else {
+            // Payload smaller than max - can't copy safely
+            // Just report what we have (payload stays zeroed)
+            pevt->payload_len = 0;
+        }
+
+        ret = bpf_ringbuf_output(&xdp_events, pevt, sizeof(*pevt), 0);
+    } else if (is_new_classification) {
+        // Send metadata-only discovery event
+        struct xdp_packet_event *evt = bpf_map_lookup_elem(&xdp_event_heap, &zero);
+        if (evt) {
+            evt->timestamp_ns = now;
+            evt->socket_cookie = cookie;
+            __builtin_memcpy(&evt->flow, &fkey, sizeof(fkey));
+            evt->pkt_len = pkt_len;
+            evt->ifindex = ifindex;
+            evt->event_type = EVENT_XDP_PACKET;
+            evt->category = category;
+            evt->tls_type = tls_type;
+            evt->direction = fs ? fs->direction : 0;
+            evt->tcp_flags = tcp_flags;
+            evt->_pad[0] = 0;
+            evt->_pad[1] = 0;
+
+            // Calculate payload offset (payload ptr was validated during parsing)
+            evt->payload_off = (__u8 *)payload - (__u8 *)data;
+
+            ret = bpf_ringbuf_output(&xdp_events, evt, sizeof(*evt), 0);
+        }
+    }
+
+    if (ret < 0 && stats)
+        stats->ringbuf_drops++;
+
+    return XDP_PASS;
+}
+
+// =============================================================================
+// SOCK_OPS Program - Socket Cookie Caching for XDP Correlation
+// =============================================================================
+//
+// Why SOCK_OPS?
+// - bpf_get_socket_cookie() requires socket context (NOT available in XDP)
+// - sock_ops runs at TCP connection establishment (socket fully ready)
+// - We cache the cookie here so XDP can look it up later
+//
+// Flow:
+//   1. TCP connection established → kernel calls sock_ops
+//   2. sock_ops extracts socket_cookie → stores in flow_cookie_map
+//   3. Packet arrives → XDP looks up cookie from flow_cookie_map
+//   4. XDP correlates with uprobe SSL data via cookie ("Golden Thread")
+//
+// Operations we handle:
+//   - BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB (server accepted connection)
+//   - BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB (client initiated connection)
+//
+SEC("sockops")
+int sockops_cache_cookie(struct bpf_sock_ops *skops) {
+    // Only hook connection establishment events
+    switch (skops->op) {
+    case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:  // Server side: accept() completed
+    case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:   // Client side: connect() completed
+        break;
+    default:
+        return 0;  // Ignore other socket operations
+    }
+
+    // Get socket cookie (works in sock_ops context)
+    __u64 socket_cookie = bpf_get_socket_cookie(skops);
+    if (socket_cookie == 0) {
+        return 0;
+    }
+
+    // Build flow key from sock_ops context
+    // sock_ops uses local/remote from the socket's perspective
+    struct flow_key fkey = {};
+
+    if (skops->family == AF_INET) {
+        // IPv4: Use local/remote addresses
+        // For PASSIVE (server): local=server, remote=client
+        // For ACTIVE (client): local=client, remote=server
+        fkey.saddr = skops->remote_ip4;  // Remote IP
+        fkey.daddr = skops->local_ip4;   // Local IP
+        fkey.sport = bpf_ntohl(skops->remote_port) >> 16;  // Remote port (in high 16 bits)
+        fkey.dport = skops->local_port;  // Local port (already in host order)
+        fkey.ip_version = 4;
+
+        // sock_ops ports need conversion: remote_port is in network order in high 16 bits
+        // local_port is in host order
+        // We need network byte order for the flow key to match XDP
+        fkey.sport = bpf_htons(fkey.sport);
+        fkey.dport = bpf_htons(fkey.dport);
+    } else if (skops->family == AF_INET6) {
+        // IPv6: XOR-hash the 128-bit addresses into 32 bits
+        // Same algorithm as XDP uses for IPv6 flows
+        fkey.saddr = skops->remote_ip6[0] ^ skops->remote_ip6[1] ^
+                     skops->remote_ip6[2] ^ skops->remote_ip6[3];
+        fkey.daddr = skops->local_ip6[0] ^ skops->local_ip6[1] ^
+                     skops->local_ip6[2] ^ skops->local_ip6[3];
+        fkey.sport = bpf_ntohl(skops->remote_port) >> 16;
+        fkey.dport = skops->local_port;
+        fkey.ip_version = 6;
+
+        fkey.sport = bpf_htons(fkey.sport);
+        fkey.dport = bpf_htons(fkey.dport);
+    } else {
+        return 0;  // Unknown address family
+    }
+
+    fkey.protocol = IPPROTO_TCP_VAL;
+
+    // Cache the cookie for XDP to look up later
+    struct flow_cookie_entry entry = {
+        .socket_cookie = socket_cookie,
+        .timestamp_ns = bpf_ktime_get_ns()
+    };
+
+    bpf_map_update_elem(&flow_cookie_map, &fkey, &entry, BPF_ANY);
+
+    // Also cache reverse direction (for bidirectional correlation)
+    struct flow_key reverse_fkey = {
+        .saddr = fkey.daddr,
+        .daddr = fkey.saddr,
+        .sport = fkey.dport,
+        .dport = fkey.sport,
+        .protocol = IPPROTO_TCP_VAL,
+        .ip_version = fkey.ip_version
+    };
+    bpf_map_update_elem(&flow_cookie_map, &reverse_fkey, &entry, BPF_ANY);
+
+    return 0;  // Success
 }
 
 char LICENSE[] SEC("license") = "GPL";

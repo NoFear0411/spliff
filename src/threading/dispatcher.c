@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <arpa/inet.h>  /* For ntohl/ntohs */
 
 /* Global dispatcher context (for BPF callback) */
 static dispatcher_ctx_t *g_dispatcher = NULL;
@@ -219,4 +220,191 @@ void dispatcher_get_stats(dispatcher_ctx_t *ctx, uint64_t *dispatched,
 
     if (dispatched) *dispatched = atomic_load(&ctx->events_dispatched);
     if (dropped) *dropped = atomic_load(&ctx->events_dropped);
+}
+
+/*
+ * Get XDP statistics
+ */
+void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
+                               uint64_t *flows_terminated, uint64_t *ambiguous,
+                               uint64_t *dropped) {
+    if (!ctx) {
+        if (flows_discovered) *flows_discovered = 0;
+        if (flows_terminated) *flows_terminated = 0;
+        if (ambiguous) *ambiguous = 0;
+        if (dropped) *dropped = 0;
+        return;
+    }
+
+    if (flows_discovered) *flows_discovered = atomic_load(&ctx->xdp_flows_discovered);
+    if (flows_terminated) *flows_terminated = atomic_load(&ctx->xdp_flows_terminated);
+    if (ambiguous) *ambiguous = atomic_load(&ctx->xdp_ambiguous_events);
+    if (dropped) *dropped = atomic_load(&ctx->xdp_events_dropped);
+}
+
+/* ============================================================================
+ * XDP Event Handling
+ * ============================================================================
+ * Event type is inferred from struct size + tcp_flags:
+ *   - 172 bytes = xdp_payload_event_t → AMBIGUOUS (needs PCRE2-JIT)
+ *   - 56 bytes + FIN/RST = xdp_packet_event_t → FLOW_END
+ *   - 56 bytes otherwise = xdp_packet_event_t → FLOW_NEW
+ */
+
+/* Debug sampling rate - print 1 in N events to avoid performance issues */
+#define XDP_DEBUG_SAMPLE_RATE 1000
+
+/*
+ * Get category name for display
+ */
+static const char *xdp_category_name(uint8_t category) {
+    switch (category) {
+        case XDP_CAT_TLS_TCP:     return "TLS/TCP";
+        case XDP_CAT_QUIC:        return "QUIC";
+        case XDP_CAT_PLAIN_HTTP:  return "HTTP";
+        case XDP_CAT_H2_PREFACE:  return "H2-Preface";
+        case XDP_CAT_OTHER:       return "Other";
+        case XDP_CAT_UNKNOWN:     return "Unknown";
+        default:                   return "?";
+    }
+}
+
+/*
+ * Format IPv4 address for display
+ */
+static void format_ipv4(uint32_t ip_net, char *buf, size_t buf_size) {
+    uint32_t ip = ntohl(ip_net);
+    snprintf(buf, buf_size, "%u.%u.%u.%u",
+             (ip >> 24) & 0xFF,
+             (ip >> 16) & 0xFF,
+             (ip >> 8) & 0xFF,
+             ip & 0xFF);
+}
+
+/*
+ * XDP event handler callback
+ * Called by ring_buffer__poll() for each XDP event
+ *
+ * Event type is inferred from struct size:
+ *   - sizeof(xdp_payload_event_t) = 172 → AMBIGUOUS
+ *   - sizeof(xdp_packet_event_t) = 56 → FLOW_NEW or FLOW_END
+ */
+int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
+    dispatcher_ctx_t *dispatcher = (dispatcher_ctx_t *)ctx;
+
+    if (!dispatcher || !data) {
+        return 0;  /* Continue processing */
+    }
+
+    /* Sampling counter for debug output */
+    uint64_t sample_count = atomic_fetch_add(&dispatcher->xdp_debug_samples, 1);
+    bool should_debug = g_config.debug_mode &&
+                        (sample_count % XDP_DEBUG_SAMPLE_RATE == 0);
+
+    /* === Event Type Inference from Struct Size === */
+
+    if (data_sz == sizeof(xdp_payload_event_t)) {
+        /* ==================== AMBIGUOUS EVENT ====================
+         * 172-byte payload event - needs PCRE2-JIT classification
+         */
+        const xdp_payload_event_t *payload_evt = (const xdp_payload_event_t *)data;
+
+        atomic_fetch_add(&dispatcher->xdp_ambiguous_events, 1);
+
+        if (should_debug) {
+            char src_ip[16], dst_ip[16];
+            format_ipv4(payload_evt->flow.saddr, src_ip, sizeof(src_ip));
+            format_ipv4(payload_evt->flow.daddr, dst_ip, sizeof(dst_ip));
+
+            fprintf(stderr,
+                "[XDP] AMBIGUOUS: %s:%u -> %s:%u [%s] cookie=%lu len=%u\n",
+                src_ip, ntohs(payload_evt->flow.sport),
+                dst_ip, ntohs(payload_evt->flow.dport),
+                xdp_category_name(payload_evt->category),
+                (unsigned long)payload_evt->socket_cookie,
+                payload_evt->payload_len);
+
+            /* Show payload hex dump (first 32 bytes) */
+            if (payload_evt->payload_len > 0) {
+                fprintf(stderr, "  Payload: ");
+                uint32_t dump_len = payload_evt->payload_len;
+                if (dump_len > 32) dump_len = 32;
+                for (uint32_t i = 0; i < dump_len; i++) {
+                    fprintf(stderr, "%02x ", payload_evt->payload[i]);
+                }
+                if (payload_evt->payload_len > 32) {
+                    fprintf(stderr, "...");
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+
+        /* TODO: Queue for PCRE2-JIT classification
+         * dispatcher_queue_ambiguous_event(dispatcher, payload_evt);
+         */
+
+    } else if (data_sz == sizeof(xdp_packet_event_t)) {
+        /* ==================== PACKET EVENT (metadata-only) ====================
+         * 56-byte metadata event - infer sub-type from tcp_flags
+         */
+        const xdp_packet_event_t *packet_evt = (const xdp_packet_event_t *)data;
+
+        if (packet_evt->tcp_flags & (TCP_FLAG_FIN | TCP_FLAG_RST)) {
+            /* ==================== FLOW_END ====================
+             * Flow terminated (FIN or RST)
+             */
+            atomic_fetch_add(&dispatcher->xdp_flows_terminated, 1);
+
+            if (should_debug) {
+                char src_ip[16], dst_ip[16];
+                format_ipv4(packet_evt->flow.saddr, src_ip, sizeof(src_ip));
+                format_ipv4(packet_evt->flow.daddr, dst_ip, sizeof(dst_ip));
+
+                const char *flag_name = (packet_evt->tcp_flags & TCP_FLAG_FIN)
+                    ? "FIN" : "RST";
+
+                fprintf(stderr,
+                    "[XDP] FLOW_END (%s): %s:%u -> %s:%u [%s] cookie=%lu\n",
+                    flag_name,
+                    src_ip, ntohs(packet_evt->flow.sport),
+                    dst_ip, ntohs(packet_evt->flow.dport),
+                    xdp_category_name(packet_evt->category),
+                    (unsigned long)packet_evt->socket_cookie);
+            }
+
+        } else {
+            /* ==================== FLOW_NEW ====================
+             * New flow discovered (category != UNKNOWN)
+             */
+            atomic_fetch_add(&dispatcher->xdp_flows_discovered, 1);
+
+            if (should_debug) {
+                char src_ip[16], dst_ip[16];
+                format_ipv4(packet_evt->flow.saddr, src_ip, sizeof(src_ip));
+                format_ipv4(packet_evt->flow.daddr, dst_ip, sizeof(dst_ip));
+
+                fprintf(stderr,
+                    "[XDP] FLOW_NEW: %s:%u -> %s:%u [%s] cookie=%lu if=%u\n",
+                    src_ip, ntohs(packet_evt->flow.sport),
+                    dst_ip, ntohs(packet_evt->flow.dport),
+                    xdp_category_name(packet_evt->category),
+                    (unsigned long)packet_evt->socket_cookie,
+                    packet_evt->ifindex);
+            }
+        }
+
+    } else {
+        /* Unknown struct size - should not happen */
+        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+
+        if (should_debug) {
+            fprintf(stderr, "[XDP] WARNING: Unknown event size %zu "
+                    "(expected %zu or %zu)\n",
+                    data_sz,
+                    sizeof(xdp_packet_event_t),
+                    sizeof(xdp_payload_event_t));
+        }
+    }
+
+    return 0;  /* Continue processing */
 }

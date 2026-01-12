@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.7.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -30,6 +30,14 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **Per-Worker State**: Isolated HTTP/2 sessions, ALPN cache, pending bodies
 - **Serialized Output**: Dedicated output thread prevents interleaved lines
 - **Adaptive Wait**: spin → yield → eventfd for efficient CPU usage
+
+### XDP Packet-Level Tracking (v0.8.0+)
+- **High-Performance Flow Tracking**: XDP programs at network interface level
+- **Auto-Attach**: Discovers and attaches to all suitable interfaces (physical/virtual)
+- **Protocol Detection**: TLS, HTTP/2, HTTP/1.x classification at packet level
+- **sock_ops Cookie Caching**: "Golden Thread" correlation between packets and SSL sessions
+- **Connection Warm-up**: Seeds existing TCP connections at startup via netlink SOCK_DIAG
+- **XDP Statistics**: Debug-mode metrics (packets, flows, gatekeeper hits)
 
 ### BPF-Level Filtering (v0.7.0+)
 - **Socket Family Detection**: Filters AF_UNIX (IPC) at kernel level

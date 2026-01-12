@@ -46,11 +46,14 @@ static probe_handler_t g_handler;
 static bool g_modules_initialized = false;
 static bool g_bpf_initialized = false;
 static bool g_probe_initialized = false;
+static bool g_xdp_initialized = false;
+static bool g_debug_mode = false;
 
 #ifdef HAVE_THREADING
 static threading_mgr_t g_threading;
 static bool g_threading_initialized = false;
 static bool g_threading_enabled = false;  /* Set by CLI or auto-detect */
+static dispatcher_ctx_t g_xdp_dispatcher;  /* XDP event dispatcher context */
 #endif
 
 /* Configuration - IPC filtering enabled by default (BPF handles kernel-level filtering) */
@@ -346,6 +349,32 @@ static void cleanup_all_resources(void) {
     if (g_probe_initialized) {
         probe_handler_cleanup(&g_handler);
         g_probe_initialized = false;
+    }
+
+    /* Print XDP statistics before cleanup */
+    if (g_xdp_initialized && g_debug_mode) {
+        xdp_stats_t xdp_stats;
+        if (bpf_loader_xdp_read_stats(&g_loader, &xdp_stats) == 0) {
+            printf("\n=== XDP Statistics ===\n");
+            printf("Packets:\n");
+            printf("  Total:     %lu\n", xdp_stats.packets_total);
+            printf("  TCP:       %lu\n", xdp_stats.packets_tcp);
+            printf("\nFlows:\n");
+            printf("  Created:   %lu\n", xdp_stats.flows_created);
+            printf("  Classified: %lu\n", xdp_stats.flows_classified);
+            printf("  Ambiguous: %lu\n", xdp_stats.flows_ambiguous);
+            printf("\nGatekeeper:\n");
+            printf("  Hits:      %lu\n", xdp_stats.gatekeeper_hits);
+            printf("  Cookie failures: %lu\n", xdp_stats.cookie_failures);
+            printf("  Ringbuf drops:   %lu\n", xdp_stats.ringbuf_drops);
+            printf("\n");
+        }
+    }
+
+    /* Cleanup XDP (detach from all interfaces) - before BPF cleanup */
+    if (g_xdp_initialized) {
+        bpf_loader_xdp_detach_all(&g_loader, g_debug_mode);
+        g_xdp_initialized = false;
     }
 
     /* Cleanup BPF loader (detach probes, close object) */
@@ -854,12 +883,14 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
             worker_set_h1_request(state, event->pid, event->ssl_ctx,
                                   msg.method, msg.path, host);
 
-            /* Build full URI - sized for host(256) + path(2048) + https:// prefix */
+            /* Build full URI with safe truncation for display
+             * Buffer: 2560, "https://" = 8, null = 1, available = 2551
+             * Host max: 500 (domains are short), Path max: 2048 */
             char full_uri[2560];
             if (host && host[0]) {
-                snprintf(full_uri, sizeof(full_uri), "https://%s%s", host, msg.path);
+                snprintf(full_uri, sizeof(full_uri), "https://%.500s%.2048s", host, msg.path);
             } else {
-                snprintf(full_uri, sizeof(full_uri), "%s", msg.path);
+                snprintf(full_uri, sizeof(full_uri), "%.2048s", msg.path);
             }
 
             /* Format: <timestamp> -> <METHOD> <full URI> ALPN:<protocol> <process> (<PID>) [latency] */
@@ -1338,6 +1369,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-d") == 0) {
             debug_mode = true;
             g_config.debug_mode = true;
+            g_debug_mode = true;
         } else if (strcmp(argv[i], "-b") == 0) {
             g_config.show_body = true;
         } else if (strcmp(argv[i], "-x") == 0) {
@@ -1520,6 +1552,63 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%sError:%s Cannot load BPF program\n",
                 display_color(C_RED), display_color(C_RESET));
         return 1;
+    }
+
+    /* Initialize XDP subsystem (auto-attach to network interfaces) */
+    xdp_error_t xdp_err;
+    if (bpf_loader_xdp_init(&g_loader, debug_mode, &xdp_err) == 0) {
+        g_xdp_initialized = true;
+
+#ifdef HAVE_THREADING
+        /* Initialize XDP dispatcher context for event handling */
+        memset(&g_xdp_dispatcher, 0, sizeof(g_xdp_dispatcher));
+
+        /* Register XDP event callback (may fail if ringbuf unavailable) */
+        int callback_ret = bpf_loader_xdp_set_event_callback(&g_loader,
+                                                              dispatcher_xdp_event_handler,
+                                                              &g_xdp_dispatcher);
+        if (callback_ret != 0 && debug_mode) {
+            printf("  %s[DEBUG]%s XDP event callback not registered (ringbuf unavailable)\n",
+                   display_color(C_YELLOW), display_color(C_RESET));
+        }
+#endif
+
+        /* Auto-attach to all suitable network interfaces
+         * Attach regardless of callback status - provides packet visibility */
+        int attached = bpf_loader_xdp_attach_all(&g_loader, debug_mode);
+        if (attached > 0) {
+            printf("  %s✓%s XDP attached to %d interface%s\n",
+                   display_color(C_GREEN), display_color(C_RESET),
+                   attached, attached > 1 ? "s" : "");
+
+            /* Attach sock_ops for socket cookie caching (the "Golden Thread")
+             * sock_ops runs at TCP connection establishment and caches cookies
+             * so XDP can correlate packets with SSL sessions */
+            if (bpf_loader_sockops_attach(&g_loader, debug_mode) == 0) {
+                if (debug_mode) {
+                    printf("  %s✓%s sock_ops attached for cookie caching\n",
+                           display_color(C_GREEN), display_color(C_RESET));
+                }
+            } else if (debug_mode) {
+                printf("  %s[DEBUG]%s sock_ops attach failed (cookie correlation limited)\n",
+                       display_color(C_YELLOW), display_color(C_RESET));
+            }
+
+            /* Warm-up: Seed flow_cookie_map with existing TCP connections
+             * This enables correlation with connections established before attachment */
+            int warmed = bpf_loader_xdp_warmup_cookies(&g_loader, debug_mode);
+            if (warmed > 0 && debug_mode) {
+                printf("  %s[DEBUG]%s Warmed up %d existing connections\n",
+                       display_color(C_GREEN), display_color(C_RESET), warmed);
+            }
+        } else if (debug_mode) {
+            printf("  %s[DEBUG]%s No suitable interfaces for XDP attachment\n",
+                   display_color(C_YELLOW), display_color(C_RESET));
+        }
+    } else if (debug_mode) {
+        printf("  %s[DEBUG]%s XDP not available: %s\n",
+               display_color(C_YELLOW), display_color(C_RESET),
+               xdp_err.message[0] ? xdp_err.message : "unknown error");
     }
 
     setup_signals();
@@ -1751,6 +1840,42 @@ int main(int argc, char **argv) {
     printf("%s════════════════════════════════════════════%s\n\n",
            display_color(C_DIM), display_color(C_RESET));
 
+    /* === Main Event Processing Loop ===
+     *
+     * This loop integrates two event sources:
+     *
+     * 1. UPROBE EVENTS (SSL/TLS Decryption)
+     *    - Source:  SSL_read/write/set_fd hooks
+     *    - Data:    Decrypted payloads, socket cookies
+     *    - Handler: uprobe worker threads (if HAVE_THREADING)
+     *    - Purpose: Observe encrypted traffic semantics
+     *
+     * 2. XDP EVENTS (Network Flow Classification)
+     *    - Source:  Kernel XDP program
+     *    - Data:    5-tuple, protocol category, socket cookies
+     *    - Handler: dispatcher_xdp_event_handler
+     *    - Purpose: Observe network-layer traffic patterns
+     *
+     * CORRELATION: Both events carry socket_cookie to enable matching
+     *
+     *   Uprobe sees: SSL_write(fd=42, data="GET /api/v1/...")
+     *   XDP sees:    TCP 192.168.1.1:54321 -> 10.0.0.1:443 [TLS]
+     *   Link:        Both have cookie=12345 (same socket)
+     *
+     * FLOW WITH THREADING:
+     *   Main thread:   Polls XDP, updates stats, sleeps 50ms
+     *   Worker threads: Handle uprobe events via dispatcher
+     *
+     * FLOW WITHOUT THREADING:
+     *   Main thread:   Sequentially polls uprobe (50ms), then XDP (50ms)
+     *   Total latency: ~100ms worst case
+     *
+     * ERROR HANDLING:
+     *   - Uprobe errors: Fatal (break loop)
+     *   - XDP errors:    Non-fatal (continue, uprobe unaffected)
+     *   - EINTR:         Harmless (continue loop)
+     */
+
 #ifdef HAVE_THREADING
     if (g_threading_enabled) {
         /* Multi-threaded mode: start threading and wait */
@@ -1760,20 +1885,41 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        /* Wait for signal (Ctrl+C) */
+        /* Main thread polls XDP ring buffer while workers handle uprobes */
         while (!g_exiting) {
-            usleep(100000);  /* 100ms sleep */
+            if (g_xdp_initialized && bpf_loader_xdp_is_active(&g_loader)) {
+                /* Poll XDP events (non-blocking with short timeout) */
+                int xdp_err = bpf_loader_xdp_poll(&g_loader, 50);
+                if (xdp_err < 0 && xdp_err != -EINTR) {
+                    if (debug_mode) {
+                        fprintf(stderr, "[DEBUG] XDP poll error: %d\n", xdp_err);
+                    }
+                }
+            }
+            usleep(50000);  /* 50ms between XDP polls */
         }
 
         /* Shutdown handled by cleanup_all_resources via atexit */
     } else
 #endif
     {
-        /* Single-threaded main event loop */
+        /* Single-threaded main event loop - poll both uprobe and XDP */
         while (!g_exiting) {
-            err = probe_handler_poll(&g_handler, 100);
+            /* Poll uprobe ring buffer */
+            err = probe_handler_poll(&g_handler, 50);
             if (err == -EINTR) continue;
             if (err < 0) break;
+
+            /* Poll XDP ring buffer if active */
+            if (g_xdp_initialized && bpf_loader_xdp_is_active(&g_loader)) {
+                int xdp_err = bpf_loader_xdp_poll(&g_loader, 50);
+                if (xdp_err < 0 && xdp_err != -EINTR) {
+                    /* Non-fatal: XDP errors don't stop uprobe capture */
+                    if (debug_mode) {
+                        fprintf(stderr, "[DEBUG] XDP poll error: %d\n", xdp_err);
+                    }
+                }
+            }
         }
     }
 

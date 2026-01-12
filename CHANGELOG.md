@@ -2,6 +2,40 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.8.0] - 2026-01-13
+
+### Added
+- **XDP Packet-Level Flow Tracking**: High-performance packet capture at network interface level
+  - Auto-attaches to all suitable network interfaces (physical and virtual)
+  - Native mode with automatic SKB fallback for unsupported drivers
+  - Protocol detection: TLS, HTTP/2 preface, HTTP/1.x at packet level
+  - Flow state machine tracks connection lifecycle (SYN, data, FIN/RST)
+
+- **sock_ops Cookie Caching ("Golden Thread")**: Socket-to-packet correlation
+  - `sock_ops` BPF program hooks TCP connection establishment events
+  - Caches socket cookies at `ACTIVE_ESTABLISHED_CB` and `PASSIVE_ESTABLISHED_CB`
+  - XDP reads cached cookies via `flow_cookie_map` for uprobe correlation
+  - Enables linking packet-level data with SSL session data
+
+- **Connection Warm-up**: Existing connection tracking at startup
+  - Uses netlink `SOCK_DIAG` to enumerate existing TCP sockets
+  - Seeds `flow_cookie_map` with connections established before attachment
+  - Enables correlation with long-lived connections
+
+- **XDP Statistics**: Debug-mode performance metrics
+  - Packet counts (total, TCP)
+  - Flow lifecycle (created, classified, ambiguous)
+  - Gatekeeper hits, cookie failures, ringbuf drops
+  - Displayed at shutdown with `-d` flag
+
+### Technical Details
+- BPF verifier compatibility: "check-pointer-first" pattern for bounds validation
+  - Prevents Clang from inverting comparisons that do arithmetic on `pkt_end`
+  - `asm volatile` barriers lock pointer arithmetic before comparisons
+- New BPF maps: `flow_states`, `flow_cookie_map`, `xdp_events`, `xdp_stats_map`
+- sock_ops replaces SK_LOOKUP (which doesn't support `bpf_get_socket_cookie`)
+- Cgroup-based attachment for system-wide socket cookie tracking
+
 ## [0.7.1] - 2026-01-12
 
 ### Added

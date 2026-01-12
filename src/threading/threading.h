@@ -393,6 +393,13 @@ typedef struct dispatcher_ctx {
     _Atomic uint64_t events_dispatched;
     _Atomic uint64_t events_dropped;
 
+    /* XDP statistics */
+    _Atomic uint64_t xdp_flows_discovered;
+    _Atomic uint64_t xdp_flows_terminated;
+    _Atomic uint64_t xdp_ambiguous_events;
+    _Atomic uint64_t xdp_events_dropped;
+    _Atomic uint64_t xdp_debug_samples;      /* Debug output sampling counter */
+
     /* Control */
     _Atomic bool running;
 } dispatcher_ctx_t;
@@ -402,6 +409,10 @@ int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
                     worker_ctx_t *workers, int num_workers);
 void dispatcher_cleanup(dispatcher_ctx_t *ctx);
 void *dispatcher_thread_main(void *arg);
+
+/* XDP event handler - can be used as callback for bpf_loader_xdp_set_event_callback()
+ * Handles flow discovery, termination, and ambiguous traffic events */
+int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz);
 
 /* ============================================================================
  * Output Context
@@ -545,6 +556,9 @@ void pool_get_stats(object_pool_t *pool, uint64_t *allocs, uint64_t *frees,
                     uint64_t *failures);
 void dispatcher_get_stats(dispatcher_ctx_t *ctx, uint64_t *dispatched,
                           uint64_t *dropped);
+void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
+                               uint64_t *flows_terminated, uint64_t *ambiguous,
+                               uint64_t *dropped);
 void output_get_stats(output_ctx_t *ctx, uint64_t *messages, uint64_t *bytes);
 
 /* ============================================================================

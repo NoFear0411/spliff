@@ -29,12 +29,74 @@
 #define MAX_LINKS 32
 #define MAX_DISCOVERED_LIBS 32   /* Maximum unique library paths to track */
 #define MAX_PATHS_PER_TYPE 8     /* Maximum paths per library type */
+#define MAX_XDP_INTERFACES 32    /* Maximum network interfaces for XDP */
+
+// =============================================================================
+// XDP Types - Forward Declarations
+// =============================================================================
+
+/* XDP error information for diagnostics */
+typedef struct {
+    int code;                /* Error code (-ENOENT, -EACCES, etc.) */
+    char message[256];       /* Human-readable error message */
+} xdp_error_t;
+
+/* XDP event callback function type
+ * Called by ring_buffer__poll() for each event received.
+ * @param ctx      User context (passed to set_event_callback)
+ * @param data     Event data (xdp_packet_event or xdp_payload_event)
+ * @param data_sz  Size of event data
+ * @return 0 to continue processing, <0 to stop
+ */
+typedef int (*xdp_event_callback_t)(void *ctx, void *data, size_t data_sz);
+
+// =============================================================================
+// XDP Interface Management
+// =============================================================================
+
+/* XDP attachment mode */
+typedef enum {
+    XDP_MODE_SKB = 0,    /* Generic/SKB mode (fallback, works everywhere) */
+    XDP_MODE_NATIVE,     /* Native/driver mode (requires driver support) */
+    XDP_MODE_OFFLOAD,    /* Hardware offload (requires NIC support) */
+} xdp_mode_t;
+
+/* XDP interface attachment state */
+typedef struct {
+    char name[32];       /* Interface name (e.g., "eth0") */
+    int ifindex;         /* Interface index */
+    int prog_fd;         /* XDP program fd attached to this interface */
+    xdp_mode_t mode;     /* Attachment mode used */
+    bool attached;       /* Whether XDP is attached */
+} xdp_interface_t;
+
+/* XDP loader state */
+typedef struct {
+    struct bpf_program *xdp_prog;           /* XDP program from BPF object */
+    xdp_interface_t interfaces[MAX_XDP_INTERFACES];
+    int interface_count;                     /* Number of attached interfaces */
+    struct ring_buffer *xdp_rb;              /* XDP ring buffer (xdp_events) */
+    xdp_event_callback_t event_callback;    /* User event callback */
+    void *callback_ctx;                      /* User context for callback */
+    int xdp_events_fd;                       /* XDP ring buffer map fd */
+    int session_registry_fd;                 /* For userspace policy updates */
+    int flow_states_fd;                      /* For debugging/stats */
+    int xdp_stats_fd;                        /* XDP statistics map fd */
+    int cookie_to_ssl_fd;                   /* Cookie correlation map fd */
+    int flow_cookie_map_fd;                 /* Flow→cookie cache map fd */
+    xdp_error_t last_error;                 /* Last error for diagnostics */
+    bool enabled;                            /* Whether XDP is initialized */
+    /* sock_ops for socket cookie caching */
+    struct bpf_link *sockops_link;          /* sock_ops program link */
+    int cgroup_fd;                          /* Cgroup fd for sock_ops attachment */
+} xdp_loader_t;
 
 /* BPF loader state */
 typedef struct {
     struct bpf_object *obj;
     struct bpf_link *links[MAX_LINKS];
     int link_count;
+    xdp_loader_t xdp;                        /* XDP-specific state */
 } bpf_loader_t;
 
 /* Initialize BPF loader - returns 0 on success, -1 on failure */
@@ -133,5 +195,280 @@ void bpf_loader_print_discovery(const lib_discovery_result_t *result);
 
 /* Cleanup BPF resources */
 void bpf_loader_cleanup(bpf_loader_t *loader);
+
+// =============================================================================
+// XDP Functions - Network Interface Discovery and Attachment
+// =============================================================================
+//
+// Initialization Sequence:
+//   1. bpf_loader_init() + bpf_loader_load()
+//   2. bpf_loader_xdp_init()           - Find XDP program and maps
+//   3. bpf_loader_xdp_set_event_callback() - Register event handler
+//   4. bpf_loader_xdp_attach_all()     - Attach to interfaces
+//   5. ring_buffer__poll() in event loop
+//
+// Cleanup Sequence (bpf_loader_cleanup handles automatically):
+//   1. Stop event loop
+//   2. bpf_loader_xdp_detach_all()     - Detach from all interfaces
+//   3. ring_buffer__free()             - Free ring buffer
+//   4. bpf_object__close()             - Close BPF object
+//
+// Kernel Requirements:
+//   - Linux >= 5.8  (XDP socket lookup, bpf_skc_lookup_tcp)
+//   - Linux >= 5.13 (BPF ring buffer)
+//   - libbpf >= 0.5.0
+// =============================================================================
+
+/* Interface discovery filter flags */
+#define XDP_DISCOVER_SKIP_LOOPBACK   (1 << 0)  /* Skip lo interface */
+#define XDP_DISCOVER_SKIP_VIRTUAL    (1 << 1)  /* Skip veth, docker, etc. */
+#define XDP_DISCOVER_ONLY_UP         (1 << 2)  /* Only interfaces with IFF_UP */
+#define XDP_DISCOVER_ONLY_PHYSICAL   (1 << 3)  /* Only physical NICs */
+#define XDP_DISCOVER_DEFAULT         (XDP_DISCOVER_SKIP_LOOPBACK | \
+                                      XDP_DISCOVER_SKIP_VIRTUAL | \
+                                      XDP_DISCOVER_ONLY_UP)
+
+/* Extended interface info from discovery */
+typedef struct {
+    char name[64];           /* Interface name (supports long VRF names) */
+    unsigned int ifindex;    /* Kernel interface index */
+    unsigned int mtu;        /* Maximum transmission unit */
+    unsigned int flags;      /* IFF_UP, IFF_LOOPBACK, etc. */
+    bool is_physical;        /* True if physical NIC (not virtual) */
+} xdp_iface_info_t;
+
+/* XDP statistics with field documentation */
+typedef struct {
+    uint64_t packets_total;      /* All packets processed by XDP */
+    uint64_t packets_tcp;        /* TCP packets (passed header parsing) */
+    uint64_t flows_created;      /* New flow_state entries created */
+    uint64_t flows_classified;   /* Successfully classified (TLS, HTTP, etc.) */
+    uint64_t flows_ambiguous;    /* Sent to userspace for PCRE2-JIT */
+    uint64_t flows_terminated;   /* FIN/RST seen (connection closed) */
+    uint64_t gatekeeper_hits;    /* Fast-path: silenced sessions skipped */
+    uint64_t cookie_failures;    /* Socket cookie lookup failed (IPv6, etc.) */
+    uint64_t ringbuf_drops;      /* Events dropped due to ringbuf full */
+} xdp_stats_t;
+
+/**
+ * Check kernel support for XDP features.
+ * Validates kernel version and required BPF features.
+ *
+ * @param err_out  Optional: error details if check fails
+ * @return 0 if supported, -1 if not (check err_out for details)
+ */
+int bpf_loader_xdp_check_kernel_support(xdp_error_t *err_out);
+
+/**
+ * Initialize XDP subsystem within an already-loaded BPF object.
+ * Finds the XDP program ("xdp_flow_tracker") and required maps:
+ *   - flow_states, session_registry, xdp_events (required)
+ *   - cookie_to_ssl, xdp_stats_map, xdp_payload_heap (optional)
+ *
+ * Must be called after bpf_loader_load().
+ *
+ * @param loader   BPF loader with loaded object
+ * @param debug    Print debug messages
+ * @param err_out  Optional: error details if init fails
+ * @return 0 on success, -1 if XDP program/maps not found
+ */
+int bpf_loader_xdp_init(bpf_loader_t *loader, bool debug, xdp_error_t *err_out);
+
+/**
+ * Register callback for XDP ring buffer events.
+ * Must be called before attach to receive events.
+ *
+ * Events received:
+ *   - xdp_packet_event:  Discovery, termination (FIN/RST)
+ *   - xdp_payload_event: Ambiguous traffic needing PCRE2-JIT
+ *
+ * @param loader   BPF loader with initialized XDP
+ * @param callback Event handler function
+ * @param ctx      User context passed to callback
+ * @return 0 on success, -1 on failure
+ */
+int bpf_loader_xdp_set_event_callback(bpf_loader_t *loader,
+                                       xdp_event_callback_t callback,
+                                       void *ctx);
+
+/**
+ * Discover active network interfaces suitable for XDP attachment.
+ *
+ * @param ifaces   Output array (caller provides buffer)
+ * @param max      Maximum interfaces to return
+ * @param count    Output: actual number found
+ * @param flags    Discovery filter flags (XDP_DISCOVER_*)
+ * @param debug    Print debug messages
+ * @return 0 on success, -1 on failure (e.g., /sys/class/net not readable)
+ */
+int bpf_loader_xdp_discover_interfaces(xdp_iface_info_t *ifaces, int max,
+                                        int *count, int flags, bool debug);
+
+/**
+ * Attach XDP program to a specific network interface.
+ * Tries preferred mode first, falls back to SKB mode.
+ *
+ * @param loader   BPF loader with initialized XDP
+ * @param ifname   Interface name (e.g., "eth0")
+ * @param mode     Preferred XDP mode (XDP_MODE_NATIVE recommended)
+ * @param debug    Print debug messages
+ * @param err_out  Optional: error details if attach fails
+ * @return Actual mode attached (XDP_MODE_*) on success, -1 on failure
+ */
+int bpf_loader_xdp_attach(bpf_loader_t *loader, const char *ifname,
+                          xdp_mode_t mode, bool debug, xdp_error_t *err_out);
+
+/**
+ * Attach XDP program to all suitable network interfaces.
+ * Auto-discovers interfaces using XDP_DISCOVER_DEFAULT flags.
+ *
+ * @param loader   BPF loader with initialized XDP
+ * @param debug    Print debug messages
+ * @return Number of interfaces successfully attached (may be 0)
+ */
+int bpf_loader_xdp_attach_all(bpf_loader_t *loader, bool debug);
+
+/**
+ * Attach sock_ops program for socket cookie caching.
+ * This program runs at TCP connection establishment and caches
+ * socket cookies so XDP can correlate packets with connections.
+ *
+ * @param loader   BPF loader with loaded BPF object
+ * @param debug    Print debug messages
+ * @return 0 on success, -1 on failure
+ */
+int bpf_loader_sockops_attach(bpf_loader_t *loader, bool debug);
+
+/**
+ * Detach sock_ops program.
+ * Called automatically by bpf_loader_cleanup().
+ *
+ * @param loader   BPF loader
+ * @param debug    Print debug messages
+ */
+void bpf_loader_sockops_detach(bpf_loader_t *loader, bool debug);
+
+/**
+ * Detach XDP program from a specific interface.
+ *
+ * @param loader   BPF loader
+ * @param ifname   Interface name to detach from
+ * @param debug    Print debug messages
+ * @return 0 on success, -1 on failure
+ */
+int bpf_loader_xdp_detach(bpf_loader_t *loader, const char *ifname, bool debug);
+
+/**
+ * Detach XDP from all attached interfaces.
+ * Called automatically by bpf_loader_cleanup().
+ * Safe to call multiple times (idempotent).
+ *
+ * @param loader   BPF loader
+ * @param debug    Print debug messages
+ */
+void bpf_loader_xdp_detach_all(bpf_loader_t *loader, bool debug);
+
+/**
+ * Check if XDP is attached to a specific interface.
+ *
+ * @param loader   BPF loader
+ * @param ifname   Interface name to check
+ * @return true if attached, false otherwise
+ */
+bool bpf_loader_xdp_is_attached(bpf_loader_t *loader, const char *ifname);
+
+/**
+ * Get list of currently attached interfaces.
+ *
+ * @param loader   BPF loader
+ * @param ifaces   Output array (caller provides buffer)
+ * @param max      Maximum interfaces to return
+ * @return Number of attached interfaces (may exceed max if truncated)
+ */
+int bpf_loader_xdp_get_attached_interfaces(bpf_loader_t *loader,
+                                            xdp_interface_t *ifaces, int max);
+
+/**
+ * Get the XDP ring buffer for manual polling (advanced).
+ * Prefer using set_event_callback() + ring_buffer__poll().
+ *
+ * @param loader   BPF loader with initialized XDP
+ * @return Ring buffer pointer, or NULL if XDP not initialized
+ */
+struct ring_buffer *bpf_loader_xdp_get_ring_buffer(bpf_loader_t *loader);
+
+/**
+ * Poll XDP ring buffer for events.
+ * Calls registered callback for each event.
+ *
+ * @param loader     BPF loader with initialized XDP
+ * @param timeout_ms Timeout in milliseconds (-1 for blocking)
+ * @return Number of events processed, 0 on timeout, <0 on error
+ */
+int bpf_loader_xdp_poll(bpf_loader_t *loader, int timeout_ms);
+
+/**
+ * Update session registry (the "Gatekeeper" silencing map).
+ * Called by userspace dispatcher after PCRE2-JIT classification.
+ *
+ * Note: Due to concurrent access, updates may have 10-100µs latency
+ * before XDP sees them. Not suitable for hard-real-time policies.
+ *
+ * @param loader       BPF loader with initialized XDP
+ * @param cookie       Socket cookie (the "Golden Thread")
+ * @param proto_type   Classified protocol (PROTO_HTTP1, PROTO_HTTP2, etc.)
+ * @param silenced     Whether to silence future packet notifications
+ * @return 0 on success, -1 on failure
+ */
+int bpf_loader_xdp_update_policy(bpf_loader_t *loader, uint64_t cookie,
+                                  uint32_t proto_type, bool silenced);
+
+/**
+ * Read XDP statistics (packets processed, flows classified, etc.).
+ * Sums per-CPU counters across all CPUs.
+ *
+ * @param loader   BPF loader with initialized XDP
+ * @param stats    Output: aggregated statistics
+ * @return 0 on success, -1 on failure
+ */
+int bpf_loader_xdp_read_stats(bpf_loader_t *loader, xdp_stats_t *stats);
+
+/**
+ * Get XDP mode name for display.
+ *
+ * @param mode   XDP attachment mode
+ * @return "native", "skb", "offload", or "unknown"
+ */
+const char *bpf_loader_xdp_mode_name(xdp_mode_t mode);
+
+/**
+ * Check if XDP is enabled and has at least one attached interface.
+ *
+ * @param loader   BPF loader
+ * @return true if XDP active, false otherwise
+ */
+bool bpf_loader_xdp_is_active(bpf_loader_t *loader);
+
+/**
+ * Get last XDP error (for functions that don't have err_out parameter).
+ *
+ * @param loader   BPF loader
+ * @return Pointer to internal error struct (valid until next XDP call)
+ */
+const xdp_error_t *bpf_loader_xdp_get_last_error(bpf_loader_t *loader);
+
+/**
+ * Warm-up flow_cookie_map with existing TCP connections.
+ * Parses /proc/net/tcp[6] and seeds the map with socket cookies for
+ * connections that existed before sock_ops program was attached.
+ * This enables XDP correlation with existing long-lived connections.
+ *
+ * Should be called after bpf_loader_xdp_init() and before traffic capture.
+ *
+ * @param loader   BPF loader with initialized XDP
+ * @param debug    Print debug messages
+ * @return Number of connections seeded (0 if map not available)
+ */
+int bpf_loader_xdp_warmup_cookies(bpf_loader_t *loader, bool debug);
 
 #endif /* BPF_LOADER_H */
