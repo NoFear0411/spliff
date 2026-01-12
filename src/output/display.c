@@ -83,21 +83,23 @@ void display_http_request(const http_message_t *msg) {
         snprintf(full_uri, sizeof(full_uri), "%s", msg->path);
     }
 
-    /* Determine protocol version string */
-    const char *proto_str = (msg->protocol == PROTO_HTTP2) ? "HTTP/2" : "HTTP/1.1";
+    /* Determine ALPN protocol string - prefer alpn_proto if available */
+    const char *alpn_str = NULL;
+    if (msg->alpn_proto[0]) {
+        alpn_str = msg->alpn_proto;
+    } else if (msg->protocol == PROTO_HTTP2) {
+        alpn_str = "h2";
+    } else {
+        alpn_str = "http/1.1";
+    }
 
-    /* Format: <timestamp> ← <method> <full URI> <protocol> [ALPN] <process name> <PID> [latency] */
-    printf("%s%s%s %s←%s %s%s%s %s %s%s%s",
+    /* Format: <timestamp> → <method> <full URI> ALPN:<protocol> <process> (<PID>) [latency] [stream N] */
+    printf("%s%s%s %s→%s %s%s%s %s %sALPN:%s%s",
            display_color(C_DIM), ts, display_color(C_RESET),
            display_color(C_GREEN), display_color(C_RESET),
            display_color(C_BOLD), msg->method, display_color(C_RESET),
            full_uri,
-           display_color(C_DIM), proto_str, display_color(C_RESET));
-
-    /* Show ALPN if available */
-    if (msg->alpn_proto[0]) {
-        printf(" %s[%s]%s", display_color(C_MAGENTA), msg->alpn_proto, display_color(C_RESET));
-    }
+           display_color(C_DIM), alpn_str, display_color(C_RESET));
 
     printf(" %s%s%s %s(%u)%s",
            display_color(C_CYAN), msg->comm, display_color(C_RESET),
@@ -109,6 +111,12 @@ void display_http_request(const http_message_t *msg) {
         display_format_latency(msg->delta_ns, lat, sizeof(lat));
         printf(" %s[%s]%s", display_color(C_YELLOW), lat, display_color(C_RESET));
     }
+
+    /* Show stream ID for HTTP/2 */
+    if (msg->protocol == PROTO_HTTP2 && msg->stream_id > 0) {
+        printf(" %s[stream %d]%s", display_color(C_DIM), msg->stream_id, display_color(C_RESET));
+    }
+
     printf("\n");
 }
 
@@ -121,23 +129,39 @@ void display_http_response(const http_message_t *msg) {
     if (msg->status_code >= 400) status_color = C_RED;
     else if (msg->status_code >= 300) status_color = C_YELLOW;
 
-    /* Format: <timestamp> → <status code> <content-type> <size> [ALPN] <process name> <PID> [latency] */
-    printf("%s%s%s %s→%s %s%d%s",
+    /* Determine ALPN protocol string - prefer alpn_proto if available */
+    const char *alpn_str = NULL;
+    if (msg->alpn_proto[0]) {
+        alpn_str = msg->alpn_proto;
+    } else if (msg->protocol == PROTO_HTTP2) {
+        alpn_str = "h2";
+    } else {
+        alpn_str = "http/1.1";
+    }
+
+    /* Format: <timestamp> ← <status> <URL> ALPN:<protocol> <content-type> (<size>) <process> (<PID>) [latency] [stream N] */
+    printf("%s%s%s %s←%s %s%d%s",
            display_color(C_DIM), ts, display_color(C_RESET),
            display_color(C_BLUE), display_color(C_RESET),
            display_color(status_color), msg->status_code, display_color(C_RESET));
 
+    /* Show request URL for correlation */
+    if (msg->authority[0]) {
+        printf(" %s://%s%s",
+               msg->scheme[0] ? msg->scheme : "https",
+               msg->authority,
+               msg->path);
+    }
+
+    /* Show ALPN after URL */
+    printf(" %sALPN:%s%s", display_color(C_DIM), alpn_str, display_color(C_RESET));
+
     if (msg->content_type[0]) {
-        printf(" %s", msg->content_type);
+        printf(" %s%s%s", display_color(C_DIM), msg->content_type, display_color(C_RESET));
     }
 
     if (msg->content_length > 0) {
         printf(" %s(%zu bytes)%s", display_color(C_DIM), msg->content_length, display_color(C_RESET));
-    }
-
-    /* Show ALPN if available */
-    if (msg->alpn_proto[0]) {
-        printf(" %s[%s]%s", display_color(C_MAGENTA), msg->alpn_proto, display_color(C_RESET));
     }
 
     printf(" %s%s%s %s(%u)%s",
@@ -150,6 +174,12 @@ void display_http_response(const http_message_t *msg) {
         display_format_latency(msg->delta_ns, lat, sizeof(lat));
         printf(" %s[%s]%s", display_color(C_YELLOW), lat, display_color(C_RESET));
     }
+
+    /* Show stream ID for HTTP/2 */
+    if (msg->protocol == PROTO_HTTP2 && msg->stream_id > 0) {
+        printf(" %s[stream %d]%s", display_color(C_DIM), msg->stream_id, display_color(C_RESET));
+    }
+
     printf("\n");
 }
 
