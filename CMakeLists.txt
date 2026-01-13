@@ -395,6 +395,7 @@ add_custom_command(
         -g -O2
         -target bpf
         -D__TARGET_ARCH_${BPF_ARCH}
+        -I${CMAKE_SOURCE_DIR}/src/bpf
         -I/usr/include/${UNAME_M}-linux-gnu
         -c ${BPF_SOURCE}
         -o ${BPF_OBJECT}
