@@ -2474,22 +2474,38 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
 // Operations we handle:
 //   - BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB (server accepted connection)
 //   - BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB (client initiated connection)
+//   - BPF_SOCK_OPS_STATE_CB (connection state change - for cleanup on close)
 //
+// TCP states for STATE_CB (from include/net/tcp_states.h):
+#define TCP_ESTABLISHED  1
+#define TCP_CLOSE        7
+#define TCP_CLOSE_WAIT   8
+#define TCP_LAST_ACK     9
+#define TCP_FIN_WAIT1   10
+#define TCP_FIN_WAIT2   11
+#define TCP_TIME_WAIT   12
+
 SEC("sockops")
 int sockops_cache_cookie(struct bpf_sock_ops *skops) {
-    // Only hook connection establishment events
+    bool is_cleanup = false;
+
     switch (skops->op) {
     case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:  // Server side: accept() completed
     case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:   // Client side: connect() completed
         break;
+    case BPF_SOCK_OPS_STATE_CB: {
+        // Connection state change - clean up on close
+        // args[0] = old_state, args[1] = new_state
+        __u32 new_state = skops->args[1];
+        if (new_state != TCP_CLOSE && new_state != TCP_CLOSE_WAIT &&
+            new_state != TCP_TIME_WAIT) {
+            return 0;  // Not a close event
+        }
+        is_cleanup = true;
+        break;
+    }
     default:
         return 0;  // Ignore other socket operations
-    }
-
-    // Get socket cookie (works in sock_ops context)
-    __u64 socket_cookie = bpf_get_socket_cookie(skops);
-    if (socket_cookie == 0) {
-        return 0;
     }
 
     // Build flow key from sock_ops context
@@ -2530,15 +2546,7 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
 
     fkey.protocol = IPPROTO_TCP_VAL;
 
-    // Cache the cookie for XDP to look up later
-    struct flow_cookie_entry entry = {
-        .socket_cookie = socket_cookie,
-        .timestamp_ns = bpf_ktime_get_ns()
-    };
-
-    bpf_map_update_elem(&flow_cookie_map, &fkey, &entry, BPF_ANY);
-
-    // Also cache reverse direction (for bidirectional correlation)
+    // Build reverse flow key (for bidirectional handling)
     struct flow_key reverse_fkey = {
         .saddr = fkey.daddr,
         .daddr = fkey.saddr,
@@ -2547,6 +2555,27 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
         .protocol = IPPROTO_TCP_VAL,
         .ip_version = fkey.ip_version
     };
+
+    if (is_cleanup) {
+        // Delete flow entries on connection close
+        bpf_map_delete_elem(&flow_cookie_map, &fkey);
+        bpf_map_delete_elem(&flow_cookie_map, &reverse_fkey);
+        return 0;
+    }
+
+    // Get socket cookie for new connections
+    __u64 socket_cookie = bpf_get_socket_cookie(skops);
+    if (socket_cookie == 0) {
+        return 0;
+    }
+
+    // Cache the cookie for XDP to look up later
+    struct flow_cookie_entry entry = {
+        .socket_cookie = socket_cookie,
+        .timestamp_ns = bpf_ktime_get_ns()
+    };
+
+    bpf_map_update_elem(&flow_cookie_map, &fkey, &entry, BPF_ANY);
     bpf_map_update_elem(&flow_cookie_map, &reverse_fkey, &entry, BPF_ANY);
 
     return 0;  // Success
