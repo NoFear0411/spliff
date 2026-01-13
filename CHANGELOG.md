@@ -2,6 +2,15 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.8.1] - 2026-01-13
+
+### Fixed
+- **sock_ops Connection Cleanup**: Added `BPF_SOCK_OPS_STATE_CB` handler to remove stale entries from `flow_cookie_map` when TCP connections close
+  - Triggers on transitions to `TCP_CLOSE`, `TCP_CLOSE_WAIT`, `TCP_TIME_WAIT`
+  - Deletes both forward and reverse flow keys
+  - Prevents map bloat for high-volume short-lived connections
+  - Complements existing LRU eviction with proactive cleanup
+
 ## [0.8.0] - 2026-01-13
 
 ### Added
