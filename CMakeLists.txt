@@ -583,6 +583,19 @@ if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
 endif()
 
 # Debian package configuration
+# Standard naming: <name>_<version>-<release>_<arch>.deb
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_DEBIAN_PACKAGE_RELEASE "1")
+# Architecture detection (fallback if dpkg not available)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "armv7")
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "armhf")
+else()
+    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
 set(CPACK_DEBIAN_PACKAGE_DEPENDS
     "libbpf1, libelf1, zlib1g, libllhttp1, libnghttp2-14"
 )
@@ -590,6 +603,9 @@ set(CPACK_DEBIAN_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 
 # RPM package configuration
+# Standard naming: <name>-<version>-<release>.<arch>.rpm
+set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+set(CPACK_RPM_PACKAGE_RELEASE "1")
 set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/System")
 set(CPACK_RPM_PACKAGE_REQUIRES
