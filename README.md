@@ -24,13 +24,6 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | HTTP/1.1 | llhttp | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
 | HTTP/2 | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
 
-### Multi-Threaded Architecture (v0.6.0+)
-- **Lock-Free Event Processing**: Dispatcher → Worker threads with SPSC ring buffers
-- **Connection Affinity**: Same (pid, ssl_ctx) always routes to same worker
-- **Per-Worker State**: Isolated HTTP/2 sessions, ALPN cache, pending bodies
-- **Serialized Output**: Dedicated output thread prevents interleaved lines
-- **Adaptive Wait**: spin → yield → eventfd for efficient CPU usage
-
 ### XDP Packet-Level Tracking (v0.8.0+)
 - **High-Performance Flow Tracking**: XDP programs at network interface level
 - **Auto-Attach**: Discovers and attaches to all suitable interfaces (physical/virtual)
@@ -44,6 +37,13 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **CO-RE BTF Access**: Walks `task_struct → files_struct → socket → sock → skc_family`
 - **SSL Session Tracking**: Maps SSL* to file descriptors for socket lookup
 - **NSS SSL Verification**: Filters non-SSL NSPR file descriptors
+
+### Multi-Threaded Architecture (v0.6.0+)
+- **Lock-Free Event Processing**: Dispatcher → Worker threads with SPSC ring buffers
+- **Connection Affinity**: Same (pid, ssl_ctx) always routes to same worker
+- **Per-Worker State**: Isolated HTTP/2 sessions, ALPN cache, pending bodies
+- **Serialized Output**: Dedicated output thread prevents interleaved lines
+- **Adaptive Wait**: spin → yield → eventfd for efficient CPU usage
 
 ### Advanced Capabilities
 - **ALPN Detection**: Hooks ALPN negotiation for definitive HTTP/1.1 vs HTTP/2 detection
