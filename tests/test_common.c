@@ -28,7 +28,13 @@ config_t g_config = {
     .compact_mode = false,
     .show_latency = false,
     .show_handshake = false,
+    .hexdump_mode = false,
+    .hexdump_body = false,
+    .filter_ipc = true,     /* Default: filter IPC traffic */
+    .debug_mode = false,
     .use_openssl = true,
     .use_gnutls = true,
     .use_nss = true,
+    .worker_threads = 0,    /* Single-threaded by default in tests */
+    .output_format = FMT_TEXT,
 };
