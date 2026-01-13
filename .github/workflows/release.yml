@@ -1,7 +1,8 @@
 # spliff Release Workflow
 #
 # Creates releases with binary packages when a version tag is pushed.
-# Builds on latest LTS: Ubuntu 24.04, Debian 12, Fedora 43 (for full features)
+# - Publishes to GitHub Releases with changelog
+# - Publishes to GitHub Packages (container registry)
 
 name: Release
 
@@ -9,6 +10,10 @@ on:
   push:
     tags:
       - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   # ==========================================================================
@@ -107,7 +112,7 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # Create GitHub Release
+  # Create GitHub Release with Changelog
   # ==========================================================================
   release:
     name: Create Release
@@ -119,6 +124,54 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version info
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          # Extract changelog section for this version
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Try to extract the section for this version from CHANGELOG.md
+          if [ -f CHANGELOG.md ]; then
+            # Extract content between this version header and the next version header
+            CHANGELOG=$(awk -v ver="$VERSION" '
+              /^## \[?v?'"$VERSION"'\]?/ { found=1; next }
+              /^## \[?v?[0-9]/ && found { exit }
+              found { print }
+            ' CHANGELOG.md)
+
+            if [ -z "$CHANGELOG" ]; then
+              # Fallback: try without 'v' prefix
+              CHANGELOG=$(awk -v ver="$VERSION" '
+                /^## \[?'"$VERSION"'\]?/ { found=1; next }
+                /^## \[?[0-9]/ && found { exit }
+                found { print }
+              ' CHANGELOG.md)
+            fi
+          fi
+
+          # If no changelog found, use git log
+          if [ -z "$CHANGELOG" ]; then
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+            if [ -n "$PREV_TAG" ]; then
+              CHANGELOG=$(git log --pretty=format:"- %s" "$PREV_TAG"..HEAD)
+            else
+              CHANGELOG="Initial release"
+            fi
+          fi
+
+          # Write to file for multiline output
+          echo "$CHANGELOG" > /tmp/changelog.txt
+          echo "file=/tmp/changelog.txt" >> $GITHUB_OUTPUT
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -126,21 +179,112 @@ jobs:
           path: artifacts
 
       - name: Prepare release assets
+        id: assets
         run: |
+          VERSION="${{ steps.version.outputs.version }}"
           mkdir -p release
+
+          # Copy and rename binaries with version
           find artifacts -name 'spliff' -type f | while read f; do
             dir=$(dirname "$f")
             distro=$(basename "$dir")
-            cp "$f" "release/spliff-${distro}"
+            cp "$f" "release/spliff-${VERSION}-${distro}"
+            chmod +x "release/spliff-${VERSION}-${distro}"
           done
+
+          # Copy packages (already have version in filename)
           find artifacts -name '*.deb' -exec cp {} release/ \;
           find artifacts -name '*.rpm' -exec cp {} release/ \;
-          ls -la release/
+
+          # Generate checksums
+          cd release
+          sha256sum * > SHA256SUMS.txt
+
+          ls -la
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          name: spliff ${{ steps.version.outputs.tag }}
+          body_path: ${{ steps.changelog.outputs.file }}
           files: release/*
-          generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+
+  # ==========================================================================
+  # Publish to GitHub Container Registry
+  # ==========================================================================
+  docker:
+    name: Publish Docker Image
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Fedora artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: spliff-fedora-43
+          path: docker-build
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Dockerfile
+        run: |
+          cat > Dockerfile << 'DOCKERFILE'
+          FROM fedora:43
+
+          LABEL org.opencontainers.image.source=https://github.com/NoFear0411/spliff
+          LABEL org.opencontainers.image.description="eBPF-based SSL/TLS traffic sniffer"
+          LABEL org.opencontainers.image.licenses=GPL-3.0
+
+          # Install runtime dependencies
+          RUN dnf install -y \
+              libbpf elfutils-libelf zlib \
+              llhttp libnghttp2 \
+              libzstd brotli \
+              ck libxdp userspace-rcu \
+              jemalloc pcre2 && \
+              dnf clean all
+
+          # Copy the binary
+          COPY docker-build/spliff /usr/local/bin/spliff
+          RUN chmod +x /usr/local/bin/spliff
+
+          ENTRYPOINT ["/usr/local/bin/spliff"]
+          DOCKERFILE
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
