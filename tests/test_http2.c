@@ -426,9 +426,25 @@ static void test_frame_validation(void) {
         return;
     }
 
-    /* Valid: All frame types 0-9 should be accepted */
+    /* Valid: All frame types 0-9 should be accepted with correct stream_id
+     * Per HTTP/2 spec:
+     *   - SETTINGS (4), PING (6), GOAWAY (7) require stream_id=0
+     *   - DATA (0), HEADERS (1), PRIORITY (2), RST_STREAM (3), PUSH_PROMISE (5), CONTINUATION (9) require stream_id>0
+     *   - WINDOW_UPDATE (8) can be on any stream
+     */
     for (int type = 0; type <= H2_MAX_VALID_FRAME_TYPE; type++) {
-        build_frame_header(frame, 10, (uint8_t)type, 0x00, 1);
+        uint32_t stream_id;
+        switch (type) {
+        case 0x04: /* SETTINGS */
+        case 0x06: /* PING */
+        case 0x07: /* GOAWAY */
+            stream_id = 0;  /* Connection-level frames */
+            break;
+        default:
+            stream_id = 1;  /* Stream-specific frames */
+            break;
+        }
+        build_frame_header(frame, 10, (uint8_t)type, 0x00, stream_id);
         if (!http2_is_valid_frame_header(frame)) {
             char buf[64];
             snprintf(buf, sizeof(buf), "Valid frame type %d rejected", type);

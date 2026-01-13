@@ -503,6 +503,18 @@ if(BROTLI_FOUND)
 endif()
 add_test(NAME http2_parser_tests COMMAND test_http2)
 
+# XDP structure tests (v0.8.0+)
+add_executable(test_xdp EXCLUDE_FROM_ALL tests/test_xdp.c tests/test_common.c
+    src/bpf/bpf_loader.c
+    src/util/safe_str.c
+)
+target_include_directories(test_xdp PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_xdp PRIVATE
+    PkgConfig::LIBBPF
+    PkgConfig::LIBELF
+)
+add_test(NAME xdp_structure_tests COMMAND test_xdp)
+
 # ============================================================================
 # Installation
 # ============================================================================

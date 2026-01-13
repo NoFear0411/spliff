@@ -69,8 +69,8 @@ typedef enum {
  * =============================================================================
  * Event type inference: The dispatcher infers event type from struct size + tcp_flags:
  *   - size == 172 && payload_len > 0  → AMBIGUOUS (send to PCRE2-JIT)
- *   - size == 56 && tcp_flags & (FIN|RST) → FLOW_END (terminated)
- *   - size == 56 otherwise → FLOW_NEW (new classified flow)
+ *   - size == 52 && tcp_flags & (FIN|RST) → FLOW_END (terminated)
+ *   - size == 52 otherwise → FLOW_NEW (new classified flow)
  */
 
 /* TCP flags for flow lifecycle detection */
@@ -96,19 +96,22 @@ typedef enum {
 } xdp_category_t;
 
 /* Flow key (5-tuple) for BPF map lookups - 16 bytes
- * Note: IPv4 only. IPv6 flows use XOR-hashed addresses in BPF but
- * socket cookie correlation is limited for IPv6.
+ * Must match struct flow_key in spliff.bpf.c exactly.
+ * Note: IPv6 flows use XOR-hashed addresses (32-bit) for both IP fields.
  */
 typedef struct {
-    uint32_t saddr;              /* Source IP (network byte order) */
-    uint32_t daddr;              /* Dest IP (network byte order) */
-    uint16_t sport;              /* Source port (network byte order) */
-    uint16_t dport;              /* Dest port (network byte order) */
-    uint8_t  _pad[4];            /* Alignment to 16 bytes */
+    uint32_t saddr;              /* [4] Source IP (v4) or XOR-hash (v6), network byte order */
+    uint32_t daddr;              /* [4] Dest IP (v4) or XOR-hash (v6), network byte order */
+    uint16_t sport;              /* [2] Source port (network byte order) */
+    uint16_t dport;              /* [2] Dest port (network byte order) */
+    uint8_t  protocol;           /* [1] IPPROTO_TCP (6) or IPPROTO_UDP (17) */
+    uint8_t  ip_version;         /* [1] 4 or 6 */
+    uint8_t  _pad[2];            /* [2] Alignment to 16 bytes */
 } __attribute__((packed)) flow_key_t;
 
-/* XDP packet event (metadata only) - 56 bytes
+/* XDP packet event (metadata only) - 52 bytes
  * Matches struct xdp_packet_event in spliff.bpf.c
+ * Size: 8+8+16+4+4+4+2+1+1+1+1+2 = 52 bytes
  *
  * Sent for:
  *   - New flow discovery (category != UNKNOWN)
