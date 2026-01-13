@@ -46,15 +46,23 @@ jobs:
         run: |
           apt-get update
           apt-get install -y \
-            git cmake make pkg-config \
+            git cmake make pkg-config curl ca-certificates \
             gcc g++ clang llvm \
             libbpf-dev libelf-dev zlib1g-dev \
-            libllhttp-dev libnghttp2-dev \
-            libzstd-dev libbrotli-dev \
-            libck-dev libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev
+            libnghttp2-dev libzstd-dev libbrotli-dev \
+            liburcu-dev libpcre2-dev
         env:
           DEBIAN_FRONTEND: noninteractive
+
+      - name: Build llhttp from source
+        run: |
+          cd /tmp
+          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
+          cd llhttp-release-v9.2.1
+          cmake -B build -DBUILD_SHARED_LIBS=ON
+          cmake --build build
+          cmake --install build
+          ldconfig
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,7 +72,8 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
-            -DENABLE_SANITIZERS=${{ matrix.sanitizers }}
+            -DENABLE_SANITIZERS=${{ matrix.sanitizers }} \
+            -DENABLE_XDP=OFF
 
       - name: Build
         run: cmake --build build --parallel
@@ -83,24 +92,19 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # Debian Stable
+  # Debian Stable (Bookworm only - Bullseye has CMake 3.18 which is too old)
   # ==========================================================================
   debian:
-    name: Debian ${{ matrix.codename }}
+    name: Debian Bookworm
     runs-on: ubuntu-latest
-    container: debian:${{ matrix.codename }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        codename: [bookworm, bullseye]
+    container: debian:bookworm
 
     steps:
       - name: Install dependencies
         run: |
           apt-get update
           apt-get install -y \
-            git cmake make pkg-config curl \
+            git cmake make pkg-config curl ca-certificates \
             gcc g++ clang llvm \
             libbpf-dev libelf-dev zlib1g-dev \
             libnghttp2-dev libzstd-dev libbrotli-dev \
@@ -129,12 +133,11 @@ jobs:
 
       - name: Test
         run: |
-          cmake --build build --target test_http1 test_http2 || true
-          cd build && ctest --output-on-failure || true
-        continue-on-error: true
+          cmake --build build --target test_http1 test_http2 test_xdp
+          cd build && ctest --output-on-failure
 
   # ==========================================================================
-  # Fedora
+  # Fedora (Full feature support)
   # ==========================================================================
   fedora:
     name: Fedora ${{ matrix.version }}
@@ -173,7 +176,7 @@ jobs:
           cd build && ctest --output-on-failure
 
   # ==========================================================================
-  # Arch Linux
+  # Arch Linux (Rolling Release)
   # ==========================================================================
   arch:
     name: Arch Linux
@@ -211,9 +214,8 @@ jobs:
 
       - name: Test
         run: |
-          cmake --build build --target test_http1 test_http2 || true
-          cd build && ctest --output-on-failure || true
-        continue-on-error: true
+          cmake --build build --target test_http1 test_http2 test_xdp
+          cd build && ctest --output-on-failure
 
   # ==========================================================================
   # AlmaLinux / Rocky (RHEL 9 Compatible)
@@ -242,7 +244,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          dnf install -y \
+          dnf install -y --allowerasing \
             git cmake make pkg-config curl \
             gcc gcc-c++ clang llvm \
             elfutils-libelf-devel zlib-devel \
@@ -281,31 +283,28 @@ jobs:
 
       - name: Test
         run: |
-          cmake --build build --target test_http1 test_http2 || true
-          cd build && ctest --output-on-failure || true
-        continue-on-error: true
+          cmake --build build --target test_http1 test_http2 test_xdp
+          cd build && ctest --output-on-failure
 
   # ==========================================================================
-  # Code Coverage
+  # Code Coverage (Fedora - has all packages)
   # ==========================================================================
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
-    container: ubuntu:24.04
+    container: fedora:43
 
     steps:
       - name: Install dependencies
         run: |
-          apt-get update
-          apt-get install -y \
-            git cmake make pkg-config gcc g++ lcov \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libllhttp-dev libnghttp2-dev \
-            libzstd-dev libbrotli-dev \
-            libck-dev libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev clang llvm
-        env:
-          DEBIAN_FRONTEND: noninteractive
+          dnf install -y \
+            git cmake make pkg-config lcov \
+            gcc gcc-c++ clang llvm \
+            libbpf-devel elfutils-libelf-devel zlib-devel \
+            llhttp-devel libnghttp2-devel \
+            libzstd-devel brotli-devel \
+            ck-devel libxdp-devel userspace-rcu-devel \
+            jemalloc-devel pcre2-devel
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -344,21 +343,19 @@ jobs:
   analysis:
     name: Static Analysis
     runs-on: ubuntu-latest
-    container: ubuntu:24.04
+    container: fedora:43
 
     steps:
       - name: Install dependencies
         run: |
-          apt-get update
-          apt-get install -y \
-            git cmake make pkg-config gcc g++ cppcheck \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libllhttp-dev libnghttp2-dev \
-            libzstd-dev libbrotli-dev \
-            libck-dev libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev clang llvm
-        env:
-          DEBIAN_FRONTEND: noninteractive
+          dnf install -y \
+            git cmake make pkg-config cppcheck \
+            gcc gcc-c++ clang llvm \
+            libbpf-devel elfutils-libelf-devel zlib-devel \
+            llhttp-devel libnghttp2-devel \
+            libzstd-devel brotli-devel \
+            ck-devel libxdp-devel userspace-rcu-devel \
+            jemalloc-devel pcre2-devel
 
       - name: Checkout
         uses: actions/checkout@v4
