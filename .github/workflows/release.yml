@@ -1,0 +1,163 @@
+# spliff Release Workflow
+#
+# Creates releases with binary packages when a version tag is pushed.
+# Builds on latest LTS: Ubuntu 24.04, Debian 12, AlmaLinux 9 (RHEL 9)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # ==========================================================================
+  # Build Release Binaries
+  # ==========================================================================
+  build:
+    name: Build (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 24.04 LTS (Noble)
+          - distro: ubuntu-24.04
+            container: ubuntu:24.04
+            pkg_type: deb
+            pkg_manager: apt
+
+          # Debian 12 (Bookworm) - Current Stable
+          - distro: debian-12
+            container: debian:bookworm
+            pkg_type: deb
+            pkg_manager: apt
+
+          # AlmaLinux 9 (RHEL 9 Compatible)
+          - distro: el9
+            container: almalinux:9
+            pkg_type: rpm
+            pkg_manager: dnf
+
+    steps:
+      - name: Install dependencies (apt)
+        if: matrix.pkg_manager == 'apt'
+        run: |
+          apt-get update
+          apt-get install -y \
+            git cmake make pkg-config curl \
+            gcc g++ clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libnghttp2-dev libzstd-dev libbrotli-dev \
+            liburcu-dev libpcre2-dev \
+            dpkg-dev file
+          # Install llhttp if available, otherwise build from source
+          apt-get install -y libllhttp-dev 2>/dev/null || {
+            cd /tmp
+            curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
+            cd llhttp-release-v9.2.1
+            cmake -B build -DBUILD_SHARED_LIBS=ON
+            cmake --build build
+            cmake --install build
+            ldconfig
+          }
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Install dependencies (dnf)
+        if: matrix.pkg_manager == 'dnf'
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled crb || true
+          dnf install -y \
+            git cmake make pkg-config curl \
+            gcc gcc-c++ clang llvm \
+            elfutils-libelf-devel zlib-devel \
+            libnghttp2-devel libzstd-devel brotli-devel \
+            userspace-rcu-devel pcre2-devel \
+            rpm-build
+          # Build libbpf from source
+          cd /tmp
+          curl -sL https://github.com/libbpf/libbpf/archive/refs/tags/v1.4.0.tar.gz | tar xz
+          cd libbpf-1.4.0/src
+          make -j$(nproc)
+          make install
+          ldconfig
+          # Build llhttp from source
+          cd /tmp
+          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
+          cd llhttp-release-v9.2.1
+          cmake -B build -DBUILD_SHARED_LIBS=ON
+          cmake --build build
+          cmake --install build
+          ldconfig
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_SANITIZERS=OFF \
+            -DENABLE_XDP=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Create package
+        run: |
+          cd build
+          cpack -G ${{ matrix.pkg_type == 'deb' && 'DEB' || 'RPM' }} || true
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-${{ matrix.distro }}
+          path: |
+            build/spliff
+            build/*.deb
+            build/*.rpm
+          retention-days: 7
+
+  # ==========================================================================
+  # Create GitHub Release
+  # ==========================================================================
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          find artifacts -name 'spliff' -type f | while read f; do
+            dir=$(dirname "$f")
+            distro=$(basename "$dir")
+            cp "$f" "release/spliff-${distro}"
+          done
+          find artifacts -name '*.deb' -exec cp {} release/ \;
+          find artifacts -name '*.rpm' -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
