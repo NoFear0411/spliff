@@ -206,7 +206,7 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────────────────────────────┐
 │                                 User Space                                        │
 │                                                                                   │
 │   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                           │
@@ -214,7 +214,7 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │   └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                           │
 │          │                  │                  │                                  │
 │   ┌──────▼──────┐    ┌──────▼──────┐    ┌──────▼──────┐                           │
-│   │   OpenSSL   │    │     NSS     │    │  BoringSSL  │     SSL/TLS Libraries     │
+│   │   OpenSSL   │    │     NSS     │    │  BoringSSL  │     SSL/TLS Libraries     │ 
 │   │ SSL_read()  │    │  PR_Read()  │    │ SSL_read()  │                           │
 │   └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                           │
 │          │                  │                  │                                  │
@@ -241,8 +241,8 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │   │          ┌───────────┼───────────┐                 │                          │
 │   │          ▼           ▼           ▼                 │                          │
 │   │     ┌────────┐  ┌────────┐  ┌────────┐             │                          │
-│   │     │Worker 0│  │Worker 1│  │Worker N│   Lock-free SPSC queues               │
-│   │     │ HTTP/1 │  │ HTTP/2 │  │ HTTP/1 │   Per-worker state isolation          │
+│   │     │Worker 0│  │Worker 1│  │Worker N│   Lock-free SPSC queues                │
+│   │     │ HTTP/1 │  │ HTTP/2 │  │ HTTP/1 │   Per-worker state isolation           │
 │   │     │ HTTP/2 │  │ HTTP/1 │  │ HTTP/2 │                                        │
 │   │     └───┬────┘  └───┬────┘  └───┬────┘             │                          │
 │   │         │           │           │                  │                          │
