@@ -39,7 +39,7 @@ clean:
 
 # Run tests (builds test executables then runs them)
 test: debug
-	@cmake --build $(BUILD_DIR) --target test_http1 test_http2
+	@cmake --build $(BUILD_DIR) --target test_http1 test_http2 test_xdp
 	@cd $(BUILD_DIR) && ctest --output-on-failure
 
 # Install to system (requires sudo)
