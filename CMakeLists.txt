@@ -15,6 +15,7 @@ project(spliff
 # ============================================================================
 
 option(ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan in Debug builds" ON)
+option(ENABLE_COVERAGE "Enable code coverage instrumentation (gcov)" OFF)
 option(ENABLE_ZSTD "Enable zstd compression support" ON)
 option(ENABLE_BROTLI "Enable brotli compression support" ON)
 option(ENABLE_XDP "Enable XDP packet capture support" ON)
@@ -110,6 +111,41 @@ if(ENABLE_SANITIZERS AND (CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE 
         string(SUBSTRING "${SANITIZER_FLAGS}" 1 -1 SANITIZER_FLAGS)
         add_compile_options(-fsanitize=${SANITIZER_FLAGS} -fno-omit-frame-pointer)
         add_link_options(-fsanitize=${SANITIZER_FLAGS})
+    endif()
+endif()
+
+# ============================================================================
+# Code Coverage (gcov/lcov)
+# ============================================================================
+# Note: Coverage and sanitizers are mutually exclusive for accurate results
+
+if(ENABLE_COVERAGE)
+    if(ENABLE_SANITIZERS)
+        message(WARNING "Coverage enabled with sanitizers - results may be inaccurate. "
+                        "Consider -DENABLE_SANITIZERS=OFF for coverage builds.")
+    endif()
+
+    # Check for gcov support (requires compile+link test since --coverage affects linking)
+    include(CheckCSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS "--coverage")
+    set(CMAKE_REQUIRED_LINK_OPTIONS "--coverage")
+    check_c_source_compiles("int main(void) { return 0; }" HAVE_COVERAGE)
+    unset(CMAKE_REQUIRED_FLAGS)
+    unset(CMAKE_REQUIRED_LINK_OPTIONS)
+
+    if(HAVE_COVERAGE)
+        message(STATUS "Code coverage: enabled (gcov)")
+        add_compile_options(--coverage -fprofile-arcs -ftest-coverage)
+        add_link_options(--coverage)
+
+        # Disable optimizations for accurate line coverage
+        if(CMAKE_BUILD_TYPE STREQUAL "Release")
+            message(WARNING "Coverage with Release build may have inaccurate line mapping. "
+                            "Consider Debug or RelWithDebInfo build type.")
+        endif()
+    else()
+        message(WARNING "Code coverage requested but --coverage flag not supported")
+        set(ENABLE_COVERAGE OFF)
     endif()
 endif()
 
@@ -612,6 +648,7 @@ endif()
 message(STATUS "")
 message(STATUS "Options:")
 message(STATUS "  Sanitizers:     ${ENABLE_SANITIZERS}")
+message(STATUS "  Coverage:       ${ENABLE_COVERAGE}")
 message(STATUS "  ZSTD support:   ${ENABLE_ZSTD}")
 message(STATUS "  Brotli support: ${ENABLE_BROTLI}")
 if(CK_FOUND)
