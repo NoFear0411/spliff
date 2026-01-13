@@ -40,12 +40,11 @@ jobs:
             pkg_type: deb
             pkg_manager: apt
 
-          # Fedora 43 (Full features including XDP)
+          # Fedora 43
           - distro: fedora-43
             container: fedora:43
             pkg_type: rpm
             pkg_manager: dnf
-            full_features: true
 
     steps:
       - name: Install dependencies (apt)
@@ -58,7 +57,7 @@ jobs:
             libbpf-dev libelf-dev zlib1g-dev \
             libnghttp2-dev libzstd-dev libbrotli-dev \
             liburcu-dev libpcre2-dev \
-            dpkg-dev file
+            libxdp-dev dpkg-dev file
           # Build llhttp from source
           cd /tmp
           curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
@@ -90,8 +89,7 @@ jobs:
         run: |
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_SANITIZERS=OFF \
-            -DENABLE_XDP=${{ matrix.full_features && 'ON' || 'OFF' }}
+            -DENABLE_SANITIZERS=OFF
 
       - name: Build
         run: cmake --build build --parallel
