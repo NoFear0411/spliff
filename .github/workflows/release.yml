@@ -1,8 +1,8 @@
 # spliff Release Workflow
 #
 # Creates releases with binary packages when a version tag is pushed.
-# - Publishes to GitHub Releases with changelog
-# - Publishes to GitHub Packages (container registry)
+# Builds for: Fedora 43, AlmaLinux 10/9, Ubuntu 24.04, Debian Bookworm, Arch
+# Publishes .deb/.rpm packages to GitHub Releases
 
 name: Release
 
@@ -11,54 +11,235 @@ on:
     tags:
       - 'v*'
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
 jobs:
   # ==========================================================================
-  # Build Release Binaries
+  # Fedora 43 (Full feature support - primary build target)
   # ==========================================================================
-  build:
-    name: Build (${{ matrix.distro }})
+  build-fedora-43:
+    name: Build (Fedora 43)
     runs-on: ubuntu-latest
-    container: ${{ matrix.container }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Ubuntu 24.04 LTS (Noble)
-          - distro: ubuntu-24.04
-            container: ubuntu:24.04
-            pkg_type: deb
-            pkg_manager: apt
-
-          # Debian 12 (Bookworm)
-          - distro: debian-12
-            container: debian:bookworm
-            pkg_type: deb
-            pkg_manager: apt
-
-          # Fedora 43
-          - distro: fedora-43
-            container: fedora:43
-            pkg_type: rpm
-            pkg_manager: dnf
+    container: fedora:43
 
     steps:
-      - name: Install dependencies (apt)
-        if: matrix.pkg_manager == 'apt'
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            git cmake make pkg-config \
+            gcc gcc-c++ clang llvm \
+            libbpf-devel elfutils-libelf-devel zlib-devel \
+            llhttp-devel libnghttp2-devel \
+            ck-devel \
+            libzstd-devel brotli-devel \
+            libxdp-devel userspace-rcu-devel \
+            jemalloc-devel pcre2-devel \
+            rpm-build
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Create RPM package
+        run: cd build-release && cpack -G RPM
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-fedora-43
+          path: |
+            build-release/spliff
+            build-release/*.rpm
+          retention-days: 7
+
+  # ==========================================================================
+  # Fedora 42 (Full feature support)
+  # ==========================================================================
+  build-fedora-42:
+    name: Build (Fedora 42)
+    runs-on: ubuntu-latest
+    container: fedora:42
+
+    steps:
+      - name: Install dependencies
+        run: |
+          dnf install -y \
+            git cmake make pkg-config \
+            gcc gcc-c++ clang llvm \
+            libbpf-devel elfutils-libelf-devel zlib-devel \
+            llhttp-devel libnghttp2-devel \
+            ck-devel \
+            libzstd-devel brotli-devel \
+            libxdp-devel userspace-rcu-devel \
+            jemalloc-devel pcre2-devel \
+            rpm-build
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Create RPM package
+        run: cd build-release && cpack -G RPM
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-fedora-42
+          path: |
+            build-release/spliff
+            build-release/*.rpm
+          retention-days: 7
+
+  # ==========================================================================
+  # AlmaLinux 10 (RHEL 10 Compatible)
+  # ==========================================================================
+  build-alma10:
+    name: Build (AlmaLinux 10)
+    runs-on: ubuntu-latest
+    container: almalinux:10
+
+    steps:
+      - name: Enable EPEL and CRB
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled crb || true
+
+      - name: Install dependencies
+        run: |
+          dnf install -y --allowerasing \
+            git cmake make pkg-config curl \
+            gcc gcc-c++ clang llvm \
+            elfutils-libelf-devel zlib-devel \
+            llhttp-devel libnghttp2-devel \
+            libzstd-devel brotli-devel \
+            userspace-rcu-devel pcre2-devel \
+            jemalloc-devel \
+            rpm-build
+
+      - name: Build libbpf from source
+        run: |
+          cd /tmp
+          curl -sL https://github.com/libbpf/libbpf/archive/refs/tags/v1.4.0.tar.gz | tar xz
+          cd libbpf-1.4.0/src
+          make -j$(nproc)
+          make install
+          ldconfig
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: |
+          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig
+          cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DENABLE_XDP=OFF
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Create RPM package
+        run: cd build-release && cpack -G RPM
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-almalinux-10
+          path: |
+            build-release/spliff
+            build-release/*.rpm
+          retention-days: 7
+
+  # ==========================================================================
+  # AlmaLinux 9 (RHEL 9 Compatible)
+  # ==========================================================================
+  build-alma9:
+    name: Build (AlmaLinux 9)
+    runs-on: ubuntu-latest
+    container: almalinux:9
+
+    steps:
+      - name: Enable EPEL and CRB
+        run: |
+          dnf install -y epel-release
+          dnf config-manager --set-enabled crb || true
+
+      - name: Install dependencies
+        run: |
+          dnf install -y --allowerasing \
+            git cmake make pkg-config curl \
+            gcc gcc-c++ clang llvm \
+            elfutils-libelf-devel zlib-devel \
+            llhttp-devel libnghttp2-devel \
+            libzstd-devel brotli-devel \
+            userspace-rcu-devel pcre2-devel \
+            jemalloc-devel \
+            rpm-build
+
+      - name: Build libbpf from source
+        run: |
+          cd /tmp
+          curl -sL https://github.com/libbpf/libbpf/archive/refs/tags/v1.4.0.tar.gz | tar xz
+          cd libbpf-1.4.0/src
+          make -j$(nproc)
+          make install
+          ldconfig
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: |
+          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig
+          cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DENABLE_XDP=OFF
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Create RPM package
+        run: cd build-release && cpack -G RPM
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-almalinux-9
+          path: |
+            build-release/spliff
+            build-release/*.rpm
+          retention-days: 7
+
+  # ==========================================================================
+  # Ubuntu 24.04 LTS (Noble)
+  # ==========================================================================
+  build-ubuntu:
+    name: Build (Ubuntu 24.04)
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+
+    steps:
+      - name: Install dependencies
         run: |
           apt-get update
           apt-get install -y \
             git cmake make pkg-config curl ca-certificates \
             gcc g++ clang llvm \
             libbpf-dev libelf-dev zlib1g-dev \
-            libnghttp2-dev libzstd-dev libbrotli-dev \
-            liburcu-dev libpcre2-dev \
-            libxdp-dev dpkg-dev file
-          # Build llhttp from source
+            libnghttp2-dev \
+            libzstd-dev libbrotli-dev \
+            libxdp-dev liburcu-dev \
+            libjemalloc-dev libpcre2-dev \
+            dpkg-dev file
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Build llhttp from source
+        run: |
           cd /tmp
           curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
           cd llhttp-release-v9.2.1
@@ -66,55 +247,181 @@ jobs:
           cmake --build build
           cmake --install build
           ldconfig
-        env:
-          DEBIAN_FRONTEND: noninteractive
-
-      - name: Install dependencies (dnf)
-        if: matrix.pkg_manager == 'dnf'
-        run: |
-          dnf install -y \
-            git cmake make pkg-config \
-            gcc gcc-c++ clang llvm \
-            libbpf-devel elfutils-libelf-devel zlib-devel \
-            llhttp-devel libnghttp2-devel \
-            libzstd-devel brotli-devel \
-            ck-devel libxdp-devel userspace-rcu-devel \
-            jemalloc-devel pcre2-devel \
-            rpm-build
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure
-        run: |
-          cmake -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_SANITIZERS=OFF
+      - name: Configure (Release)
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
 
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build-release --parallel
 
-      - name: Create package
-        run: |
-          cd build
-          cpack -G ${{ matrix.pkg_type == 'deb' && 'DEB' || 'RPM' }} || true
+      - name: Create DEB package
+        run: cd build-release && cpack -G DEB
 
-      - name: Upload binary
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: spliff-${{ matrix.distro }}
+          name: spliff-ubuntu-24.04
           path: |
-            build/spliff
-            build/*.deb
-            build/*.rpm
+            build-release/spliff
+            build-release/*.deb
           retention-days: 7
 
   # ==========================================================================
-  # Create GitHub Release with Changelog
+  # Debian 13 (Trixie) - Full feature support with native packages
+  # ==========================================================================
+  build-debian-13:
+    name: Build (Debian 13)
+    runs-on: ubuntu-latest
+    container: debian:trixie
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            git cmake make pkg-config curl ca-certificates \
+            gcc g++ clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libllhttp-dev libnghttp2-dev \
+            libck-dev \
+            libzstd-dev libbrotli-dev \
+            libxdp-dev liburcu-dev \
+            libjemalloc-dev libpcre2-dev \
+            dpkg-dev file
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Create DEB package
+        run: cd build-release && cpack -G DEB
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-debian-13
+          path: |
+            build-release/spliff
+            build-release/*.deb
+          retention-days: 7
+
+  # ==========================================================================
+  # Debian 12 (Bookworm) - llhttp built from source
+  # ==========================================================================
+  build-debian-12:
+    name: Build (Debian 12)
+    runs-on: ubuntu-latest
+    container: debian:bookworm
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            git cmake make pkg-config curl ca-certificates \
+            gcc g++ clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libnghttp2-dev \
+            libzstd-dev libbrotli-dev \
+            libxdp-dev liburcu-dev \
+            libjemalloc-dev libpcre2-dev \
+            dpkg-dev file
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Build llhttp from source
+        run: |
+          cd /tmp
+          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
+          cd llhttp-release-v9.2.1
+          cmake -B build -DBUILD_SHARED_LIBS=ON
+          cmake --build build
+          cmake --install build
+          ldconfig
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Create DEB package
+        run: cd build-release && cpack -G DEB
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-debian-12
+          path: |
+            build-release/spliff
+            build-release/*.deb
+          retention-days: 7
+
+  # ==========================================================================
+  # Arch Linux (Rolling Release) - Binary only, no package
+  # ==========================================================================
+  build-arch:
+    name: Build (Arch Linux)
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm \
+            git cmake make pkg-config curl \
+            gcc clang llvm \
+            libbpf libelf zlib \
+            libnghttp2 \
+            zstd brotli \
+            xdp-tools liburcu \
+            jemalloc pcre2
+
+      - name: Build llhttp from source
+        run: |
+          cd /tmp
+          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
+          cd llhttp-release-v9.2.1
+          cmake -B build -DBUILD_SHARED_LIBS=ON
+          cmake --build build
+          cmake --install build
+          ldconfig
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-arch
+          path: build-release/spliff
+          retention-days: 7
+
+  # ==========================================================================
+  # Create GitHub Release with Packages
   # ==========================================================================
   release:
     name: Create Release
-    needs: build
+    needs: [build-fedora-43, build-fedora-42, build-alma10, build-alma9, build-ubuntu, build-debian-13, build-debian-12, build-arch]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -135,12 +442,10 @@ jobs:
       - name: Extract changelog for this version
         id: changelog
         run: |
-          # Extract changelog section for this version
           VERSION="${{ steps.version.outputs.version }}"
 
           # Try to extract the section for this version from CHANGELOG.md
           if [ -f CHANGELOG.md ]; then
-            # Extract content between this version header and the next version header
             CHANGELOG=$(awk -v ver="$VERSION" '
               /^## \[?v?'"$VERSION"'\]?/ { found=1; next }
               /^## \[?v?[0-9]/ && found { exit }
@@ -148,7 +453,6 @@ jobs:
             ' CHANGELOG.md)
 
             if [ -z "$CHANGELOG" ]; then
-              # Fallback: try without 'v' prefix
               CHANGELOG=$(awk -v ver="$VERSION" '
                 /^## \[?'"$VERSION"'\]?/ { found=1; next }
                 /^## \[?[0-9]/ && found { exit }
@@ -167,11 +471,10 @@ jobs:
             fi
           fi
 
-          # Write to file for multiline output
           echo "$CHANGELOG" > /tmp/changelog.txt
           echo "file=/tmp/changelog.txt" >> $GITHUB_OUTPUT
 
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -182,15 +485,16 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p release
 
-          # Copy and rename binaries with version
-          find artifacts -name 'spliff' -type f | while read f; do
-            dir=$(dirname "$f")
-            distro=$(basename "$dir")
-            cp "$f" "release/spliff-${VERSION}-${distro}"
-            chmod +x "release/spliff-${VERSION}-${distro}"
+          # Copy binaries with distro suffix
+          for dir in artifacts/spliff-*; do
+            distro=$(basename "$dir" | sed 's/spliff-//')
+            if [ -f "$dir/spliff" ]; then
+              cp "$dir/spliff" "release/spliff-${VERSION}-${distro}"
+              chmod +x "release/spliff-${VERSION}-${distro}"
+            fi
           done
 
-          # Copy packages (already have version in filename)
+          # Copy all packages (already have version in filename from CPack)
           find artifacts -name '*.deb' -exec cp {} release/ \;
           find artifacts -name '*.rpm' -exec cp {} release/ \;
 
@@ -198,6 +502,7 @@ jobs:
           cd release
           sha256sum * > SHA256SUMS.txt
 
+          echo "Release assets:"
           ls -la
 
       - name: Create Release
@@ -208,81 +513,3 @@ jobs:
           files: release/*
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
-
-  # ==========================================================================
-  # Publish to GitHub Container Registry
-  # ==========================================================================
-  docker:
-    name: Publish Docker Image
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Fedora artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: spliff-fedora-43
-          path: docker-build
-
-      - name: Get version
-        id: version
-        run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-
-      - name: Create Dockerfile
-        run: |
-          cat > Dockerfile << 'DOCKERFILE'
-          FROM fedora:43
-
-          LABEL org.opencontainers.image.source=https://github.com/NoFear0411/spliff
-          LABEL org.opencontainers.image.description="eBPF-based SSL/TLS traffic sniffer"
-          LABEL org.opencontainers.image.licenses=GPL-3.0
-
-          # Install runtime dependencies
-          RUN dnf install -y \
-              libbpf elfutils-libelf zlib \
-              llhttp libnghttp2 \
-              libzstd brotli \
-              ck libxdp userspace-rcu \
-              jemalloc pcre2 && \
-              dnf clean all
-
-          # Copy the binary
-          COPY docker-build/spliff /usr/local/bin/spliff
-          RUN chmod +x /usr/local/bin/spliff
-
-          ENTRYPOINT ["/usr/local/bin/spliff"]
-          DOCKERFILE
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest,enable=${{ !contains(github.ref, '-') }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
