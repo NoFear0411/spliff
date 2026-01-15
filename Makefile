@@ -1,128 +1,206 @@
-# spliff Makefile - CMake wrapper for backward compatibility
+# spliff Makefile - CMake wrapper
 #
-# This Makefile wraps CMake for users accustomed to running 'make'.
-# For full CMake functionality, use cmake directly:
-#   cmake -B build -DCMAKE_BUILD_TYPE=Debug
-#   cmake --build build
+# This Makefile wraps CMake for convenient command-line usage.
+# Default target is release build (optimized, stripped, no sanitizers).
 #
-# Or use CMake presets (if defined in CMakePresets.json)
+# Usage:
+#   make          Build release version (same as 'make release')
+#   make debug    Build debug version with sanitizers
+#   make tests    Build and run tests
+#   make clean    Remove all build artifacts and configuration
 
-.PHONY: all debug release relsan clean install test coverage coverage-html coverage-clean help legacy
+.PHONY: all release debug tests test clean distclean install \
+        coverage coverage-html coverage-clean \
+        package-deb package-rpm help
 
-BUILD_DIR := build
+# Build directories
+BUILD_DIR_DEBUG := build-debug
+BUILD_DIR_RELEASE := build-release
 
-# Default target: debug build
-all: debug
+# Number of parallel jobs (default: number of CPUs)
+JOBS := $(shell nproc 2>/dev/null || echo 4)
 
-# Debug build with sanitizers
-debug:
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
-	@cmake --build $(BUILD_DIR) --parallel
-	@ln -sf $(BUILD_DIR)/spliff spliff 2>/dev/null || cp $(BUILD_DIR)/spliff spliff
+# ============================================================================
+# Main Build Targets
+# ============================================================================
 
-# Release build (optimized, stripped)
+# Default target: release build
+all: release
+
+# Release build (optimized, stripped, no sanitizers)
 release:
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release
-	@cmake --build $(BUILD_DIR) --parallel
-	@ln -sf $(BUILD_DIR)/spliff spliff 2>/dev/null || cp $(BUILD_DIR)/spliff spliff
+	@echo "==> Configuring release build..."
+	@cmake -B $(BUILD_DIR_RELEASE) \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DENABLE_SANITIZERS=OFF
+	@echo "==> Building release..."
+	@cmake --build $(BUILD_DIR_RELEASE) --parallel $(JOBS)
+	@ln -sf $(BUILD_DIR_RELEASE)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_RELEASE)/spliff spliff
+	@echo "==> Release build complete: ./spliff"
 
-# Release build with sanitizers (optimized + ASan/UBSan)
+# Debug build (symbols, sanitizers enabled)
+debug:
+	@echo "==> Configuring debug build..."
+	@cmake -B $(BUILD_DIR_DEBUG) \
+		-DCMAKE_BUILD_TYPE=Debug \
+		-DENABLE_SANITIZERS=ON
+	@echo "==> Building debug..."
+	@cmake --build $(BUILD_DIR_DEBUG) --parallel $(JOBS)
+	@ln -sf $(BUILD_DIR_DEBUG)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_DEBUG)/spliff spliff
+	@echo "==> Debug build complete: ./spliff"
+
+# Release build with sanitizers (for testing optimized code)
 relsan:
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=RelWithSan -DENABLE_SANITIZERS=ON
-	@cmake --build $(BUILD_DIR) --parallel
-	@ln -sf $(BUILD_DIR)/spliff spliff 2>/dev/null || cp $(BUILD_DIR)/spliff spliff
+	@echo "==> Configuring release+sanitizers build..."
+	@cmake -B $(BUILD_DIR_DEBUG) \
+		-DCMAKE_BUILD_TYPE=RelWithSan \
+		-DENABLE_SANITIZERS=ON
+	@echo "==> Building release+sanitizers..."
+	@cmake --build $(BUILD_DIR_DEBUG) --parallel $(JOBS)
+	@ln -sf $(BUILD_DIR_DEBUG)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_DEBUG)/spliff spliff
+	@echo "==> RelWithSan build complete: ./spliff"
 
-# Clean build artifacts
+# ============================================================================
+# Test Targets
+# ============================================================================
+
+# Build and run all tests (uses debug build)
+tests: debug
+	@echo "==> Building test executables..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests --parallel $(JOBS)
+	@echo "==> Running tests..."
+	@cd $(BUILD_DIR_DEBUG) && ctest --output-on-failure
+	@echo "==> All tests passed"
+
+# Alias for tests
+test: tests
+
+# ============================================================================
+# Clean Targets
+# ============================================================================
+
+# Clean all build artifacts and CMake configuration
 clean:
-	@rm -rf $(BUILD_DIR) spliff
-	@echo "Build directory cleaned"
+	@echo "==> Cleaning build directories..."
+	@rm -rf $(BUILD_DIR_DEBUG) $(BUILD_DIR_RELEASE)
+	@rm -f spliff
+	@rm -f compile_commands.json
+	@echo "==> Clean complete"
 
-# Run tests (builds test executables then runs them)
-test: debug
-	@cmake --build $(BUILD_DIR) --target test_http1 test_http2 test_xdp
-	@cd $(BUILD_DIR) && ctest --output-on-failure
+# Deep clean (same as clean, for compatibility)
+distclean: clean
+
+# ============================================================================
+# Code Coverage Targets
+# ============================================================================
 
 # Build with coverage instrumentation and run tests
 coverage:
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON -DENABLE_SANITIZERS=OFF
-	@cmake --build $(BUILD_DIR) --parallel
-	@cmake --build $(BUILD_DIR) --target test_http1 test_http2 test_xdp
-	@cd $(BUILD_DIR) && ctest --output-on-failure
+	@echo "==> Configuring coverage build..."
+	@cmake -B $(BUILD_DIR_DEBUG) \
+		-DCMAKE_BUILD_TYPE=Debug \
+		-DENABLE_COVERAGE=ON \
+		-DENABLE_SANITIZERS=OFF
+	@echo "==> Building with coverage..."
+	@cmake --build $(BUILD_DIR_DEBUG) --parallel $(JOBS)
+	@echo "==> Building test executables..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests --parallel $(JOBS)
+	@echo "==> Running tests for coverage..."
+	@cd $(BUILD_DIR_DEBUG) && ctest --output-on-failure
 	@echo ""
-	@echo "Coverage data generated. Run 'make coverage-html' to generate HTML report."
+	@echo "==> Coverage data generated. Run 'make coverage-html' for HTML report."
 
 # Generate HTML coverage report (requires lcov)
 coverage-html: coverage
-	@command -v lcov >/dev/null 2>&1 || { echo "Error: lcov not installed. Install with: sudo dnf install lcov"; exit 1; }
-	@command -v genhtml >/dev/null 2>&1 || { echo "Error: genhtml not installed. Install with: sudo dnf install lcov"; exit 1; }
-	@echo "Capturing coverage data..."
-	@lcov --capture --directory $(BUILD_DIR) --output-file $(BUILD_DIR)/coverage.info --ignore-errors mismatch
-	@lcov --remove $(BUILD_DIR)/coverage.info '/usr/*' '*/tests/*' --output-file $(BUILD_DIR)/coverage.info --ignore-errors unused
-	@echo "Generating HTML report..."
-	@genhtml $(BUILD_DIR)/coverage.info --output-directory $(BUILD_DIR)/coverage_html
+	@command -v lcov >/dev/null 2>&1 || { echo "Error: lcov not installed"; exit 1; }
+	@command -v genhtml >/dev/null 2>&1 || { echo "Error: genhtml not installed"; exit 1; }
+	@echo "==> Capturing coverage data..."
+	@lcov --capture --directory $(BUILD_DIR_DEBUG) \
+		--output-file $(BUILD_DIR_DEBUG)/coverage.info \
+		--ignore-errors mismatch 2>/dev/null
+	@lcov --remove $(BUILD_DIR_DEBUG)/coverage.info \
+		'/usr/*' '*/tests/*' \
+		--output-file $(BUILD_DIR_DEBUG)/coverage.info \
+		--ignore-errors unused 2>/dev/null
+	@echo "==> Generating HTML report..."
+	@genhtml $(BUILD_DIR_DEBUG)/coverage.info \
+		--output-directory $(BUILD_DIR_DEBUG)/coverage_html
 	@echo ""
-	@echo "Coverage report generated: $(BUILD_DIR)/coverage_html/index.html"
+	@echo "==> Coverage report: $(BUILD_DIR_DEBUG)/coverage_html/index.html"
 
 # Clean coverage data
 coverage-clean:
-	@find $(BUILD_DIR) -name "*.gcda" -delete 2>/dev/null || true
-	@find $(BUILD_DIR) -name "*.gcno" -delete 2>/dev/null || true
-	@rm -rf $(BUILD_DIR)/coverage.info $(BUILD_DIR)/coverage_html
-	@echo "Coverage data cleaned"
+	@find $(BUILD_DIR_DEBUG) -name "*.gcda" -delete 2>/dev/null || true
+	@find $(BUILD_DIR_DEBUG) -name "*.gcno" -delete 2>/dev/null || true
+	@rm -rf $(BUILD_DIR_DEBUG)/coverage.info $(BUILD_DIR_DEBUG)/coverage_html
+	@echo "==> Coverage data cleaned"
+
+# ============================================================================
+# Installation Target
+# ============================================================================
 
 # Install to system (requires sudo)
 install: release
-	@sudo cmake --install $(BUILD_DIR)
-	@echo "Installed to /usr/local/bin/spliff"
+	@echo "==> Installing spliff..."
+	@sudo cmake --install $(BUILD_DIR_RELEASE)
+	@echo "==> Installed to /usr/local/bin/spliff"
 
-# Create Debian package
+# ============================================================================
+# Package Targets
+# ============================================================================
+
+# Create Debian package (.deb)
 package-deb: release
-	@cd $(BUILD_DIR) && cpack -G DEB
-	@echo "Debian package created in $(BUILD_DIR)/"
+	@echo "==> Creating Debian package..."
+	@cd $(BUILD_DIR_RELEASE) && cpack -G DEB
+	@echo "==> Package created in $(BUILD_DIR_RELEASE)/"
+	@ls -la $(BUILD_DIR_RELEASE)/*.deb 2>/dev/null || true
 
-# Create RPM package
+# Create RPM package (.rpm)
 package-rpm: release
-	@cd $(BUILD_DIR) && cpack -G RPM
-	@echo "RPM package created in $(BUILD_DIR)/"
+	@echo "==> Creating RPM package..."
+	@cd $(BUILD_DIR_RELEASE) && cpack -G RPM
+	@echo "==> Package created in $(BUILD_DIR_RELEASE)/"
+	@ls -la $(BUILD_DIR_RELEASE)/*.rpm 2>/dev/null || true
 
-# Use legacy Makefile (pre-CMake)
-legacy:
-	@echo "Using legacy Makefile..."
-	@$(MAKE) -f Makefile.legacy $(filter-out legacy,$(MAKECMDGOALS))
-
+# ============================================================================
 # Help
+# ============================================================================
+
 help:
 	@echo "spliff - eBPF-based SSL/TLS Traffic Sniffer"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  all          Build debug version (default)"
-	@echo "  debug        Build with debug symbols and sanitizers"
-	@echo "  release      Build optimized, stripped binary (no sanitizers)"
-	@echo "  relsan       Build optimized with sanitizers (for testing)"
-	@echo "  test         Build and run tests"
-	@echo "  clean        Remove build artifacts"
-	@echo "  install      Install to /usr/local/bin (requires sudo)"
+	@echo "  make / make release   Build optimized, stripped binary (default)"
+	@echo "  make debug            Build with debug symbols and sanitizers"
+	@echo "  make relsan           Build optimized with sanitizers"
+	@echo "  make tests            Build and run all tests"
+	@echo "  make clean            Remove all build artifacts and configuration"
+	@echo "  make install          Install to /usr/local/bin (requires sudo)"
 	@echo ""
 	@echo "Coverage targets:"
-	@echo "  coverage       Build with gcov and run tests"
-	@echo "  coverage-html  Generate HTML coverage report (requires lcov)"
-	@echo "  coverage-clean Remove coverage data files"
+	@echo "  make coverage         Build with gcov and run tests"
+	@echo "  make coverage-html    Generate HTML coverage report (requires lcov)"
+	@echo "  make coverage-clean   Remove coverage data files"
 	@echo ""
 	@echo "Packaging targets:"
-	@echo "  package-deb  Create Debian package (.deb)"
-	@echo "  package-rpm  Create RPM package (.rpm)"
+	@echo "  make package-deb      Create Debian package (.deb)"
+	@echo "  make package-rpm      Create RPM package (.rpm)"
 	@echo ""
-	@echo "Other targets:"
-	@echo "  legacy       Use legacy Makefile (Makefile.legacy)"
-	@echo "  help         Show this help"
+	@echo "Build directories:"
+	@echo "  build-release/        Release builds (make, make release)"
+	@echo "  build-debug/          Debug builds (make debug, make tests)"
 	@echo ""
-	@echo "CMake options (pass via cmake command):"
-	@echo "  -DENABLE_SANITIZERS=ON/OFF   Enable ASan/UBSan (default: ON)"
-	@echo "  -DENABLE_COVERAGE=ON/OFF     Enable gcov coverage (default: OFF)"
-	@echo "  -DENABLE_ZSTD=ON/OFF         Enable zstd support (default: ON)"
-	@echo "  -DENABLE_BROTLI=ON/OFF       Enable brotli support (default: ON)"
+	@echo "Required dependencies:"
+	@echo "  Fedora:   libbpf-devel elfutils-libelf-devel zlib-devel"
+	@echo "            libzstd-devel brotli-devel llhttp-devel"
+	@echo "            libnghttp2-devel ck-devel libxdp-devel"
+	@echo "            userspace-rcu-devel jemalloc-devel pcre2-devel"
+	@echo "            clang llvm"
 	@echo ""
-	@echo "Direct CMake usage:"
-	@echo "  cmake -B build -DCMAKE_BUILD_TYPE=Debug"
-	@echo "  cmake --build build"
-	@echo "  sudo cmake --install build"
+	@echo "  Debian:   libbpf-dev libelf-dev zlib1g-dev libzstd-dev"
+	@echo "            libbrotli-dev libllhttp-dev libnghttp2-dev"
+	@echo "            libck-dev libxdp-dev liburcu-dev libjemalloc-dev"
+	@echo "            libpcre2-dev clang llvm"
+	@echo ""
+	@echo "Architectures supported: x86_64, aarch64"

@@ -16,9 +16,6 @@ project(spliff
 
 option(ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan in Debug builds" ON)
 option(ENABLE_COVERAGE "Enable code coverage instrumentation (gcov)" OFF)
-option(ENABLE_ZSTD "Enable zstd compression support" ON)
-option(ENABLE_BROTLI "Enable brotli compression support" ON)
-option(ENABLE_XDP "Enable XDP packet capture support" ON)
 
 # ============================================================================
 # C23 Standard Configuration
@@ -58,6 +55,11 @@ endif()
 # ============================================================================
 # Build Type Configuration
 # ============================================================================
+
+# Default to Release build if not specified
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
+endif()
 
 # Define RelWithSan build type (Release + Sanitizers)
 set(CMAKE_C_FLAGS_RELWITHSAN "-O2 -g -DNDEBUG" CACHE STRING
@@ -150,7 +152,7 @@ if(ENABLE_COVERAGE)
 endif()
 
 # ============================================================================
-# Architecture Detection
+# Architecture Detection and Validation
 # ============================================================================
 
 # Detect architecture for BPF compilation
@@ -160,32 +162,72 @@ execute_process(
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
 
+# Validate supported architectures
 if(MACHINE_ARCH STREQUAL "x86_64")
     set(BPF_ARCH "x86")
+    set(ARCH_INCLUDE_PATH "/usr/include/x86_64-linux-gnu")
 elseif(MACHINE_ARCH STREQUAL "aarch64")
     set(BPF_ARCH "arm64")
+    set(ARCH_INCLUDE_PATH "/usr/include/aarch64-linux-gnu")
 else()
-    set(BPF_ARCH ${MACHINE_ARCH})
+    message(FATAL_ERROR "Unsupported architecture: ${MACHINE_ARCH}. Supported: x86_64, aarch64")
 endif()
 
 message(STATUS "Machine architecture: ${MACHINE_ARCH}")
 message(STATUS "BPF target architecture: ${BPF_ARCH}")
 
 # ============================================================================
-# Find Dependencies
+# Find Required Dependencies
 # ============================================================================
 
 find_package(PkgConfig REQUIRED)
 
-# Required dependencies
+# --- Core BPF dependencies ---
 pkg_check_modules(LIBBPF REQUIRED IMPORTED_TARGET libbpf)
-pkg_check_modules(LIBELF REQUIRED IMPORTED_TARGET libelf)
-pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
+message(STATUS "Found libbpf: ${LIBBPF_VERSION}")
 
-# llhttp (required for HTTP/1.1 parsing)
+pkg_check_modules(LIBELF REQUIRED IMPORTED_TARGET libelf)
+message(STATUS "Found libelf: ${LIBELF_VERSION}")
+
+# --- Compression dependencies ---
+pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
+message(STATUS "Found zlib: ${ZLIB_VERSION}")
+
+pkg_check_modules(ZSTD IMPORTED_TARGET libzstd)
+if(NOT ZSTD_FOUND)
+    find_path(ZSTD_INCLUDE_DIR zstd.h)
+    find_library(ZSTD_LIBRARY NAMES zstd)
+    if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
+        message(STATUS "Found zstd via direct search")
+        set(ZSTD_FOUND TRUE)
+        add_library(PkgConfig::ZSTD INTERFACE IMPORTED)
+        target_include_directories(PkgConfig::ZSTD INTERFACE ${ZSTD_INCLUDE_DIR})
+        target_link_libraries(PkgConfig::ZSTD INTERFACE ${ZSTD_LIBRARY})
+    else()
+        message(FATAL_ERROR "zstd not found. Install libzstd-devel (Fedora) or libzstd-dev (Debian)")
+    endif()
+endif()
+message(STATUS "Found zstd: ${ZSTD_VERSION}")
+
+pkg_check_modules(BROTLI IMPORTED_TARGET libbrotlidec)
+if(NOT BROTLI_FOUND)
+    find_path(BROTLI_INCLUDE_DIR brotli/decode.h)
+    find_library(BROTLI_LIBRARY NAMES brotlidec)
+    if(BROTLI_INCLUDE_DIR AND BROTLI_LIBRARY)
+        message(STATUS "Found brotli via direct search")
+        set(BROTLI_FOUND TRUE)
+        add_library(PkgConfig::BROTLI INTERFACE IMPORTED)
+        target_include_directories(PkgConfig::BROTLI INTERFACE ${BROTLI_INCLUDE_DIR})
+        target_link_libraries(PkgConfig::BROTLI INTERFACE ${BROTLI_LIBRARY})
+    else()
+        message(FATAL_ERROR "brotli not found. Install brotli-devel (Fedora) or libbrotli-dev (Debian)")
+    endif()
+endif()
+message(STATUS "Found brotli: ${BROTLI_VERSION}")
+
+# --- HTTP parsing dependencies ---
 pkg_check_modules(LLHTTP IMPORTED_TARGET libllhttp)
 if(NOT LLHTTP_FOUND)
-    # Fallback: try to find header and library directly
     find_path(LLHTTP_INCLUDE_DIR llhttp.h)
     find_library(LLHTTP_LIBRARY NAMES llhttp)
     if(LLHTTP_INCLUDE_DIR AND LLHTTP_LIBRARY)
@@ -200,10 +242,8 @@ if(NOT LLHTTP_FOUND)
 endif()
 message(STATUS "Found llhttp: ${LLHTTP_VERSION}")
 
-# nghttp2 (required for HTTP/2 parsing)
 pkg_check_modules(NGHTTP2 IMPORTED_TARGET libnghttp2)
 if(NOT NGHTTP2_FOUND)
-    # Fallback: try to find header and library directly
     find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h)
     find_library(NGHTTP2_LIBRARY NAMES nghttp2)
     if(NGHTTP2_INCLUDE_DIR AND NGHTTP2_LIBRARY)
@@ -213,35 +253,14 @@ if(NOT NGHTTP2_FOUND)
         target_include_directories(PkgConfig::NGHTTP2 INTERFACE ${NGHTTP2_INCLUDE_DIR})
         target_link_libraries(PkgConfig::NGHTTP2 INTERFACE ${NGHTTP2_LIBRARY})
     else()
-        message(FATAL_ERROR "nghttp2 not found. Install nghttp2-devel (Fedora) or libnghttp2-dev (Debian)")
+        message(FATAL_ERROR "nghttp2 not found. Install libnghttp2-devel (Fedora) or libnghttp2-dev (Debian)")
     endif()
 endif()
 message(STATUS "Found nghttp2: ${NGHTTP2_VERSION}")
 
-# Optional: zstd compression
-if(ENABLE_ZSTD)
-    pkg_check_modules(ZSTD IMPORTED_TARGET libzstd)
-    if(ZSTD_FOUND)
-        message(STATUS "Found zstd: ${ZSTD_VERSION}")
-    else()
-        message(STATUS "zstd not found (optional)")
-    endif()
-endif()
-
-# Optional: brotli compression
-if(ENABLE_BROTLI)
-    pkg_check_modules(BROTLI IMPORTED_TARGET libbrotlidec)
-    if(BROTLI_FOUND)
-        message(STATUS "Found brotli: ${BROTLI_VERSION}")
-    else()
-        message(STATUS "brotli not found (optional)")
-    endif()
-endif()
-
-# Concurrency Kit (ck) - lock-free data structures for threading
+# --- Threading dependencies ---
 pkg_check_modules(CK IMPORTED_TARGET ck)
 if(NOT CK_FOUND)
-    # Fallback: try to find header and library directly
     find_path(CK_INCLUDE_DIR ck_ring.h PATH_SUFFIXES ck)
     find_library(CK_LIBRARY NAMES ck)
     if(CK_INCLUDE_DIR AND CK_LIBRARY)
@@ -251,41 +270,31 @@ if(NOT CK_FOUND)
         target_include_directories(PkgConfig::CK INTERFACE ${CK_INCLUDE_DIR})
         target_link_libraries(PkgConfig::CK INTERFACE ${CK_LIBRARY})
     else()
-        message(STATUS "ck not found - multi-threading disabled")
-        set(CK_FOUND FALSE)
+        message(FATAL_ERROR "Concurrency Kit (ck) not found. Install ck-devel (Fedora) or libck-dev (Debian)")
     endif()
 endif()
-if(CK_FOUND)
-    message(STATUS "Found ck: ${CK_VERSION}")
-endif()
+message(STATUS "Found ck: ${CK_VERSION}")
 
-# libxdp (optional, for XDP/AF_XDP support)
-if(ENABLE_XDP)
-    pkg_check_modules(LIBXDP IMPORTED_TARGET libxdp)
-    if(NOT LIBXDP_FOUND)
-        # Fallback: try to find header and library directly
-        find_path(LIBXDP_INCLUDE_DIR xdp/xsk.h)
-        find_library(LIBXDP_LIBRARY NAMES xdp)
-        if(LIBXDP_INCLUDE_DIR AND LIBXDP_LIBRARY)
-            message(STATUS "Found libxdp via direct search")
-            set(LIBXDP_FOUND TRUE)
-            add_library(PkgConfig::LIBXDP INTERFACE IMPORTED)
-            target_include_directories(PkgConfig::LIBXDP INTERFACE ${LIBXDP_INCLUDE_DIR})
-            target_link_libraries(PkgConfig::LIBXDP INTERFACE ${LIBXDP_LIBRARY})
-        else()
-            message(STATUS "libxdp not found - XDP support disabled")
-            set(LIBXDP_FOUND FALSE)
-        endif()
-    endif()
-    if(LIBXDP_FOUND)
-        message(STATUS "Found libxdp: ${LIBXDP_VERSION}")
+# --- XDP support ---
+pkg_check_modules(LIBXDP IMPORTED_TARGET libxdp)
+if(NOT LIBXDP_FOUND)
+    find_path(LIBXDP_INCLUDE_DIR xdp/xsk.h)
+    find_library(LIBXDP_LIBRARY NAMES xdp)
+    if(LIBXDP_INCLUDE_DIR AND LIBXDP_LIBRARY)
+        message(STATUS "Found libxdp via direct search")
+        set(LIBXDP_FOUND TRUE)
+        add_library(PkgConfig::LIBXDP INTERFACE IMPORTED)
+        target_include_directories(PkgConfig::LIBXDP INTERFACE ${LIBXDP_INCLUDE_DIR})
+        target_link_libraries(PkgConfig::LIBXDP INTERFACE ${LIBXDP_LIBRARY})
+    else()
+        message(FATAL_ERROR "libxdp not found. Install libxdp-devel (Fedora) or libxdp-dev (Debian)")
     endif()
 endif()
+message(STATUS "Found libxdp: ${LIBXDP_VERSION}")
 
-# liburcu (optional, for RCU-based shared data structures)
+# --- RCU support ---
 pkg_check_modules(LIBURCU IMPORTED_TARGET liburcu-memb)
 if(NOT LIBURCU_FOUND)
-    # Fallback: try to find header and library directly
     find_path(LIBURCU_INCLUDE_DIR urcu/urcu-memb.h)
     find_library(LIBURCU_LIBRARY NAMES urcu-memb)
     if(LIBURCU_INCLUDE_DIR AND LIBURCU_LIBRARY)
@@ -295,15 +304,12 @@ if(NOT LIBURCU_FOUND)
         target_include_directories(PkgConfig::LIBURCU INTERFACE ${LIBURCU_INCLUDE_DIR})
         target_link_libraries(PkgConfig::LIBURCU INTERFACE ${LIBURCU_LIBRARY})
     else()
-        message(STATUS "liburcu not found (optional)")
-        set(LIBURCU_FOUND FALSE)
+        message(FATAL_ERROR "liburcu not found. Install userspace-rcu-devel (Fedora) or liburcu-dev (Debian)")
     endif()
 endif()
-if(LIBURCU_FOUND)
-    message(STATUS "Found liburcu: ${LIBURCU_VERSION}")
-endif()
+message(STATUS "Found liburcu: ${LIBURCU_VERSION}")
 
-# jemalloc (optional, for optimized memory allocation)
+# --- Memory allocator ---
 pkg_check_modules(JEMALLOC IMPORTED_TARGET jemalloc)
 if(NOT JEMALLOC_FOUND)
     find_path(JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h)
@@ -315,15 +321,12 @@ if(NOT JEMALLOC_FOUND)
         target_include_directories(PkgConfig::JEMALLOC INTERFACE ${JEMALLOC_INCLUDE_DIR})
         target_link_libraries(PkgConfig::JEMALLOC INTERFACE ${JEMALLOC_LIBRARY})
     else()
-        message(STATUS "jemalloc not found (optional)")
-        set(JEMALLOC_FOUND FALSE)
+        message(FATAL_ERROR "jemalloc not found. Install jemalloc-devel (Fedora) or libjemalloc-dev (Debian)")
     endif()
 endif()
-if(JEMALLOC_FOUND)
-    message(STATUS "Found jemalloc: ${JEMALLOC_VERSION}")
-endif()
+message(STATUS "Found jemalloc: ${JEMALLOC_VERSION}")
 
-# PCRE2 (required for RFC-compliant HTTP pattern matching with JIT)
+# --- Pattern matching ---
 pkg_check_modules(PCRE2 IMPORTED_TARGET libpcre2-8)
 if(NOT PCRE2_FOUND)
     find_path(PCRE2_INCLUDE_DIR pcre2.h)
@@ -335,17 +338,17 @@ if(NOT PCRE2_FOUND)
         target_include_directories(PkgConfig::PCRE2 INTERFACE ${PCRE2_INCLUDE_DIR})
         target_link_libraries(PkgConfig::PCRE2 INTERFACE ${PCRE2_LIBRARY})
     else()
-        message(STATUS "pcre2 not found - RFC-compliant HTTP detection disabled")
-        set(PCRE2_FOUND FALSE)
+        message(FATAL_ERROR "pcre2 not found. Install pcre2-devel (Fedora) or libpcre2-dev (Debian)")
     endif()
 endif()
-if(PCRE2_FOUND)
-    message(STATUS "Found pcre2: ${PCRE2_VERSION}")
-endif()
+message(STATUS "Found pcre2: ${PCRE2_VERSION}")
 
-# Find clang for BPF compilation
+# --- Build tools ---
 find_program(CLANG_EXECUTABLE clang REQUIRED)
 message(STATUS "Found clang: ${CLANG_EXECUTABLE}")
+
+find_program(STRIP_EXECUTABLE strip REQUIRED)
+message(STATUS "Found strip: ${STRIP_EXECUTABLE}")
 
 # ============================================================================
 # Source Files
@@ -361,19 +364,14 @@ set(SPLIFF_SOURCES
     src/bpf/bpf_loader.c
     src/bpf/probe_handler.c
     src/output/display.c
+    # Threading sources (required)
+    src/threading/pool.c
+    src/threading/state.c
+    src/threading/worker.c
+    src/threading/dispatcher.c
+    src/threading/output.c
+    src/threading/manager.c
 )
-
-# Threading sources (optional, requires ck library)
-if(CK_FOUND)
-    list(APPEND SPLIFF_SOURCES
-        src/threading/pool.c
-        src/threading/state.c
-        src/threading/worker.c
-        src/threading/dispatcher.c
-        src/threading/output.c
-        src/threading/manager.c
-    )
-endif()
 
 # ============================================================================
 # BPF Program Compilation
@@ -382,12 +380,12 @@ endif()
 set(BPF_SOURCE ${CMAKE_SOURCE_DIR}/src/bpf/spliff.bpf.c)
 set(BPF_OBJECT ${CMAKE_BINARY_DIR}/spliff.bpf.o)
 
-# Get system include path for BPF
-execute_process(
-    COMMAND uname -m
-    OUTPUT_VARIABLE UNAME_M
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+# BPF include paths for architecture
+if(EXISTS ${ARCH_INCLUDE_PATH})
+    set(BPF_ARCH_INCLUDE "-I${ARCH_INCLUDE_PATH}")
+else()
+    set(BPF_ARCH_INCLUDE "")
+endif()
 
 add_custom_command(
     OUTPUT ${BPF_OBJECT}
@@ -396,11 +394,11 @@ add_custom_command(
         -target bpf
         -D__TARGET_ARCH_${BPF_ARCH}
         -I${CMAKE_SOURCE_DIR}/src/bpf
-        -I/usr/include/${UNAME_M}-linux-gnu
+        ${BPF_ARCH_INCLUDE}
         -c ${BPF_SOURCE}
         -o ${BPF_OBJECT}
     DEPENDS ${BPF_SOURCE}
-    COMMENT "Compiling BPF program..."
+    COMMENT "Compiling BPF program for ${BPF_ARCH}..."
     VERBATIM
 )
 
@@ -420,68 +418,41 @@ target_include_directories(spliff PRIVATE
     ${CMAKE_SOURCE_DIR}/src/include
 )
 
-# Link required libraries
+# Link all required libraries
 target_link_libraries(spliff PRIVATE
     PkgConfig::LIBBPF
     PkgConfig::LIBELF
     PkgConfig::ZLIB
+    PkgConfig::ZSTD
+    PkgConfig::BROTLI
     PkgConfig::LLHTTP
     PkgConfig::NGHTTP2
+    PkgConfig::CK
+    PkgConfig::LIBXDP
+    PkgConfig::LIBURCU
+    PkgConfig::JEMALLOC
+    PkgConfig::PCRE2
     pthread
 )
 
-# Compile definitions
+# Compile definitions for all features
 target_compile_definitions(spliff PRIVATE
     HAVE_LLHTTP
     HAVE_NGHTTP2
+    HAVE_ZSTD
+    HAVE_BROTLI
+    HAVE_THREADING
+    HAVE_XDP
+    HAVE_LIBURCU
+    HAVE_JEMALLOC
+    HAVE_PCRE2
+    PCRE2_CODE_UNIT_WIDTH=8
 )
-
-# Optional zstd support
-if(ZSTD_FOUND)
-    target_link_libraries(spliff PRIVATE PkgConfig::ZSTD)
-    target_compile_definitions(spliff PRIVATE HAVE_ZSTD)
-endif()
-
-# Optional brotli support
-if(BROTLI_FOUND)
-    target_link_libraries(spliff PRIVATE PkgConfig::BROTLI)
-    target_compile_definitions(spliff PRIVATE HAVE_BROTLI)
-endif()
-
-# Threading support (requires ck library)
-if(CK_FOUND)
-    target_link_libraries(spliff PRIVATE PkgConfig::CK)
-    target_compile_definitions(spliff PRIVATE HAVE_THREADING)
-endif()
-
-# XDP support (requires libxdp and threading)
-if(LIBXDP_FOUND AND CK_FOUND)
-    target_link_libraries(spliff PRIVATE PkgConfig::LIBXDP)
-    target_compile_definitions(spliff PRIVATE HAVE_XDP)
-endif()
-
-# Optional liburcu support (RCU-based shared data)
-if(LIBURCU_FOUND)
-    target_link_libraries(spliff PRIVATE PkgConfig::LIBURCU)
-    target_compile_definitions(spliff PRIVATE HAVE_LIBURCU)
-endif()
-
-# Optional jemalloc support (optimized memory allocation)
-if(JEMALLOC_FOUND)
-    target_link_libraries(spliff PRIVATE PkgConfig::JEMALLOC)
-    target_compile_definitions(spliff PRIVATE HAVE_JEMALLOC)
-endif()
-
-# PCRE2 support (RFC-compliant HTTP pattern matching with JIT)
-if(PCRE2_FOUND)
-    target_link_libraries(spliff PRIVATE PkgConfig::PCRE2)
-    target_compile_definitions(spliff PRIVATE HAVE_PCRE2 PCRE2_CODE_UNIT_WIDTH=8)
-endif()
 
 # Strip release builds
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_custom_command(TARGET spliff POST_BUILD
-        COMMAND ${CMAKE_STRIP} --strip-all $<TARGET_FILE:spliff>
+        COMMAND ${STRIP_EXECUTABLE} --strip-all $<TARGET_FILE:spliff>
         COMMENT "Stripping spliff binary..."
     )
 endif()
@@ -502,46 +473,48 @@ set(TEST_COMMON_SOURCES
     src/content/signatures.c
 )
 
-# HTTP/1.1 parser tests (EXCLUDE_FROM_ALL - only built with 'make test' or explicitly)
-add_executable(test_http1 EXCLUDE_FROM_ALL tests/test_http1.c tests/test_common.c ${TEST_COMMON_SOURCES})
+# HTTP/1.1 parser tests
+add_executable(test_http1 EXCLUDE_FROM_ALL
+    tests/test_http1.c
+    tests/test_common.c
+    ${TEST_COMMON_SOURCES}
+)
 target_include_directories(test_http1 PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_http1 PRIVATE
     PkgConfig::LLHTTP
     PkgConfig::NGHTTP2
     PkgConfig::ZLIB
+    PkgConfig::ZSTD
+    PkgConfig::BROTLI
 )
-target_compile_definitions(test_http1 PRIVATE HAVE_LLHTTP HAVE_NGHTTP2)
-if(ZSTD_FOUND)
-    target_link_libraries(test_http1 PRIVATE PkgConfig::ZSTD)
-    target_compile_definitions(test_http1 PRIVATE HAVE_ZSTD)
-endif()
-if(BROTLI_FOUND)
-    target_link_libraries(test_http1 PRIVATE PkgConfig::BROTLI)
-    target_compile_definitions(test_http1 PRIVATE HAVE_BROTLI)
-endif()
+target_compile_definitions(test_http1 PRIVATE
+    HAVE_LLHTTP HAVE_NGHTTP2 HAVE_ZSTD HAVE_BROTLI
+)
 add_test(NAME http1_parser_tests COMMAND test_http1)
 
-# HTTP/2 parser tests (EXCLUDE_FROM_ALL - only built with 'make test' or explicitly)
-add_executable(test_http2 EXCLUDE_FROM_ALL tests/test_http2.c tests/test_common.c ${TEST_COMMON_SOURCES})
+# HTTP/2 parser tests
+add_executable(test_http2 EXCLUDE_FROM_ALL
+    tests/test_http2.c
+    tests/test_common.c
+    ${TEST_COMMON_SOURCES}
+)
 target_include_directories(test_http2 PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_http2 PRIVATE
     PkgConfig::LLHTTP
     PkgConfig::NGHTTP2
     PkgConfig::ZLIB
+    PkgConfig::ZSTD
+    PkgConfig::BROTLI
 )
-target_compile_definitions(test_http2 PRIVATE HAVE_LLHTTP HAVE_NGHTTP2)
-if(ZSTD_FOUND)
-    target_link_libraries(test_http2 PRIVATE PkgConfig::ZSTD)
-    target_compile_definitions(test_http2 PRIVATE HAVE_ZSTD)
-endif()
-if(BROTLI_FOUND)
-    target_link_libraries(test_http2 PRIVATE PkgConfig::BROTLI)
-    target_compile_definitions(test_http2 PRIVATE HAVE_BROTLI)
-endif()
+target_compile_definitions(test_http2 PRIVATE
+    HAVE_LLHTTP HAVE_NGHTTP2 HAVE_ZSTD HAVE_BROTLI
+)
 add_test(NAME http2_parser_tests COMMAND test_http2)
 
-# XDP structure tests (v0.8.0+)
-add_executable(test_xdp EXCLUDE_FROM_ALL tests/test_xdp.c tests/test_common.c
+# XDP structure tests
+add_executable(test_xdp EXCLUDE_FROM_ALL
+    tests/test_xdp.c
+    tests/test_common.c
     src/bpf/bpf_loader.c
     src/util/safe_str.c
 )
@@ -551,6 +524,12 @@ target_link_libraries(test_xdp PRIVATE
     PkgConfig::LIBELF
 )
 add_test(NAME xdp_structure_tests COMMAND test_xdp)
+
+# Custom target to build all tests
+add_custom_target(build_tests
+    DEPENDS test_http1 test_http2 test_xdp
+    COMMENT "Building all test executables..."
+)
 
 # ============================================================================
 # Installation
@@ -578,40 +557,77 @@ set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
 set(CPACK_PACKAGE_VENDOR "spliff developers")
 set(CPACK_PACKAGE_CONTACT "maintainer@example.com")
 
-# License file (optional - only set if exists)
+# License file
 if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
     set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
 endif()
 
-# Debian package configuration
+# ============================================================================
+# Distribution Detection for Package Dependencies
+# ============================================================================
+
+set(LINUX_DISTRO "unknown")
+set(LINUX_DISTRO_VERSION "")
+
+if(EXISTS "/etc/os-release")
+    file(STRINGS "/etc/os-release" OS_RELEASE_CONTENTS)
+    foreach(line ${OS_RELEASE_CONTENTS})
+        if(line MATCHES "^ID=(.*)$")
+            string(REGEX REPLACE "^ID=\"?([^\"]*)\"?$" "\\1" LINUX_DISTRO "${line}")
+        endif()
+        if(line MATCHES "^VERSION_ID=(.*)$")
+            string(REGEX REPLACE "^VERSION_ID=\"?([^\"]*)\"?$" "\\1" LINUX_DISTRO_VERSION "${line}")
+        endif()
+    endforeach()
+endif()
+
+message(STATUS "Detected distribution: ${LINUX_DISTRO} ${LINUX_DISTRO_VERSION}")
+
+# ============================================================================
+# Debian/Ubuntu Package Configuration
+# ============================================================================
+
 # Standard naming: <name>_<version>-<release>_<arch>.deb
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_RELEASE "1")
-# Architecture detection (fallback if dpkg not available)
+
+# Architecture detection
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "armv7")
-    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "armhf")
 else()
     set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
 endif()
-set(CPACK_DEBIAN_PACKAGE_DEPENDS
-    "libbpf1, libelf1, zlib1g, libllhttp1, libnghttp2-14"
-)
+
+# Use automatic shared library dependency detection
+# This properly handles different library versions across Debian 12/13, Ubuntu, etc.
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+
+# Fallback dependencies (used if shlibdeps fails or for static builds)
+# Note: Package names vary by version (e.g., liburcu8 vs liburcu8t64)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "libc6")
 set(CPACK_DEBIAN_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 
-# RPM package configuration
+# ============================================================================
+# RPM Package Configuration (Fedora/RHEL/Alma)
+# ============================================================================
+
 # Standard naming: <name>-<version>-<release>.<arch>.rpm
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 set(CPACK_RPM_PACKAGE_RELEASE "1")
 set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/System")
-set(CPACK_RPM_PACKAGE_REQUIRES
-    "libbpf, elfutils-libelf, zlib, llhttp, libnghttp2"
-)
+
+# Use automatic dependency detection for RPM
+# This handles differences between Fedora 42/43, AlmaLinux 9/10, etc.
+set(CPACK_RPM_PACKAGE_AUTOREQ ON)
+set(CPACK_RPM_PACKAGE_AUTOPROV ON)
+
+# Minimal explicit dependencies (auto-req will add the rest)
+# Note: On AlmaLinux some libs are built from source and won't have packages
+set(CPACK_RPM_PACKAGE_REQUIRES "glibc")
 
 include(CPack)
 
@@ -625,62 +641,33 @@ message(STATUS "Build type:       ${CMAKE_BUILD_TYPE}")
 message(STATUS "C compiler:       ${CMAKE_C_COMPILER}")
 message(STATUS "C standard:       C${CMAKE_C_STANDARD}")
 message(STATUS "Install prefix:   ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "Architecture:     ${MACHINE_ARCH} (BPF: ${BPF_ARCH})")
 message(STATUS "")
-message(STATUS "Dependencies:")
+message(STATUS "Required Dependencies (all found):")
 message(STATUS "  libbpf:         ${LIBBPF_VERSION}")
 message(STATUS "  libelf:         ${LIBELF_VERSION}")
 message(STATUS "  zlib:           ${ZLIB_VERSION}")
+message(STATUS "  zstd:           ${ZSTD_VERSION}")
+message(STATUS "  brotli:         ${BROTLI_VERSION}")
 message(STATUS "  llhttp:         ${LLHTTP_VERSION}")
 message(STATUS "  nghttp2:        ${NGHTTP2_VERSION}")
-if(ZSTD_FOUND)
-    message(STATUS "  zstd:           ${ZSTD_VERSION}")
-else()
-    message(STATUS "  zstd:           not found (optional)")
-endif()
-if(BROTLI_FOUND)
-    message(STATUS "  brotli:         ${BROTLI_VERSION}")
-else()
-    message(STATUS "  brotli:         not found (optional)")
-endif()
-if(CK_FOUND)
-    message(STATUS "  ck:             ${CK_VERSION}")
-else()
-    message(STATUS "  ck:             not found (threading disabled)")
-endif()
-if(LIBXDP_FOUND)
-    message(STATUS "  libxdp:         ${LIBXDP_VERSION}")
-else()
-    message(STATUS "  libxdp:         not found (XDP disabled)")
-endif()
-if(LIBURCU_FOUND)
-    message(STATUS "  liburcu:        ${LIBURCU_VERSION}")
-else()
-    message(STATUS "  liburcu:        not found (optional)")
-endif()
-if(JEMALLOC_FOUND)
-    message(STATUS "  jemalloc:       ${JEMALLOC_VERSION}")
-else()
-    message(STATUS "  jemalloc:       not found (optional)")
-endif()
+message(STATUS "  ck:             ${CK_VERSION}")
+message(STATUS "  libxdp:         ${LIBXDP_VERSION}")
+message(STATUS "  liburcu:        ${LIBURCU_VERSION}")
+message(STATUS "  jemalloc:       ${JEMALLOC_VERSION}")
+message(STATUS "  pcre2:          ${PCRE2_VERSION}")
 message(STATUS "")
-message(STATUS "Options:")
+message(STATUS "Build Options:")
 message(STATUS "  Sanitizers:     ${ENABLE_SANITIZERS}")
 message(STATUS "  Coverage:       ${ENABLE_COVERAGE}")
-message(STATUS "  ZSTD support:   ${ENABLE_ZSTD}")
-message(STATUS "  Brotli support: ${ENABLE_BROTLI}")
-if(CK_FOUND)
-    message(STATUS "  Threading:      ON (multi-threaded mode available)")
-else()
-    message(STATUS "  Threading:      OFF (single-threaded mode only)")
-endif()
-if(LIBXDP_FOUND AND CK_FOUND)
-    message(STATUS "  XDP support:    ON (packet capture available)")
-else()
-    message(STATUS "  XDP support:    OFF (requires libxdp and ck)")
-endif()
-if(PCRE2_FOUND)
-    message(STATUS "  PCRE2-JIT:      ON (RFC-compliant HTTP detection)")
-else()
-    message(STATUS "  PCRE2-JIT:      OFF (install pcre2)")
-endif()
+message(STATUS "")
+message(STATUS "Features (all enabled):")
+message(STATUS "  HTTP/1.1:       ON (llhttp)")
+message(STATUS "  HTTP/2:         ON (nghttp2)")
+message(STATUS "  Compression:    ON (zlib, zstd, brotli)")
+message(STATUS "  Threading:      ON (ck)")
+message(STATUS "  XDP capture:    ON (libxdp)")
+message(STATUS "  RCU support:    ON (liburcu)")
+message(STATUS "  Memory alloc:   ON (jemalloc)")
+message(STATUS "  Pattern match:  ON (pcre2)")
 message(STATUS "")

@@ -1,121 +1,161 @@
-# spliff CI - Build and Test
+# spliff CI - Multi-Distribution Build Check
 #
-# Multi-distro Linux build and test workflow for CMake-based eBPF project.
-# Builds release versions on supported distributions.
+# Verifies release builds with full features on supported distributions.
+# All dependencies installed from distribution repos (main/EPEL).
 
 name: CI
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  # ==========================================================================
-  # Fedora 43 (Full feature support - primary build target)
-  # ==========================================================================
   fedora-43:
     name: Fedora 43
     runs-on: ubuntu-latest
     container: fedora:43
-
     steps:
       - name: Install dependencies
         run: |
           dnf install -y \
-            git cmake make pkg-config \
-            gcc gcc-c++ clang llvm \
+            git cmake make pkg-config gcc gcc-c++ clang llvm \
             libbpf-devel elfutils-libelf-devel zlib-devel \
-            llhttp-devel libnghttp2-devel \
-            ck-devel \
-            libzstd-devel brotli-devel \
-            libxdp-devel userspace-rcu-devel \
-            jemalloc-devel pcre2-devel \
-            rpm-build
+            llhttp-devel libnghttp2-devel ck-devel \
+            libzstd-devel brotli-devel libxdp-devel \
+            userspace-rcu-devel jemalloc-devel pcre2-devel
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Test
+      - name: Build Release
         run: |
-          cmake --build build-release --target test_http1 test_http2 test_xdp
-          cd build-release && ctest --output-on-failure
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+          cmake --build build --parallel
 
-      - name: Create RPM package
-        run: cd build-release && cpack -G RPM
+      - name: Run Tests
+        run: |
+          cmake --build build --target build_tests
+          cd build && ctest --output-on-failure
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-fedora-43
-          path: |
-            build-release/spliff
-            build-release/*.rpm
-          retention-days: 7
-
-  # ==========================================================================
-  # Fedora 42 (Full feature support)
-  # ==========================================================================
   fedora-42:
     name: Fedora 42
     runs-on: ubuntu-latest
     container: fedora:42
-
     steps:
       - name: Install dependencies
         run: |
           dnf install -y \
-            git cmake make pkg-config \
-            gcc gcc-c++ clang llvm \
+            git cmake make pkg-config gcc gcc-c++ clang llvm \
             libbpf-devel elfutils-libelf-devel zlib-devel \
-            llhttp-devel libnghttp2-devel \
-            ck-devel \
-            libzstd-devel brotli-devel \
-            libxdp-devel userspace-rcu-devel \
-            jemalloc-devel pcre2-devel \
-            rpm-build
+            llhttp-devel libnghttp2-devel ck-devel \
+            libzstd-devel brotli-devel libxdp-devel \
+            userspace-rcu-devel jemalloc-devel pcre2-devel
 
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Test
+      - name: Build Release
         run: |
-          cmake --build build-release --target test_http1 test_http2 test_xdp
-          cd build-release && ctest --output-on-failure
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+          cmake --build build --parallel
 
-      - name: Create RPM package
-        run: cd build-release && cpack -G RPM
+      - name: Run Tests
+        run: |
+          cmake --build build --target build_tests
+          cd build && ctest --output-on-failure
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-fedora-42
-          path: |
-            build-release/spliff
-            build-release/*.rpm
-          retention-days: 7
+  debian-13:
+    name: Debian 13
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            git cmake make pkg-config gcc g++ clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libllhttp-dev libnghttp2-dev libck-dev \
+            libzstd-dev libbrotli-dev libxdp-dev \
+            liburcu-dev libjemalloc-dev libpcre2-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
 
-  # ==========================================================================
-  # AlmaLinux 10 (RHEL 10 Compatible)
-  # ==========================================================================
+      - uses: actions/checkout@v4
+
+      - name: Build Release
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+          cmake --build build --parallel
+
+      - name: Run Tests
+        run: |
+          cmake --build build --target build_tests
+          cd build && ctest --output-on-failure
+
+  debian-12:
+    name: Debian 12
+    runs-on: ubuntu-latest
+    container: debian:bookworm
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            git cmake make pkg-config gcc g++ clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libllhttp-dev libnghttp2-dev libck-dev \
+            libzstd-dev libbrotli-dev libxdp-dev \
+            liburcu-dev libjemalloc-dev libpcre2-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - uses: actions/checkout@v4
+
+      - name: Build Release
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+          cmake --build build --parallel
+
+      - name: Run Tests
+        run: |
+          cmake --build build --target build_tests
+          cd build && ctest --output-on-failure
+
+  ubuntu-24:
+    name: Ubuntu 24.04
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+            git cmake make pkg-config gcc g++ clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev \
+            libllhttp-dev libnghttp2-dev libck-dev \
+            libzstd-dev libbrotli-dev libxdp-dev \
+            liburcu-dev libjemalloc-dev libpcre2-dev
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - uses: actions/checkout@v4
+
+      - name: Build Release
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+          cmake --build build --parallel
+
+      - name: Run Tests
+        run: |
+          cmake --build build --target build_tests
+          cd build && ctest --output-on-failure
+
   alma-10:
     name: AlmaLinux 10
     runs-on: ubuntu-latest
     container: almalinux:10
-
     steps:
       - name: Enable EPEL and CRB
         run: |
@@ -125,60 +165,28 @@ jobs:
       - name: Install dependencies
         run: |
           dnf install -y --allowerasing \
-            git cmake make pkg-config curl \
-            gcc gcc-c++ clang llvm \
-            elfutils-libelf-devel zlib-devel \
-            llhttp-devel libnghttp2-devel \
-            libzstd-devel brotli-devel \
-            userspace-rcu-devel pcre2-devel \
-            jemalloc-devel \
-            rpm-build
+            git cmake make pkg-config gcc gcc-c++ clang llvm \
+            libbpf-devel elfutils-libelf-devel zlib-devel \
+            llhttp-devel libnghttp2-devel ck-devel \
+            libzstd-devel brotli-devel libxdp-devel \
+            userspace-rcu-devel jemalloc-devel pcre2-devel
 
-      - name: Build libbpf from source
+      - uses: actions/checkout@v4
+
+      - name: Build Release
         run: |
-          cd /tmp
-          curl -sL https://github.com/libbpf/libbpf/archive/refs/tags/v1.4.0.tar.gz | tar xz
-          cd libbpf-1.4.0/src
-          make -j$(nproc)
-          make install
-          ldconfig
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+          cmake --build build --parallel
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
+      - name: Run Tests
         run: |
-          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig
-          cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DENABLE_XDP=OFF
+          cmake --build build --target build_tests
+          cd build && ctest --output-on-failure
 
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Test
-        run: |
-          cmake --build build-release --target test_http1 test_http2 test_xdp
-          cd build-release && ctest --output-on-failure
-
-      - name: Create RPM package
-        run: cd build-release && cpack -G RPM
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-almalinux-10
-          path: |
-            build-release/spliff
-            build-release/*.rpm
-          retention-days: 7
-
-  # ==========================================================================
-  # AlmaLinux 9 (RHEL 9 Compatible)
-  # ==========================================================================
   alma-9:
     name: AlmaLinux 9
     runs-on: ubuntu-latest
     container: almalinux:9
-
     steps:
       - name: Enable EPEL and CRB
         run: |
@@ -188,270 +196,46 @@ jobs:
       - name: Install dependencies
         run: |
           dnf install -y --allowerasing \
-            git cmake make pkg-config curl \
-            gcc gcc-c++ clang llvm \
-            elfutils-libelf-devel zlib-devel \
-            llhttp-devel libnghttp2-devel \
-            libzstd-devel brotli-devel \
-            userspace-rcu-devel pcre2-devel \
-            jemalloc-devel \
-            rpm-build
+            git cmake make pkg-config gcc gcc-c++ clang llvm \
+            libbpf-devel elfutils-libelf-devel zlib-devel \
+            llhttp-devel libnghttp2-devel ck-devel \
+            libzstd-devel brotli-devel libxdp-devel \
+            userspace-rcu-devel jemalloc-devel pcre2-devel
 
-      - name: Build libbpf from source
+      - uses: actions/checkout@v4
+
+      - name: Build Release
         run: |
-          cd /tmp
-          curl -sL https://github.com/libbpf/libbpf/archive/refs/tags/v1.4.0.tar.gz | tar xz
-          cd libbpf-1.4.0/src
-          make -j$(nproc)
-          make install
-          ldconfig
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+          cmake --build build --parallel
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
+      - name: Run Tests
         run: |
-          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig
-          cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DENABLE_XDP=OFF
+          cmake --build build --target build_tests
+          cd build && ctest --output-on-failure
 
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Test
-        run: |
-          cmake --build build-release --target test_http1 test_http2 test_xdp
-          cd build-release && ctest --output-on-failure
-
-      - name: Create RPM package
-        run: cd build-release && cpack -G RPM
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-almalinux-9
-          path: |
-            build-release/spliff
-            build-release/*.rpm
-          retention-days: 7
-
-  # ==========================================================================
-  # Ubuntu 24.04 LTS (Noble)
-  # ==========================================================================
-  ubuntu:
-    name: Ubuntu 24.04 LTS
-    runs-on: ubuntu-latest
-    container: ubuntu:24.04
-
-    steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            git cmake make pkg-config curl ca-certificates \
-            gcc g++ clang llvm \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libnghttp2-dev \
-            libzstd-dev libbrotli-dev \
-            libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev \
-            dpkg-dev file
-        env:
-          DEBIAN_FRONTEND: noninteractive
-
-      - name: Build llhttp from source
-        run: |
-          cd /tmp
-          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
-          cd llhttp-release-v9.2.1
-          cmake -B build -DBUILD_SHARED_LIBS=ON
-          cmake --build build
-          cmake --install build
-          ldconfig
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Test
-        run: |
-          cmake --build build-release --target test_http1 test_http2 test_xdp
-          cd build-release && ctest --output-on-failure
-
-      - name: Create DEB package
-        run: cd build-release && cpack -G DEB
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-ubuntu-24.04
-          path: |
-            build-release/spliff
-            build-release/*.deb
-          retention-days: 7
-
-  # ==========================================================================
-  # Debian 13 (Trixie) - Full feature support with native packages
-  # ==========================================================================
-  debian-13:
-    name: Debian 13 (Trixie)
-    runs-on: ubuntu-latest
-    container: debian:trixie
-
-    steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            git cmake make pkg-config curl ca-certificates \
-            gcc g++ clang llvm \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libllhttp-dev libnghttp2-dev \
-            libck-dev \
-            libzstd-dev libbrotli-dev \
-            libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev \
-            dpkg-dev file
-        env:
-          DEBIAN_FRONTEND: noninteractive
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Test
-        run: |
-          cmake --build build-release --target test_http1 test_http2 test_xdp
-          cd build-release && ctest --output-on-failure
-
-      - name: Create DEB package
-        run: cd build-release && cpack -G DEB
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-debian-13
-          path: |
-            build-release/spliff
-            build-release/*.deb
-          retention-days: 7
-
-  # ==========================================================================
-  # Debian 12 (Bookworm) - llhttp built from source
-  # ==========================================================================
-  debian-12:
-    name: Debian 12 (Bookworm)
-    runs-on: ubuntu-latest
-    container: debian:bookworm
-
-    steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            git cmake make pkg-config curl ca-certificates \
-            gcc g++ clang llvm \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libnghttp2-dev \
-            libzstd-dev libbrotli-dev \
-            libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev \
-            dpkg-dev file
-        env:
-          DEBIAN_FRONTEND: noninteractive
-
-      - name: Build llhttp from source
-        run: |
-          cd /tmp
-          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
-          cd llhttp-release-v9.2.1
-          cmake -B build -DBUILD_SHARED_LIBS=ON
-          cmake --build build
-          cmake --install build
-          ldconfig
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Test
-        run: |
-          cmake --build build-release --target test_http1 test_http2 test_xdp
-          cd build-release && ctest --output-on-failure
-
-      - name: Create DEB package
-        run: cd build-release && cpack -G DEB
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-debian-12
-          path: |
-            build-release/spliff
-            build-release/*.deb
-          retention-days: 7
-
-  # ==========================================================================
-  # Arch Linux (Rolling Release)
-  # ==========================================================================
   arch:
     name: Arch Linux
     runs-on: ubuntu-latest
     container: archlinux:latest
-
     steps:
       - name: Install dependencies
         run: |
           pacman -Syu --noconfirm \
-            git cmake make pkg-config curl \
-            gcc clang llvm \
+            git cmake make pkgconf gcc clang llvm \
             libbpf libelf zlib \
-            libnghttp2 \
-            zstd brotli \
-            xdp-tools liburcu \
-            jemalloc pcre2
+            llhttp libnghttp2 ck \
+            zstd brotli libxdp \
+            liburcu jemalloc pcre2
 
-      - name: Build llhttp from source
+      - uses: actions/checkout@v4
+
+      - name: Build Release
         run: |
-          cd /tmp
-          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
-          cd llhttp-release-v9.2.1
-          cmake -B build -DBUILD_SHARED_LIBS=ON
-          cmake --build build
-          cmake --install build
-          ldconfig
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+          cmake --build build --parallel
 
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Test
+      - name: Run Tests
         run: |
-          cmake --build build-release --target test_http1 test_http2 test_xdp
-          cd build-release && ctest --output-on-failure
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-arch
-          path: build-release/spliff
-          retention-days: 7
+          cmake --build build --target build_tests
+          cd build && ctest --output-on-failure
