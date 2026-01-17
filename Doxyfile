@@ -11,7 +11,7 @@
 PROJECT_NAME           = "spliff"
 
 # Project version or revision number
-PROJECT_NUMBER         = "1.0.0"
+PROJECT_NUMBER         = "0.9.0"
 
 # Brief description of the project
 PROJECT_BRIEF          = "eBPF-based SSL/TLS Traffic Sniffer"
@@ -121,15 +121,16 @@ FILE_PATTERNS          = *.c \
 # Recursive search
 RECURSIVE              = YES
 
-# Exclude patterns
+# Exclude specific files
 EXCLUDE                = src/bpf/vmlinux.h
 
 # Exclude symbols
 EXCLUDE_SYMBOLS        =
 
-# Exclude patterns
+# Exclude patterns (build dirs, git, and CLAUDE.md context files)
 EXCLUDE_PATTERNS       = */build*/* \
-                         */.git/*
+                         */.git/* \
+                         *CLAUDE.md
 
 # Use README.md as main page
 USE_MDFILE_AS_MAINPAGE = README.md
