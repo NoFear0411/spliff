@@ -362,6 +362,7 @@ set(SPLIFF_SOURCES
     src/protocol/http1.c
     src/protocol/http2.c
     src/bpf/bpf_loader.c
+    src/bpf/binary_scanner.c
     src/bpf/probe_handler.c
     src/output/display.c
     # Threading sources (required)
@@ -530,6 +531,52 @@ add_custom_target(build_tests
     DEPENDS test_http1 test_http2 test_xdp
     COMMENT "Building all test executables..."
 )
+
+# ============================================================================
+# Documentation (Doxygen)
+# ============================================================================
+
+find_package(Doxygen OPTIONAL_COMPONENTS dot)
+
+if(DOXYGEN_FOUND)
+    message(STATUS "Doxygen found: ${DOXYGEN_EXECUTABLE}")
+    message(STATUS "  Version: ${DOXYGEN_VERSION}")
+
+    # Configure Doxyfile from project root
+    set(DOXYFILE_IN ${CMAKE_SOURCE_DIR}/Doxyfile)
+
+    if(EXISTS ${DOXYFILE_IN})
+        # Create docs target that runs doxygen
+        add_custom_target(docs
+            COMMAND ${DOXYGEN_EXECUTABLE} ${DOXYFILE_IN}
+            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+            COMMENT "Generating API documentation with Doxygen..."
+            VERBATIM
+        )
+
+        # Create clean-docs target
+        add_custom_target(clean-docs
+            COMMAND ${CMAKE_COMMAND} -E remove_directory ${CMAKE_SOURCE_DIR}/docs
+            COMMENT "Removing generated documentation..."
+            VERBATIM
+        )
+
+        message(STATUS "  Target 'docs' available for documentation generation")
+        message(STATUS "  Target 'clean-docs' available for cleanup")
+    else()
+        message(STATUS "  Doxyfile not found at ${DOXYFILE_IN}")
+    endif()
+
+    if(DOXYGEN_DOT_FOUND)
+        message(STATUS "  Graphviz dot: found (diagrams enabled)")
+    else()
+        message(STATUS "  Graphviz dot: not found (diagrams disabled)")
+    endif()
+else()
+    message(STATUS "Doxygen not found - documentation target disabled")
+    message(STATUS "  Install with: dnf install doxygen graphviz (Fedora)")
+    message(STATUS "             or: apt install doxygen graphviz (Debian/Ubuntu)")
+endif()
 
 # ============================================================================
 # Installation

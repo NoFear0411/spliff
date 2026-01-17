@@ -25,8 +25,10 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/stat.h>
 #include "include/spliff.h"
 #include "bpf/bpf_loader.h"
+#include "bpf/binary_scanner.h"
 #include "bpf/probe_handler.h"
 #include "output/display.h"
 #include "content/decompressor.h"
@@ -333,6 +335,370 @@ static void cleanup_pending_bodies_pid(uint32_t pid) {
     }
 }
 
+/* ============================================================================
+ * Dynamic Probe Attachment - attaches probes to newly discovered SSL libraries
+ *
+ * When a new process executes (EVENT_PROCESS_EXEC), we scan its /proc/PID/maps
+ * for SSL libraries and attach probes dynamically. This enables monitoring
+ * processes that start AFTER spliff is running.
+ *
+ * Supported libraries:
+ *   - OpenSSL (libssl.so)
+ *   - GnuTLS (libgnutls.so)
+ *   - NSS/NSPR (libnspr4.so, libssl3.so)
+ *   - WolfSSL (libwolfssl.so)
+ *   - BoringSSL (statically linked in Chrome/Chromium/Electron)
+ * ============================================================================
+ */
+
+/* Track library paths that already have probes attached */
+#define MAX_PROBED_PATHS 128
+
+typedef struct {
+    char path[512];
+    lib_type_t type;
+    bool active;
+} probed_path_t;
+
+static probed_path_t g_probed_paths[MAX_PROBED_PATHS];
+static int g_probed_path_count = 0;
+
+/* Check if probes are already attached to this path */
+static bool is_path_already_probed(const char *path) {
+    for (int i = 0; i < g_probed_path_count; i++) {
+        if (g_probed_paths[i].active &&
+            strcmp(g_probed_paths[i].path, path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Mark a path as probed */
+static void mark_path_probed(const char *path, lib_type_t type) {
+    if (g_probed_path_count >= MAX_PROBED_PATHS) return;
+
+    for (int i = 0; i < MAX_PROBED_PATHS; i++) {
+        if (!g_probed_paths[i].active) {
+            safe_strcpy(g_probed_paths[i].path, sizeof(g_probed_paths[i].path), path);
+            g_probed_paths[i].type = type;
+            g_probed_paths[i].active = true;
+            g_probed_path_count++;
+            return;
+        }
+    }
+}
+
+/* Attach probes to an OpenSSL/compatible library (OpenSSL, WolfSSL) */
+static int attach_openssl_probes(const char *path, bool is_wolfssl) {
+    int attached = 0;
+    const char *read_sym = is_wolfssl ? "wolfSSL_read" : "SSL_read";
+    const char *write_sym = is_wolfssl ? "wolfSSL_write" : "SSL_write";
+
+    /* Basic SSL_read/SSL_write probes */
+    if (bpf_loader_attach_uprobe(&g_loader, path, write_sym,
+                                  "probe_ssl_rw_enter", false, g_debug_mode) == 0) attached++;
+    if (bpf_loader_attach_uprobe(&g_loader, path, write_sym,
+                                  "probe_ssl_write_exit", true, g_debug_mode) == 0) attached++;
+    if (bpf_loader_attach_uprobe(&g_loader, path, read_sym,
+                                  "probe_ssl_rw_enter", false, g_debug_mode) == 0) attached++;
+    if (bpf_loader_attach_uprobe(&g_loader, path, read_sym,
+                                  "probe_ssl_read_exit", true, g_debug_mode) == 0) attached++;
+
+    if (!is_wolfssl) {
+        /* OpenSSL-specific: SSL_set_fd for socket family tracking */
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_set_fd",
+                                  "probe_ssl_set_fd_enter", false, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_set_fd",
+                                  "probe_ssl_set_fd_exit", true, g_debug_mode);
+        /* SSL_free for cleanup */
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_free",
+                                  "probe_ssl_free", false, g_debug_mode);
+        /* SSL_read_ex / SSL_write_ex for OpenSSL 3.x */
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_read_ex",
+                                  "probe_ssl_rw_ex_enter", false, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_read_ex",
+                                  "probe_ssl_read_ex_exit", true, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_write_ex",
+                                  "probe_ssl_rw_ex_enter", false, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_write_ex",
+                                  "probe_ssl_write_ex_exit", true, g_debug_mode);
+        /* ALPN detection */
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_get0_alpn_selected",
+                                  "probe_openssl_alpn_enter", false, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, path, "SSL_get0_alpn_selected",
+                                  "probe_openssl_alpn_exit", true, g_debug_mode);
+    } else {
+        /* WolfSSL ALPN */
+        bpf_loader_attach_uprobe(&g_loader, path, "wolfSSL_ALPN_GetProtocol",
+                                  "probe_wolfssl_alpn_enter", false, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, path, "wolfSSL_ALPN_GetProtocol",
+                                  "probe_wolfssl_alpn_exit", true, g_debug_mode);
+    }
+
+    return attached;
+}
+
+/* Attach probes to GnuTLS library */
+static int attach_gnutls_probes(const char *path) {
+    int attached = 0;
+
+    if (bpf_loader_attach_uprobe(&g_loader, path, "gnutls_record_send",
+                                  "probe_gnutls_send_enter", false, g_debug_mode) == 0) attached++;
+    if (bpf_loader_attach_uprobe(&g_loader, path, "gnutls_record_send",
+                                  "probe_gnutls_send_exit", true, g_debug_mode) == 0) attached++;
+    if (bpf_loader_attach_uprobe(&g_loader, path, "gnutls_record_recv",
+                                  "probe_gnutls_recv_enter", false, g_debug_mode) == 0) attached++;
+    if (bpf_loader_attach_uprobe(&g_loader, path, "gnutls_record_recv",
+                                  "probe_gnutls_recv_exit", true, g_debug_mode) == 0) attached++;
+    /* Cleanup */
+    bpf_loader_attach_uprobe(&g_loader, path, "gnutls_deinit",
+                              "probe_gnutls_deinit", false, g_debug_mode);
+    /* ALPN */
+    bpf_loader_attach_uprobe(&g_loader, path, "gnutls_alpn_get_selected_protocol",
+                              "probe_gnutls_alpn_enter", false, g_debug_mode);
+    bpf_loader_attach_uprobe(&g_loader, path, "gnutls_alpn_get_selected_protocol",
+                              "probe_gnutls_alpn_exit", true, g_debug_mode);
+
+    return attached;
+}
+
+/* Attach probes to NSS/NSPR library */
+static int attach_nss_probes(const char *nspr_path, const char *nss_ssl_path) {
+    int attached = 0;
+
+    if (nspr_path && nspr_path[0]) {
+        /* NSPR I/O functions */
+        if (bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Write",
+                                      "probe_nss_write_enter", false, g_debug_mode) == 0) attached++;
+        if (bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Write",
+                                      "probe_nss_write_exit", true, g_debug_mode) == 0) attached++;
+        if (bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Read",
+                                      "probe_nss_read_enter", false, g_debug_mode) == 0) attached++;
+        if (bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Read",
+                                      "probe_nss_read_exit", true, g_debug_mode) == 0) attached++;
+        bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Send",
+                                  "probe_nss_write_enter", false, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Send",
+                                  "probe_nss_write_exit", true, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Recv",
+                                  "probe_nss_read_enter", false, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Recv",
+                                  "probe_nss_read_exit", true, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, nspr_path, "PR_Close",
+                                  "probe_pr_close", false, g_debug_mode);
+    }
+
+    if (nss_ssl_path && nss_ssl_path[0]) {
+        /* NSS SSL functions */
+        bpf_loader_attach_uprobe(&g_loader, nss_ssl_path, "SSL_ImportFD",
+                                  "probe_ssl_import_fd_exit", true, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, nss_ssl_path, "SSL_GetNextProto",
+                                  "probe_nss_alpn_enter", false, g_debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, nss_ssl_path, "SSL_GetNextProto",
+                                  "probe_nss_alpn_exit", true, g_debug_mode);
+    }
+
+    return attached;
+}
+
+/* Scan /proc/PID/maps and attach probes to any SSL libraries found */
+static int attach_probes_for_pid(uint32_t pid) {
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%u/maps", pid);
+
+    FILE *f = fopen(maps_path, "r");
+    if (!f) return 0;
+
+    int total_attached = 0;
+    char line[1024];
+    char openssl_path[512] = {0};
+    char gnutls_path[512] = {0};
+    char nspr_path[512] = {0};
+    char nss_ssl_path[512] = {0};
+    char wolfssl_path[512] = {0};
+
+    while (fgets(line, sizeof(line), f)) {
+        /* Find the pathname (starts with /) */
+        char *pathname = strchr(line, '/');
+        if (!pathname) continue;
+
+        /* Remove trailing newline */
+        char *nl = strchr(pathname, '\n');
+        if (nl) *nl = '\0';
+
+        /* Skip if already probed */
+        if (is_path_already_probed(pathname)) continue;
+
+        /* Check library types */
+        if (strstr(pathname, "libssl.so") && !openssl_path[0]) {
+            safe_strcpy(openssl_path, sizeof(openssl_path), pathname);
+        } else if (strstr(pathname, "libgnutls.so") && !gnutls_path[0]) {
+            safe_strcpy(gnutls_path, sizeof(gnutls_path), pathname);
+        } else if (strstr(pathname, "libnspr4.so") && !nspr_path[0]) {
+            safe_strcpy(nspr_path, sizeof(nspr_path), pathname);
+        } else if (strstr(pathname, "libssl3.so") && !nss_ssl_path[0]) {
+            safe_strcpy(nss_ssl_path, sizeof(nss_ssl_path), pathname);
+        } else if (strstr(pathname, "libwolfssl.so") && !wolfssl_path[0]) {
+            safe_strcpy(wolfssl_path, sizeof(wolfssl_path), pathname);
+        }
+    }
+    fclose(f);
+
+    /* Attach probes to discovered libraries */
+    if (openssl_path[0] && !is_path_already_probed(openssl_path)) {
+        int attached = attach_openssl_probes(openssl_path, false);
+        if (attached > 0) {
+            mark_path_probed(openssl_path, LIB_OPENSSL);
+            total_attached += attached;
+            if (g_debug_mode) {
+                printf("  [DYNAMIC] Attached %d probes to OpenSSL: %s (PID %u)\n",
+                       attached, openssl_path, pid);
+            }
+        }
+    }
+
+    if (gnutls_path[0] && !is_path_already_probed(gnutls_path)) {
+        int attached = attach_gnutls_probes(gnutls_path);
+        if (attached > 0) {
+            mark_path_probed(gnutls_path, LIB_GNUTLS);
+            total_attached += attached;
+            if (g_debug_mode) {
+                printf("  [DYNAMIC] Attached %d probes to GnuTLS: %s (PID %u)\n",
+                       attached, gnutls_path, pid);
+            }
+        }
+    }
+
+    /* NSS requires both NSPR and SSL libraries */
+    if ((nspr_path[0] && !is_path_already_probed(nspr_path)) ||
+        (nss_ssl_path[0] && !is_path_already_probed(nss_ssl_path))) {
+        int attached = attach_nss_probes(
+            is_path_already_probed(nspr_path) ? NULL : nspr_path,
+            is_path_already_probed(nss_ssl_path) ? NULL : nss_ssl_path
+        );
+        if (attached > 0) {
+            if (nspr_path[0] && !is_path_already_probed(nspr_path)) {
+                mark_path_probed(nspr_path, LIB_NSS);
+            }
+            if (nss_ssl_path[0] && !is_path_already_probed(nss_ssl_path)) {
+                mark_path_probed(nss_ssl_path, LIB_NSS_SSL);
+            }
+            total_attached += attached;
+            if (g_debug_mode) {
+                printf("  [DYNAMIC] Attached %d probes to NSS (PID %u)\n",
+                       attached, pid);
+            }
+        }
+    }
+
+    if (wolfssl_path[0] && !is_path_already_probed(wolfssl_path)) {
+        int attached = attach_openssl_probes(wolfssl_path, true);
+        if (attached > 0) {
+            mark_path_probed(wolfssl_path, LIB_WOLFSSL);
+            total_attached += attached;
+            if (g_debug_mode) {
+                printf("  [DYNAMIC] Attached %d probes to WolfSSL: %s (PID %u)\n",
+                       attached, wolfssl_path, pid);
+            }
+        }
+    }
+
+    return total_attached;
+}
+
+/* Handle process exec event - scan for SSL libraries and attach probes */
+static void handle_process_exec_event(const ssl_data_event_t *event) {
+    /* Small delay to allow library loading to complete
+     * Libraries are loaded lazily after the process starts */
+    usleep(50000);  /* 50ms */
+
+    int attached = attach_probes_for_pid(event->pid);
+    if (attached > 0 && g_debug_mode) {
+        char proc_name[TASK_COMM_LEN] = {0};
+        get_process_name(event->pid, proc_name, sizeof(proc_name));
+        printf("  [DYNAMIC] Process %s (PID %u): attached %d probes\n",
+               proc_name[0] ? proc_name : event->comm, event->pid, attached);
+    }
+
+    /* Also check for BoringSSL binaries (Chrome, Chromium, Electron, etc.)
+     * Only if basic library scan found nothing (statically linked BoringSSL) */
+    if (attached == 0) {
+        /* Get the actual binary path via readlink */
+        char proc_exe[64];
+        char binary_path[512];
+        snprintf(proc_exe, sizeof(proc_exe), "/proc/%u/exe", event->pid);
+
+        ssize_t len = readlink(proc_exe, binary_path, sizeof(binary_path) - 1);
+        if (len <= 0) return;
+        binary_path[len] = '\0';
+
+        /* Check if already probed (fast path - avoids redundant scanning) */
+        if (is_path_already_probed(binary_path)) {
+            return;
+        }
+
+        /* Check binary size - skip small binaries (< 50MB unlikely to have BoringSSL) */
+        struct stat st;
+        if (stat(binary_path, &st) != 0 || st.st_size < 50 * 1024 * 1024) {
+            return;
+        }
+
+        /* Direct build ID lookup - fast path that only reads ELF headers
+         * Skip the slow binary_has_boringssl() signature scan since:
+         * 1. If build ID is in database, we know it has BoringSSL
+         * 2. If not in database, we can't attach probes anyway */
+        struct boringssl_offsets offsets = {0};
+        int scan_result = scan_binary_for_boringssl(binary_path, &offsets, false);
+
+        if (scan_result == 0 && offsets.found) {
+            /* Known BoringSSL binary - attach probes */
+            int probes = 0;
+
+            if (offsets.ssl_write_offset) {
+                if (bpf_loader_attach_uprobe_offset(&g_loader, binary_path,
+                        offsets.ssl_write_offset, "probe_ssl_rw_enter", false, g_debug_mode) == 0)
+                    probes++;
+                if (bpf_loader_attach_uprobe_offset(&g_loader, binary_path,
+                        offsets.ssl_write_offset, "probe_ssl_write_exit", true, g_debug_mode) == 0)
+                    probes++;
+            }
+
+            if (offsets.ssl_read_offset) {
+                if (bpf_loader_attach_uprobe_offset(&g_loader, binary_path,
+                        offsets.ssl_read_offset, "probe_ssl_rw_enter", false, g_debug_mode) == 0)
+                    probes++;
+                if (bpf_loader_attach_uprobe_offset(&g_loader, binary_path,
+                        offsets.ssl_read_offset, "probe_ssl_read_exit", true, g_debug_mode) == 0)
+                    probes++;
+            }
+
+            if (probes > 0) {
+                mark_path_probed(binary_path, LIB_BORINGSSL);
+                printf("  [DYNAMIC] %s✓%s BoringSSL: %s (%d probes)\n",
+                       display_color(C_GREEN), display_color(C_RESET),
+                       binary_path, probes);
+                if (offsets.version_info) {
+                    printf("      %s\n", offsets.version_info);
+                }
+            }
+        } else if (offsets.build_id[0] && g_debug_mode) {
+            /* Unknown build ID - log for debugging */
+            mark_path_probed(binary_path, LIB_BORINGSSL);  /* Don't rescan */
+            printf("  [DYNAMIC] Unknown BoringSSL build: %s (build_id=%s)\n",
+                   binary_path, offsets.build_id);
+        }
+    }
+}
+
+#ifdef HAVE_THREADING
+/* Process exec callback for threading mode - called directly by dispatcher */
+static void threading_process_exec_callback(const ssl_data_event_t *event, void *ctx) {
+    (void)ctx;
+    handle_process_exec_event(event);
+}
+#endif
+
 /* Master cleanup function registered with atexit() */
 static void cleanup_all_resources(void) {
 #ifdef HAVE_THREADING
@@ -349,6 +715,23 @@ static void cleanup_all_resources(void) {
     if (g_probe_initialized) {
         probe_handler_cleanup(&g_handler);
         g_probe_initialized = false;
+    }
+
+    /* Print SSL operation counter (debug: verify probes fire) */
+    if (g_bpf_initialized && g_debug_mode) {
+        struct bpf_object *obj = bpf_loader_get_object(&g_loader);
+        if (obj) {
+            struct bpf_map *map = bpf_object__find_map_by_name(obj, "ssl_op_counter");
+            if (map) {
+                int fd = bpf_map__fd(map);
+                uint32_t key = 0;
+                uint64_t counter = 0;
+                if (bpf_map_lookup_elem(fd, &key, &counter) == 0) {
+                    printf("\n=== SSL Probe Statistics ===\n");
+                    printf("Total SSL_read/SSL_write calls intercepted: %lu\n", counter);
+                }
+            }
+        }
     }
 
     /* Print XDP statistics before cleanup */
@@ -427,6 +810,12 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
     if (event->event_type == EVENT_PROCESS_EXIT) {
         http2_cleanup_pid(event->pid);
         cleanup_pending_bodies_pid(event->pid);
+        return;
+    }
+
+    /* Handle process exec events - dynamic probe attachment for new processes */
+    if (event->event_type == EVENT_PROCESS_EXEC) {
+        handle_process_exec_event(event);
         return;
     }
 
@@ -569,6 +958,12 @@ static void process_event(const ssl_data_event_t *event, void *ctx) {
 
     /* Check if we already have an active HTTP/2 session for this (PID, ssl_ctx) */
     bool has_h2 = http2_has_session(event->pid, event->ssl_ctx);
+    /* DEBUG: Always print H2 session processing */
+    if (has_h2) {
+        fprintf(stderr, "[H2-TRACK] existing session: pid=%u ssl=0x%llx type=%s len=%zu\n",
+                event->pid, (unsigned long long)event->ssl_ctx,
+                event->event_type == 0 ? "READ" : "WRITE", len);
+    }
     DEBUG_MAIN("PID=%u ssl_ctx=0x%llx has_h2_session=%d len=%zu",
                event->pid, (unsigned long long)event->ssl_ctx, has_h2, len);
     if (has_h2) {
@@ -1532,6 +1927,8 @@ int main(int argc, char **argv) {
 
     /* Load BPF program - try multiple paths */
     static const char *bpf_paths[] = {
+        "build-release/spliff.bpf.o",   /* Makefile release build */
+        "build-debug/spliff.bpf.o",     /* Makefile debug build */
         "build/spliff.bpf.o",           /* CMake build directory */
         "spliff.bpf.o",                 /* Current directory */
         "src/bpf/spliff.bpf.o",         /* Source directory (legacy) */
@@ -1634,6 +2031,19 @@ int main(int argc, char **argv) {
         /* SSL_free - cleanup session tracking when SSL connection is freed */
         bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_free",
                                 "probe_ssl_free", false, debug_mode);
+
+        /* SSL_read_ex / SSL_write_ex - OpenSSL 3.x extended variants
+         * Chrome and other modern applications use these instead of SSL_read/SSL_write */
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_read_ex",
+                                "probe_ssl_rw_ex_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_read_ex",
+                                "probe_ssl_read_ex_exit", true, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_write_ex",
+                                "probe_ssl_rw_ex_enter", false, debug_mode);
+        bpf_loader_attach_uprobe(&g_loader, openssl_path, "SSL_write_ex",
+                                "probe_ssl_write_ex_exit", true, debug_mode);
+        /* Mark as probed to prevent dynamic re-attachment */
+        mark_path_probed(openssl_path, LIB_OPENSSL);
     }
 
     if (gnutls_path[0]) {
@@ -1649,6 +2059,8 @@ int main(int argc, char **argv) {
         /* gnutls_deinit - cleanup session tracking when GnuTLS session is freed */
         bpf_loader_attach_uprobe(&g_loader, gnutls_path, "gnutls_deinit",
                                 "probe_gnutls_deinit", false, debug_mode);
+        /* Mark as probed to prevent dynamic re-attachment */
+        mark_path_probed(gnutls_path, LIB_GNUTLS);
     }
 
     if (nss_path[0]) {
@@ -1673,6 +2085,8 @@ int main(int argc, char **argv) {
         /* PR_Close - cleanup session tracking when PRFileDesc is closed */
         bpf_loader_attach_uprobe(&g_loader, nss_path, "PR_Close",
                                 "probe_pr_close", false, debug_mode);
+        /* Mark as probed to prevent dynamic re-attachment */
+        mark_path_probed(nss_path, LIB_NSS);
     }
 
     /* SSL_ImportFD - track verified SSL connections for IPC filtering
@@ -1681,6 +2095,8 @@ int main(int argc, char **argv) {
     if (nss_ssl_path[0]) {
         bpf_loader_attach_uprobe(&g_loader, nss_ssl_path, "SSL_ImportFD",
                                 "probe_ssl_import_fd_exit", true, debug_mode);
+        /* Mark as probed to prevent dynamic re-attachment */
+        mark_path_probed(nss_ssl_path, LIB_NSS_SSL);
     }
 
     /* Attach handshake probes if -H is set */
@@ -1719,6 +2135,8 @@ int main(int argc, char **argv) {
                                 "probe_ssl_rw_enter", false, debug_mode);
         bpf_loader_attach_uprobe(&g_loader, wolfssl_path, "wolfSSL_read",
                                 "probe_ssl_read_exit", true, debug_mode);
+        /* Mark as probed to prevent dynamic re-attachment */
+        mark_path_probed(wolfssl_path, LIB_WOLFSSL);
     }
 
     /* Attach ALPN protocol detection probes */
@@ -1749,12 +2167,158 @@ int main(int argc, char **argv) {
                                 "probe_wolfssl_alpn_exit", true, debug_mode);
     }
 
+    /* BoringSSL detection (EDR-style)
+     * Scan running processes for any binary with statically-linked BoringSSL.
+     * This detects Chrome, Chromium, Brave, Edge, Electron apps, or any other
+     * binary using BoringSSL - no hardcoded paths or names needed. */
+    int boringssl_found = bpf_loader_discover_boringssl(&discovery_result, 50, debug_mode);
+
+    if (discovery_result.boringssl_count > 0) {
+        printf("\n  BoringSSL Binaries (%d found, %d with known offsets):\n",
+               discovery_result.boringssl_count, boringssl_found);
+
+        for (int i = 0; i < discovery_result.boringssl_count; i++) {
+            discovered_boringssl_t *b = &discovery_result.boringssl[i];
+
+            if (!b->offsets_known) {
+                printf("  %s?%s %s\n",
+                       display_color(C_YELLOW), display_color(C_RESET), b->path);
+                printf("      Build ID: %s (unknown - add to offset database)\n", b->build_id);
+                continue;
+            }
+
+            printf("  %s✓%s %s\n",
+                   display_color(C_GREEN), display_color(C_RESET), b->path);
+            if (b->version_info) {
+                printf("      %s\n", b->version_info);
+            }
+            if (debug_mode) {
+                printf("      SSL_read: 0x%lx, SSL_write: 0x%lx\n",
+                       b->ssl_read_offset, b->ssl_write_offset);
+            }
+
+            /* Attach probes to internal functions
+             *
+             * IMPORTANT: From Ghidra decompilation of Chromium 143:
+             * - ssl_read_impl(SSL*) only takes SSL pointer - NO buf/len args!
+             * - DoPayloadWrite() takes NO args besides 'this' - buffer is internal
+             * - DoPayloadRead(this, span.data, span.size) - base::span by value
+             * - ReadIfReady(this, IOBuffer*, len, callback) - complex C++ ABI
+             *
+             * We ONLY use SSL_read/SSL_write as reliable hooks since they have
+             * stable 3-arg signatures: (SSL*, buf, len)
+             */
+
+            /* ssl_read_impl - DISABLED: only takes SSL*, no buffer args
+             * The probe would read garbage from RSI/RDX causing crashes */
+#if 0
+            if (b->ssl_read_impl_offset) {
+                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                    b->ssl_read_impl_offset, "probe_ssl_read_impl_enter", false, debug_mode);
+                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                    b->ssl_read_impl_offset, "probe_ssl_read_exit", true, debug_mode);
+            }
+#endif
+
+            /* DoPayloadWrite - DISABLED: no buffer arguments, can't capture data */
+#if 0
+            if (b->ssl_write_impl_offset) {
+                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                    b->ssl_write_impl_offset, "probe_do_payload_write_enter", false, debug_mode);
+                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                    b->ssl_write_impl_offset, "probe_ssl_write_exit", true, debug_mode);
+            }
+#endif
+
+            /* Async I/O hooks - DISABLED: complex C++ ABI, need more analysis */
+#if 0
+            if (b->socket_read_offset) {
+                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                    b->socket_read_offset, "probe_socket_read_enter", false, debug_mode);
+            }
+            if (b->on_read_ready_offset) {
+                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                    b->on_read_ready_offset, "probe_on_read_ready", false, debug_mode);
+            }
+#endif
+
+            /* DoPayloadRead - base::span passed by value (RSI=data, RDX=size)
+             * This one might work but disabled for safety until verified */
+#if 0
+            if (b->do_payload_read_offset) {
+                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                    b->do_payload_read_offset, "probe_do_payload_read_enter", false, debug_mode);
+            }
+#endif
+
+            /* Public API fallback hooks */
+            bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                b->ssl_write_offset, "probe_ssl_rw_enter", false, debug_mode);
+            bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                b->ssl_write_offset, "probe_ssl_write_exit", true, debug_mode);
+            bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                b->ssl_read_offset, "probe_ssl_rw_enter", false, debug_mode);
+            bpf_loader_attach_uprobe_offset(&g_loader, b->path,
+                b->ssl_read_offset, "probe_ssl_read_exit", true, debug_mode);
+        }
+        printf("\n");
+    }
+
+    /* Attach syscall tracepoints for SSL* → fd correlation
+     * This enables FD tracking for Chrome/BoringSSL and other libraries
+     * that don't use SSL_set_fd. The correlation works by detecting when
+     * a syscall (write/read/sendto/recvfrom) happens during an active
+     * SSL_read/SSL_write operation. */
+    int syscall_hooks = 0;
+    if (bpf_loader_attach_tracepoint(&g_loader, "syscalls", "sys_enter_write",
+                                      "trace_sys_enter_write", debug_mode) == 0) {
+        syscall_hooks++;
+    }
+    if (bpf_loader_attach_tracepoint(&g_loader, "syscalls", "sys_enter_read",
+                                      "trace_sys_enter_read", debug_mode) == 0) {
+        syscall_hooks++;
+    }
+    if (bpf_loader_attach_tracepoint(&g_loader, "syscalls", "sys_enter_sendto",
+                                      "trace_sys_enter_sendto", debug_mode) == 0) {
+        syscall_hooks++;
+    }
+    if (bpf_loader_attach_tracepoint(&g_loader, "syscalls", "sys_enter_recvfrom",
+                                      "trace_sys_enter_recvfrom", debug_mode) == 0) {
+        syscall_hooks++;
+    }
+    if (debug_mode && syscall_hooks > 0) {
+        printf("  [DEBUG] Attached %d syscall correlation hooks\n", syscall_hooks);
+    }
+
     /* Attach process exit tracepoint for session cleanup */
     if (bpf_loader_attach_tracepoint(&g_loader, "sched", "sched_process_exit",
                                       "handle_process_exit", debug_mode) == 0) {
         if (debug_mode) {
             printf("  [DEBUG] Process exit tracepoint attached\n");
         }
+    }
+
+    /* Attach process lifecycle tracepoints for dynamic SSL library detection
+     * - sched_process_exec: New process starts → check for SSL libraries
+     * - sched_process_fork: Process forks → inherit parent's SSL tracking
+     * This enables attaching probes to processes started AFTER spliff loads */
+    int lifecycle_hooks = 0;
+    if (bpf_loader_attach_tracepoint(&g_loader, "sched", "sched_process_exec",
+                                      "handle_process_exec", debug_mode) == 0) {
+        lifecycle_hooks++;
+        if (debug_mode) {
+            printf("  [DEBUG] Process exec tracepoint attached (dynamic SSL detection)\n");
+        }
+    }
+    if (bpf_loader_attach_tracepoint(&g_loader, "sched", "sched_process_fork",
+                                      "handle_process_fork", debug_mode) == 0) {
+        lifecycle_hooks++;
+        if (debug_mode) {
+            printf("  [DEBUG] Process fork tracepoint attached\n");
+        }
+    }
+    if (debug_mode && lifecycle_hooks > 0) {
+        printf("  [DEBUG] Dynamic process monitoring enabled (%d hooks)\n", lifecycle_hooks);
     }
 
     if (bpf_loader_get_link_count(&g_loader) == 0) {
@@ -1884,6 +2448,10 @@ int main(int argc, char **argv) {
                     display_color(C_RED), display_color(C_RESET));
             return 1;
         }
+
+        /* Register callback for dynamic SSL library detection (process exec events) */
+        dispatcher_set_lifecycle_callback(&g_threading.dispatcher,
+                                          threading_process_exec_callback, NULL);
 
         /* Main thread polls XDP ring buffer while workers handle uprobes */
         while (!g_exiting) {

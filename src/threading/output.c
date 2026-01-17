@@ -1,15 +1,36 @@
-/*
+/**
+ * @file output.c
+ * @brief Output thread implementation
+ *
+ * @details The output thread centralizes all formatted output from worker
+ * threads to prevent interleaved output to stdout/file.
+ *
+ * @par Responsibilities:
+ * - Collect formatted messages from all worker output queues
+ * - Serialize writes to prevent interleaving
+ * - Periodic and idle-triggered flushing
+ * - Clean drain on shutdown
+ *
+ * @par Collection Strategy:
+ * @code
+ *   Worker 0 ──┬── out_ring ──┐
+ *   Worker 1 ──┼── out_ring ──┼──► Output Thread ──► stdout/file
+ *   Worker N ──┴── out_ring ──┘
+ *              round-robin poll
+ * @endcode
+ *
+ * @par Flow:
+ * 1. Round-robin poll each worker's out_ring
+ * 2. Dequeue up to BATCH_SIZE messages per worker per iteration
+ * 3. Write to output file
+ * 4. Return message to worker's output pool
+ * 5. Flush periodically or when idle
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * output.c - Output thread implementation
- *
- * The output thread:
- * - Collects formatted output from all worker threads
- * - Serializes output to stdout (or file) to prevent interleaving
- * - Round-robin polls worker output rings
  */
 
 #include "threading.h"
@@ -21,12 +42,17 @@
 #include <unistd.h>
 #include <time.h>
 
-/* ============================================================================
- * Output Initialization
- * ============================================================================ */
+/**
+ * @defgroup output_init Output Initialization
+ * @brief Setup and teardown for output thread
+ * @{
+ */
 
-/*
- * Initialize output context
+/**
+ * @brief Initialize output context
+ *
+ * Sets up the output thread context with references to worker queues
+ * and output destination.
  */
 int output_init(output_ctx_t *ctx, worker_ctx_t *workers, int num_workers,
                 FILE *output_file) {
@@ -46,8 +72,11 @@ int output_init(output_ctx_t *ctx, worker_ctx_t *workers, int num_workers,
     return 0;
 }
 
-/*
- * Cleanup output context
+/**
+ * @brief Cleanup output context
+ *
+ * Flushes output file and clears context. Does not close the file
+ * (caller's responsibility if not stdout).
  */
 void output_cleanup(output_ctx_t *ctx) {
     if (!ctx) {
@@ -63,13 +92,25 @@ void output_cleanup(output_ctx_t *ctx) {
     ctx->num_workers = 0;
 }
 
-/* ============================================================================
- * Output Thread
- * ============================================================================ */
+/** @} */ /* end output_init */
 
-/*
- * Collect and write output messages from all workers
- * Returns number of messages written
+/**
+ * @defgroup output_thread Output Thread Loop
+ * @brief Main output thread implementation
+ * @{
+ */
+
+/**
+ * @brief Collect and write output messages from all workers
+ *
+ * Performs one round-robin pass through all worker output queues,
+ * dequeueing up to BATCH_SIZE messages per worker.
+ *
+ * @param[in] ctx Output context
+ *
+ * @return Number of messages written this iteration
+ *
+ * @note Messages are returned to worker's output_pool after writing
  */
 static int collect_and_write_output(output_ctx_t *ctx) {
     int written = 0;
@@ -104,8 +145,19 @@ static int collect_and_write_output(output_ctx_t *ctx) {
     return written;
 }
 
-/*
- * Output thread entry point
+/**
+ * @brief Output thread entry point
+ *
+ * Main loop for the output thread:
+ * 1. Collect messages from all worker output queues
+ * 2. Write to output file
+ * 3. Flush periodically (every 100 iterations or when idle)
+ * 4. Sleep 1ms when idle to avoid busy-spinning
+ * 5. On shutdown, drain remaining messages before exiting
+ *
+ * @param[in] arg Pointer to output_ctx_t
+ *
+ * @return NULL
  */
 void *output_thread_main(void *arg) {
     output_ctx_t *ctx = (output_ctx_t *)arg;
@@ -159,13 +211,23 @@ void *output_thread_main(void *arg) {
     return NULL;
 }
 
-/* ============================================================================
- * Output Helpers
- * ============================================================================ */
+/** @} */ /* end output_thread */
 
-/*
- * Allocate output message from worker's pool and format into it
- * Returns NULL if pool is empty
+/**
+ * @defgroup output_helpers Output Helpers
+ * @brief Worker functions for enqueueing formatted output
+ * @{
+ */
+
+/**
+ * @brief Allocate output message from worker's pool
+ *
+ * Allocates a message and initializes timestamp and worker_id.
+ * Caller should fill in msg->data and msg->len, then call output_enqueue().
+ *
+ * @param[in] worker Worker context
+ *
+ * @return Message pointer, or NULL if pool exhausted
  */
 output_msg_t *output_alloc(worker_ctx_t *worker) {
     if (!worker) {
@@ -183,9 +245,16 @@ output_msg_t *output_alloc(worker_ctx_t *worker) {
     return msg;
 }
 
-/*
- * Enqueue output message to output thread
- * Returns 0 on success, -1 on failure (queue full)
+/**
+ * @brief Enqueue output message to output thread
+ *
+ * Transfers ownership of the message to the output thread.
+ * On failure (queue full), the message is freed back to the pool.
+ *
+ * @param[in] worker Worker context
+ * @param[in] msg    Message to enqueue (ownership transferred)
+ *
+ * @return 0 on success, -1 if queue full
  */
 int output_enqueue(worker_ctx_t *worker, output_msg_t *msg) {
     if (!worker || !msg) {
@@ -201,8 +270,17 @@ int output_enqueue(worker_ctx_t *worker, output_msg_t *msg) {
     return 0;
 }
 
-/*
- * Format and enqueue a simple string message
+/**
+ * @brief Format and enqueue output message (printf-style)
+ *
+ * Convenience function that combines output_alloc(), vsnprintf(),
+ * and output_enqueue(). Suitable for simple formatted output.
+ *
+ * @param[in] worker Worker context
+ * @param[in] fmt    printf format string
+ * @param[in] ...    Format arguments
+ *
+ * @return 0 on success, -1 on allocation or enqueue failure
  */
 int output_write(worker_ctx_t *worker, const char *fmt, ...) {
     if (!worker || !fmt) {
@@ -228,12 +306,19 @@ int output_write(worker_ctx_t *worker, const char *fmt, ...) {
     return output_enqueue(worker, msg);
 }
 
-/* ============================================================================
- * Statistics
- * ============================================================================ */
+/** @} */ /* end output_helpers */
 
-/*
- * Get output statistics
+/**
+ * @defgroup output_stats Output Statistics
+ * @brief Output thread statistics accessors
+ * @{
+ */
+
+/**
+ * @brief Get output statistics
+ *
+ * Returns atomic counters for messages and bytes written.
+ * All output parameters are optional (pass NULL to skip).
  */
 void output_get_stats(output_ctx_t *ctx, uint64_t *messages, uint64_t *bytes) {
     if (!ctx) {
@@ -245,3 +330,5 @@ void output_get_stats(output_ctx_t *ctx, uint64_t *messages, uint64_t *bytes) {
     if (messages) *messages = atomic_load(&ctx->messages_written);
     if (bytes) *bytes = atomic_load(&ctx->bytes_written);
 }
+
+/** @} */ /* end output_stats */

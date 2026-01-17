@@ -265,8 +265,9 @@ static bool should_display(probe_handler_t *handler, const ssl_data_event_t *e) 
 
     if (!passes) return false;
 
-    /* Handshake and ALPN events have no buffer data - always pass through */
-    if (e->event_type == EVENT_HANDSHAKE || e->event_type == EVENT_ALPN) return true;
+    /* Handshake, ALPN, and process lifecycle events have no buffer data - always pass through */
+    if (e->event_type == EVENT_HANDSHAKE || e->event_type == EVENT_ALPN ||
+        e->event_type == EVENT_PROCESS_EXEC || e->event_type == EVENT_PROCESS_EXIT) return true;
 
     /* Filter truly internal threads (non-HTTP traffic like file cache) */
     if (e->buf_filled <= 1) return false;

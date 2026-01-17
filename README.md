@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.8.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -13,7 +13,8 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 ## Features
 
 ### SSL/TLS Library Support
-- **OpenSSL** / **BoringSSL**: `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex`, `SSL_connect`
+- **OpenSSL**: `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex`, `SSL_connect`
+- **BoringSSL** ⚠️: Experimental support for Chrome/Chromium/Brave/Edge (see [Known Limitations](#known-limitations))
 - **GnuTLS**: `gnutls_record_recv`, `gnutls_record_send`, `gnutls_handshake`
 - **NSS/NSPR**: `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send`, `SSL_ForceHandshake`
 - **WolfSSL**: `wolfSSL_read`, `wolfSSL_write`
@@ -31,6 +32,13 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **sock_ops Cookie Caching**: "Golden Thread" correlation between packets and SSL sessions
 - **Connection Warm-up**: Seeds existing TCP connections at startup via netlink SOCK_DIAG
 - **XDP Statistics**: Debug-mode metrics (packets, flows, gatekeeper hits)
+
+### Dynamic Process Monitoring (v0.9.0+)
+- **EDR-Style Process Scanning**: Discovers SSL libraries in running processes via `/proc/PID/maps`
+- **Runtime Browser Detection**: Detects Chrome/Chromium/Brave/Edge at startup (experimental)
+- **BoringSSL Binary Scanning**: Heuristic function offset detection for stripped binaries
+- **Process Lifecycle Events**: BPF tracepoints for `sched_process_exec` and `sched_process_fork`
+- **Deduplication**: Path-based caching prevents duplicate probe attachment
 
 ### BPF-Level Filtering (v0.7.0+)
 - **Socket Family Detection**: Filters AF_UNIX (IPC) at kernel level
@@ -113,10 +121,29 @@ sudo make install
 | `make release` | Optimized, stripped binary |
 | `make relsan` | Optimized with sanitizers (for testing) |
 | `make test` | Build and run tests |
+| `make docs` | Generate Doxygen API documentation |
 | `make clean` | Remove build artifacts |
 | `make install` | Install to /usr/local/bin |
 | `make package-deb` | Create Debian package |
 | `make package-rpm` | Create RPM package |
+
+### API Documentation
+
+Generate comprehensive API documentation with Doxygen:
+
+```bash
+# Generate HTML documentation
+make docs
+
+# View documentation
+xdg-open build/docs/html/index.html
+```
+
+Documentation includes:
+- Architecture overview with ASCII diagrams
+- Thread model and data flow documentation
+- Lock-free data structure explanations
+- Per-module API reference with parameters and return values
 
 ### CMake Options
 
@@ -357,14 +384,15 @@ spliff/
 | v0.5.x | HTTP/1.1 + HTTP/2 + Multi-library support | ✅ Complete |
 | v0.6.x | Multi-threaded event processing | ✅ Complete |
 | v0.7.x | BPF-level IPC filtering + Unified display | ✅ Complete |
-| v0.8.x | XDP packet-level flow tracking + sock_ops | ✅ **Current** |
-| v0.9.0 | PCRE2-JIT pattern matching for plain HTTP | 🔄 Next |
-| v0.10.0 | HTTP/3 + QUIC protocol support | Planned |
+| v0.8.x | XDP packet-level flow tracking + sock_ops | ✅ Complete |
+| v0.9.x | Dynamic process monitoring + Doxygen docs + BoringSSL detection | ✅ **Current** |
+| v0.10.0 | PCRE2-JIT pattern matching for plain HTTP | 🔄 Next |
+| v0.11.0 | HTTP/3 + QUIC protocol support | Planned |
 | v1.0.0 | WebSocket support + Enhanced display | Planned |
 | v1.1.0 | EDR agent mode + Event streaming (NATS/Kafka) | Planned |
 | v1.2.0 | Behavioral analysis + Threat detection | Planned |
 
-### Near-Term Goals (v0.9.x - v1.0)
+### Near-Term Goals (v0.10.x - v1.0)
 - **PCRE2-JIT Integration**: Pattern matching for ambiguous traffic classification
 - **Plain HTTP Capture**: XDP payload extraction for unencrypted traffic
 - **WebSocket Support**: Frame parsing and message reconstruction
@@ -381,11 +409,18 @@ See [docs/](docs/) for detailed implementation plans.
 
 ## Known Limitations
 
+- **⚠️ Chrome/Chromium Support (Experimental)**: Support for Chrome, Chromium, Brave, and Edge browsers is **experimental and may be flaky**. These browsers use statically-linked BoringSSL with stripped debug symbols, making function offset detection unreliable:
+  - Offsets vary between browser versions, builds, and distributions
+  - No stable ABI - Google frequently changes internal structures
+  - Detection relies on heuristic binary scanning that may fail or cause crashes
+  - Recommended: Use Firefox (NSS) for reliable browser traffic capture
+  - If Chrome capture is needed, expect occasional missed traffic or instability
+
 - **HTTP/2 Mid-Stream Capture**: Joining existing HTTP/2 connections may cause HPACK decode errors for first few responses (dynamic table not synchronized). Recovery is automatic.
 - **Multiple TLS Handshakes**: Some clients (e.g., curl) perform multiple TLS connections (initial + session resumption). Both handshakes are displayed when using `-H`.
 - **NSS Library Detection**: Firefox and other NSS applications may use multiple NSPR layers. BPF-level filtering ensures only SSL traffic is captured.
-- **Plain HTTP Capture**: Currently only captures TLS-encrypted traffic. Plain HTTP via XDP requires PCRE2-JIT classification (planned for v0.9.0).
-- **QUIC/HTTP/3**: Not yet supported (planned for v0.10.0)
+- **Plain HTTP Capture**: Currently only captures TLS-encrypted traffic. Plain HTTP via XDP requires PCRE2-JIT classification (planned for v0.10.0).
+- **QUIC/HTTP/3**: Not yet supported (planned for v0.11.0)
 - **IPv6 XDP Correlation**: XDP flow tracking uses XOR-hashed IPv6 addresses; socket cookie correlation is optimized for IPv4.
 - **XDP Native Mode**: Some network drivers don't support XDP native mode; spliff automatically falls back to SKB mode.
 - **Kernel Requirements**: Requires Linux 5.x+ with BTF support (`CONFIG_DEBUG_INFO_BTF=y`)

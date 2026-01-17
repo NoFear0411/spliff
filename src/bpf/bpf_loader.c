@@ -18,12 +18,15 @@
  */
 
 #include "bpf_loader.h"
+#include "binary_scanner.h"
+#include "boringssl_offsets.h"
 #include "../include/spliff.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <errno.h>
 #include <dirent.h>
 #include <ctype.h>
@@ -152,20 +155,22 @@ int bpf_loader_find_library(const char *name, char *path, size_t size) {
 
 /* Library name patterns for dynamic discovery */
 static const char *lib_patterns[] = {
-    [LIB_OPENSSL] = "libssl.so",
-    [LIB_GNUTLS]  = "libgnutls.so",
-    [LIB_NSS]     = "libnspr4.so",
-    [LIB_NSS_SSL] = "libssl3.so",
-    [LIB_WOLFSSL] = "libwolfssl.so",
+    [LIB_OPENSSL]   = "libssl.so",
+    [LIB_GNUTLS]    = "libgnutls.so",
+    [LIB_NSS]       = "libnspr4.so",
+    [LIB_NSS_SSL]   = "libssl3.so",
+    [LIB_WOLFSSL]   = "libwolfssl.so",
+    [LIB_BORINGSSL] = NULL,  /* Statically linked - no library pattern */
 };
 
 /* Library type names for display */
 static const char *lib_type_names[] = {
-    [LIB_OPENSSL] = "OpenSSL",
-    [LIB_GNUTLS]  = "GnuTLS",
-    [LIB_NSS]     = "NSS",
-    [LIB_NSS_SSL] = "NSS-SSL",
-    [LIB_WOLFSSL] = "WolfSSL",
+    [LIB_OPENSSL]   = "OpenSSL",
+    [LIB_GNUTLS]    = "GnuTLS",
+    [LIB_NSS]       = "NSS",
+    [LIB_NSS_SSL]   = "NSS-SSL",
+    [LIB_WOLFSSL]   = "WolfSSL",
+    [LIB_BORINGSSL] = "BoringSSL",
 };
 
 /* Get library type name */
@@ -179,7 +184,7 @@ const char *bpf_loader_lib_type_name(lib_type_t type) {
 /* Check if path matches a library pattern and return type */
 static int match_library_pattern(const char *path, lib_type_t *out_type) {
     for (int i = 0; i < LIB_TYPE_COUNT; i++) {
-        if (strstr(path, lib_patterns[i]) != NULL) {
+        if (lib_patterns[i] && strstr(path, lib_patterns[i]) != NULL) {
             *out_type = (lib_type_t)i;
             return 0;
         }
@@ -377,6 +382,169 @@ void bpf_loader_print_discovery(const lib_discovery_result_t *result) {
     printf("\n");
 }
 
+/* Track scanned paths to avoid duplicate scanning */
+#define MAX_SCANNED_PATHS 256
+static char scanned_paths[MAX_SCANNED_PATHS][512];
+static int scanned_path_count = 0;
+
+static bool path_already_scanned(const char *path) {
+    for (int i = 0; i < scanned_path_count; i++) {
+        if (strcmp(scanned_paths[i], path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void mark_path_scanned(const char *path) {
+    if (scanned_path_count < MAX_SCANNED_PATHS) {
+        snprintf(scanned_paths[scanned_path_count], sizeof(scanned_paths[0]), "%s", path);
+        scanned_path_count++;
+    }
+}
+
+/* Check if a binary path is already tracked in BoringSSL discovery results */
+static bool boringssl_path_tracked(lib_discovery_result_t *result, const char *path) {
+    for (int i = 0; i < result->boringssl_count; i++) {
+        if (strcmp(result->boringssl[i].path, path) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Discover BoringSSL binaries from running processes (EDR-style detection) */
+int bpf_loader_discover_boringssl(lib_discovery_result_t *result,
+                                   uint64_t min_size_mb, bool debug) {
+    if (!result) return -1;
+
+    /* Reset BoringSSL discovery state */
+    memset(result->boringssl, 0, sizeof(result->boringssl));
+    result->boringssl_count = 0;
+
+    /* Reset scanned paths tracker */
+    scanned_path_count = 0;
+
+    uint64_t min_size_bytes = min_size_mb * 1024 * 1024;
+
+    DIR *proc = opendir("/proc");
+    if (!proc) return -1;
+
+    int known_count = 0;
+    struct dirent *dir_entry;
+
+    while ((dir_entry = readdir(proc)) != NULL) {
+        /* Skip non-numeric entries */
+        if (!isdigit((unsigned char)dir_entry->d_name[0])) continue;
+
+        char *endptr;
+        long pid_long = strtol(dir_entry->d_name, &endptr, 10);
+        if (*endptr != '\0' || pid_long <= 0 || pid_long > INT_MAX) continue;
+        int pid = (int)pid_long;
+
+        /* Read /proc/PID/exe to get binary path */
+        char exe_link[64];
+        char exe_path[512];
+        snprintf(exe_link, sizeof(exe_link), "/proc/%d/exe", pid);
+
+        ssize_t len = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
+        if (len <= 0) continue;
+        exe_path[len] = '\0';
+
+        /* Skip deleted binaries (shows as "path (deleted)") */
+        if (strstr(exe_path, "(deleted)") != NULL) continue;
+
+        /* Skip if already scanned (avoids duplicate scanning) */
+        if (path_already_scanned(exe_path)) {
+            /* If it's a known BoringSSL binary, increment process count */
+            if (boringssl_path_tracked(result, exe_path)) {
+                for (int i = 0; i < result->boringssl_count; i++) {
+                    if (strcmp(result->boringssl[i].path, exe_path) == 0) {
+                        result->boringssl[i].process_count++;
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        /* Mark as scanned BEFORE checking size/content (prevents rescanning) */
+        mark_path_scanned(exe_path);
+
+        /* Check binary size (performance filter) */
+        struct stat st;
+        if (stat(exe_path, &st) != 0) continue;
+        uint64_t binary_size = (uint64_t)st.st_size;
+
+        if (min_size_bytes > 0 && binary_size < min_size_bytes) continue;
+
+        if (debug) {
+            fprintf(stderr, "[boringssl] Scanning: %s (%.1f MB)\n",
+                    exe_path, binary_size / (1024.0 * 1024.0));
+        }
+
+        /* Check for BoringSSL signature in binary */
+        if (!binary_has_boringssl(exe_path)) {
+            if (debug && binary_size > 100 * 1024 * 1024) {
+                /* Log large binaries that don't have BoringSSL for debugging */
+                fprintf(stderr, "[boringssl]   No BoringSSL signature (skipped)\n");
+            }
+            continue;
+        }
+
+        if (debug) {
+            fprintf(stderr, "[boringssl]   BoringSSL signature found\n");
+        }
+
+        /* Scan binary for offsets using build ID lookup */
+        struct boringssl_offsets offsets;
+        int scan_result = scan_binary_for_boringssl(exe_path, &offsets, debug);
+
+        /* Add to discovery results */
+        if (result->boringssl_count >= MAX_BORINGSSL_BINARIES) {
+            if (debug) {
+                fprintf(stderr, "[boringssl] Max binaries reached, skipping %s\n", exe_path);
+            }
+            continue;
+        }
+
+        discovered_boringssl_t *out = &result->boringssl[result->boringssl_count];
+        snprintf(out->path, sizeof(out->path), "%s", exe_path);
+        snprintf(out->build_id, sizeof(out->build_id), "%s", offsets.build_id);
+        out->binary_size = binary_size;
+        out->process_count = 1;
+
+        if (scan_result == 0 && offsets.found) {
+            out->offsets_known = true;
+            out->ssl_read_offset = offsets.ssl_read_offset;
+            out->ssl_write_offset = offsets.ssl_write_offset;
+            out->ssl_read_impl_offset = offsets.ssl_read_impl_offset;
+            out->ssl_write_impl_offset = offsets.ssl_write_impl_offset;
+            out->do_payload_read_offset = offsets.do_payload_read_offset;
+            out->socket_read_offset = offsets.socket_read_offset;
+            out->on_read_ready_offset = offsets.on_read_ready_offset;
+            out->version_info = offsets.version_info;
+            known_count++;
+
+            if (debug) {
+                fprintf(stderr, "[boringssl]   Matched: %s (build %s)\n",
+                        out->version_info ? out->version_info : "unknown",
+                        out->build_id);
+            }
+        } else {
+            out->offsets_known = false;
+            if (debug) {
+                fprintf(stderr, "[boringssl]   Unknown build ID: %s\n", out->build_id);
+            }
+        }
+
+        result->boringssl_count++;
+    }
+
+    closedir(proc);
+    return known_count;
+}
+
 /* Find library with dynamic discovery fallback */
 int bpf_loader_find_library_dynamic(const char *name, char *path, size_t size,
                                      const int *pids, int pid_count) {
@@ -423,7 +591,7 @@ int bpf_loader_attach_uprobe(bpf_loader_t *loader, const char *lib,
 
     LIBBPF_OPTS(bpf_uprobe_opts, opts, .func_name = sym, .retprobe = is_ret);
 
-    if (loader->link_count >= MAX_LINKS) return -1;
+    if (loader->link_count >= SPLIFF_MAX_LINKS) return -1;
 
     loader->links[loader->link_count] = bpf_program__attach_uprobe_opts(prog, -1, lib, 0, &opts);
 
@@ -442,6 +610,56 @@ int bpf_loader_attach_uprobe(bpf_loader_t *loader, const char *lib,
     return -1;
 }
 
+/* Attach uprobe by file offset (for stripped binaries) */
+int bpf_loader_attach_uprobe_offset(bpf_loader_t *loader, const char *binary,
+                                     uint64_t offset, const char *prog_name,
+                                     bool is_ret, bool debug) {
+    if (!loader || !loader->obj || !binary || !prog_name || offset == 0)
+        return -1;
+
+    struct bpf_program *prog = bpf_object__find_program_by_name(loader->obj, prog_name);
+    if (!prog) {
+        if (debug) {
+            DEBUG_LOG("Program '%s' not found in BPF object", prog_name);
+        }
+        return -1;
+    }
+
+    /* For offset-based attachment, set func_name to NULL and use offset */
+    LIBBPF_OPTS(bpf_uprobe_opts, opts,
+        .func_name = NULL,
+        .retprobe = is_ret
+    );
+
+    if (loader->link_count >= SPLIFF_MAX_LINKS) {
+        if (debug) {
+            DEBUG_LOG("Maximum link count reached");
+        }
+        return -1;
+    }
+
+    /* Attach with pid=-1 to capture all processes using this binary */
+    loader->links[loader->link_count] = bpf_program__attach_uprobe_opts(
+        prog, -1, binary, offset, &opts);
+
+    if (!libbpf_get_error(loader->links[loader->link_count])) {
+        if (debug) {
+            printf("  [DEBUG] Attached %s:0x%lx → %s%s\n",
+                   binary, offset, prog_name, is_ret ? " (ret)" : "");
+        }
+        loader->link_count++;
+        return 0;
+    }
+
+    long err = libbpf_get_error(loader->links[loader->link_count]);
+    /* Always print this error - uprobe offset attachment failures need visibility */
+    fprintf(stderr, "  [ERROR] Failed to attach uprobe %s:0x%lx → %s (errno: %ld - %s)\n",
+            binary, offset, prog_name, -err, strerror((int)-err));
+    loader->links[loader->link_count] = NULL;
+    (void)debug;
+    return -1;
+}
+
 /* Attach tracepoint */
 int bpf_loader_attach_tracepoint(bpf_loader_t *loader, const char *category,
                                   const char *name, const char *prog_name,
@@ -456,7 +674,7 @@ int bpf_loader_attach_tracepoint(bpf_loader_t *loader, const char *category,
         return -1;
     }
 
-    if (loader->link_count >= MAX_LINKS) return -1;
+    if (loader->link_count >= SPLIFF_MAX_LINKS) return -1;
 
     loader->links[loader->link_count] = bpf_program__attach_tracepoint(prog, category, name);
 
@@ -513,7 +731,7 @@ void bpf_loader_cleanup(bpf_loader_t *loader) {
     loader->xdp.enabled = false;
 
     /* Close all links */
-    for (int i = 0; i < MAX_LINKS; i++) {
+    for (int i = 0; i < SPLIFF_MAX_LINKS; i++) {
         if (loader->links[i]) {
             bpf_link__destroy(loader->links[i]);
             loader->links[i] = NULL;
