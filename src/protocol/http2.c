@@ -1,20 +1,55 @@
-/*
+/**
+ * @file http2.c
+ * @brief HTTP/2 protocol parser implementation using nghttp2
+ *
+ * @details This module implements HTTP/2 frame parsing and session management
+ * using the nghttp2 library. It handles the complexities of HTTP/2's binary
+ * framing layer, HPACK header compression, and stream multiplexing.
+ *
+ * @par Architecture Overview:
+ * @code
+ *   SSL data (from BPF)
+ *         │
+ *         ▼
+ *   http2_process_frame()
+ *         │
+ *         ├─── Get/create h2_session_t for (pid, ssl_ctx)
+ *         │
+ *         ├─── Feed to nghttp2_session (server-side parser)
+ *         │         │
+ *         │         └── Callbacks: on_header, on_data, on_frame_recv
+ *         │
+ *         └─── Manual HPACK decoding for response headers
+ *                    │
+ *                    └── hd_inflate_hd() for each HEADERS frame
+ * @endcode
+ *
+ * @par Why Server-Side Session?
+ * nghttp2 provides client-side and server-side session types. For passively
+ * sniffing traffic, we use a server-side session to parse incoming data.
+ * This is because:
+ * - Server sessions parse client->server data (requests)
+ * - For responses (server->client), we use manual HPACK decoding
+ *
+ * @par Stream Management:
+ * Streams are tracked in a global array keyed by (pid, ssl_ctx, stream_id).
+ * Each stream maintains:
+ * - Request metadata (:method, :path, :authority)
+ * - Response metadata (:status, headers)
+ * - Body accumulation buffer
+ * - Timing information for latency calculation
+ *
+ * @par Mid-Stream Join Handling:
+ * When spliff attaches to an already-active HTTP/2 connection, HPACK
+ * decompression may fail due to missing dynamic table state. The module
+ * marks such streams with hpack_decode_failed and attempts fallback
+ * parsing for subsequent frames.
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, version 3 of the License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "http2.h"
@@ -32,10 +67,21 @@
 #include <unistd.h>
 #include <libgen.h>
 
-/*
- * Get real process name from /proc/PID/exe (not thread name).
- * For threaded processes like Firefox, /proc/PID/comm gives thread name
- * (e.g., "Socket Thread"), but /proc/PID/exe gives the actual executable.
+/**
+ * @brief Get real process name from /proc filesystem
+ *
+ * Reads /proc/PID/exe symlink to get the actual executable name.
+ * For threaded processes, /proc/PID/comm gives thread name (e.g.,
+ * "Socket Thread" for Firefox), but /proc/PID/exe gives the actual
+ * executable ("firefox").
+ *
+ * @param[in]  pid     Process ID
+ * @param[out] buf     Output buffer for process name
+ * @param[in]  bufsize Buffer capacity
+ *
+ * @note Handles " (deleted)" suffix for processes that have exited
+ *
+ * @internal
  */
 static void h2_get_process_name(uint32_t pid, char *buf, size_t bufsize) {
     char path[64];
@@ -71,28 +117,49 @@ static void h2_get_process_name(uint32_t pid, char *buf, size_t bufsize) {
     }
 }
 
-/* Forward declarations */
+/* Forward declarations for display functions */
 static void h2_display_request(h2_stream_t *stream);
 static void h2_display_response(h2_stream_t *stream);
 static void h2_display_body(h2_stream_t *stream, direction_t dir);
 
-/* Session direction - nghttp2 requires different parsers */
+/**
+ * @brief HTTP/2 parsing direction
+ *
+ * nghttp2 requires separate sessions for parsing client vs server data.
+ * This enum identifies which direction a session parses.
+ *
+ * @internal
+ */
 typedef enum {
-    H2_DIR_CLIENT = 0,  /* Parses server->client data (responses) */
-    H2_DIR_SERVER = 1   /* Parses client->server data (requests) */
+    H2_DIR_CLIENT = 0,  /**< Parses server→client data (responses) */
+    H2_DIR_SERVER = 1   /**< Parses client→server data (requests) */
 } h2_dir_t;
 
 /* Forward declaration */
 typedef struct h2_callback_ctx h2_callback_ctx_t;
 
-/* Response reassembly buffer size */
+/**
+ * @brief Response reassembly buffer size
+ *
+ * Used for buffering incomplete HTTP/2 frames across multiple
+ * SSL_read calls.
+ *
+ * @internal
+ */
 #define H2_REASSEMBLY_BUF_SIZE 65536
 
-/* Per-connection HTTP/2 session state */
+/**
+ * @brief Per-connection HTTP/2 session state
+ *
+ * Maintains nghttp2 session and HPACK inflater for a single
+ * HTTP/2 connection identified by (pid, ssl_ctx) tuple.
+ *
+ * @internal
+ */
 typedef struct {
-    uint32_t pid;
-    uint64_t ssl_ctx;        /* SSL context pointer for connection tracking */
-    bool active;
+    uint32_t pid;            /**< Process ID owning connection */
+    uint64_t ssl_ctx;        /**< SSL context for connection disambiguation */
+    bool active;             /**< True if session slot is in use */
 
     /* nghttp2 server session for parsing requests */
     nghttp2_session *server_session;
@@ -544,6 +611,9 @@ static int on_error_callback(nghttp2_session *session,
 
 /* Display functions */
 static void h2_display_request(h2_stream_t *stream) {
+    /* DEBUG: Always log request display */
+    fprintf(stderr, "[H2-REQ] displaying: stream=%d method='%s' authority='%s' path='%s'\n",
+            stream->stream_id, stream->method, stream->authority, stream->path);
     DEBUG_H2("h2_display_request: stream=%d method='%s' path='%s' authority='%s'",
              stream->stream_id, stream->method, stream->path, stream->authority);
 
@@ -592,10 +662,36 @@ static void h2_display_response(h2_stream_t *stream) {
     DEBUG_H2("h2_display_response: stream=%d status=%d content_type='%s'",
              stream->stream_id, stream->status_code, stream->content_type);
 
-    /* Skip displaying if status is 0 (indicates HPACK decode failure) */
+    /*
+     * Handle HPACK decode failures - show partial info instead of dropping entirely.
+     * This happens when joining HTTP/2 connections mid-stream (e.g., Chrome connection reuse).
+     * The HPACK dynamic table wasn't built from connection start, so we can't decode headers.
+     */
     if (stream->status_code == 0) {
-        DEBUG_H2("Skipping display of stream %d with status=0 (decode failure)",
-                 stream->stream_id);
+        /* Still show something useful for visibility */
+        char time_str[16];
+        time_t now = time(NULL);
+        struct tm *tm = localtime(&now);
+        strftime(time_str, sizeof(time_str), "%H:%M:%S", tm);
+
+        /* Use request info if available (we may have captured it earlier) */
+        if (stream->method[0] && stream->authority[0]) {
+            printf("%s ← [HPACK decode error] %s://%s%s stream:%d %s (%u)\n",
+                   time_str,
+                   stream->scheme[0] ? stream->scheme : "https",
+                   stream->authority,
+                   stream->path[0] ? stream->path : "/",
+                   stream->stream_id,
+                   stream->comm[0] ? stream->comm : "unknown",
+                   stream->pid);
+        } else {
+            printf("%s ← [HPACK decode error] stream:%d %s (%u)\n",
+                   time_str,
+                   stream->stream_id,
+                   stream->comm[0] ? stream->comm : "unknown",
+                   stream->pid);
+        }
+        fflush(stdout);
         return;
     }
 
@@ -941,6 +1037,171 @@ const char *http2_get_alpn(uint32_t pid, uint64_t ssl_ctx) {
     return "";
 }
 
+/* ============================================================================
+ * HPACK Fallback Parser
+ *
+ * When HPACK dynamic table decoding fails (mid-stream join), this parser
+ * scans raw header data for recognizable patterns. It extracts:
+ *   - Status codes from :status pseudo-headers
+ *   - Literal header values (ASCII strings)
+ *   - Recognizable HTTP patterns (methods, paths, content-types)
+ *
+ * This provides partial visibility into HTTP/2 traffic even when we can't
+ * fully decode the HPACK-compressed headers.
+ * ============================================================================
+ */
+
+/* Extract printable ASCII string from position, return length */
+static size_t extract_ascii_string(const uint8_t *data, size_t len,
+                                    char *out, size_t out_size) {
+    size_t extracted = 0;
+    for (size_t i = 0; i < len && extracted < out_size - 1; i++) {
+        uint8_t c = data[i];
+        /* Printable ASCII (excluding control chars) */
+        if (c >= 0x20 && c <= 0x7e) {
+            out[extracted++] = (char)c;
+        } else if (extracted > 0) {
+            /* Stop at first non-printable after collecting some chars */
+            break;
+        }
+    }
+    out[extracted] = '\0';
+    return extracted;
+}
+
+/* Check if data looks like a 3-digit HTTP status code */
+static int parse_status_code(const uint8_t *data, size_t len) {
+    if (len < 3) return 0;
+
+    /* Check for 3-digit numeric status */
+    if (data[0] >= '1' && data[0] <= '5' &&
+        data[1] >= '0' && data[1] <= '9' &&
+        data[2] >= '0' && data[2] <= '9') {
+        return (data[0] - '0') * 100 + (data[1] - '0') * 10 + (data[2] - '0');
+    }
+    return 0;
+}
+
+/* HPACK static table indices for common headers */
+#define HPACK_STATUS_200 8
+#define HPACK_STATUS_204 9
+#define HPACK_STATUS_206 10
+#define HPACK_STATUS_304 11
+#define HPACK_STATUS_400 12
+#define HPACK_STATUS_404 13
+#define HPACK_STATUS_500 14
+#define HPACK_METHOD_GET 2
+#define HPACK_METHOD_POST 3
+#define HPACK_PATH_ROOT 4
+#define HPACK_PATH_INDEX 5
+#define HPACK_SCHEME_HTTP 6
+#define HPACK_SCHEME_HTTPS 7
+#define HPACK_CONTENT_TYPE 31
+
+/* Decode status from HPACK static table index */
+static int static_table_status(uint8_t index) {
+    switch (index) {
+        case HPACK_STATUS_200: return 200;
+        case HPACK_STATUS_204: return 204;
+        case HPACK_STATUS_206: return 206;
+        case HPACK_STATUS_304: return 304;
+        case HPACK_STATUS_400: return 400;
+        case HPACK_STATUS_404: return 404;
+        case HPACK_STATUS_500: return 500;
+        default: return 0;
+    }
+}
+
+/* Try to extract useful info from raw HPACK data */
+static void hpack_fallback_parse(const uint8_t *data, size_t len,
+                                  h2_stream_t *stream) {
+    if (!data || len == 0 || !stream) return;
+
+    /* Scan for recognizable patterns */
+    for (size_t i = 0; i < len; i++) {
+        uint8_t byte = data[i];
+
+        /* Check for indexed header field (top bit set)
+         * Format: 1xxxxxxx where xxxxxxx is the index */
+        if (byte & 0x80) {
+            uint8_t index = byte & 0x7f;
+            /* Check static table status codes */
+            int status = static_table_status(index);
+            if (status > 0 && stream->status_code == 0) {
+                stream->status_code = status;
+                DEBUG_H2("Fallback: extracted status %d from static table index %d",
+                         status, index);
+            }
+            continue;
+        }
+
+        /* Check for literal with indexing (0100xxxx) or without (0000xxxx)
+         * These often contain readable ASCII values */
+        if ((byte & 0xc0) == 0x40 || (byte & 0xf0) == 0x00) {
+            /* Skip the index byte, look for length prefix + value */
+            size_t remaining = len - i - 1;
+            if (remaining < 2) continue;
+
+            /* Next byte(s) contain length - check for Huffman bit */
+            size_t j = i + 1;
+            uint8_t len_byte = data[j];
+            bool huffman = (len_byte & 0x80) != 0;
+            size_t str_len = len_byte & 0x7f;
+
+            /* Skip Huffman encoded strings (can't easily decode without table) */
+            if (huffman) continue;
+
+            /* Check if we have enough data for the literal string */
+            if (j + 1 + str_len <= len && str_len > 0 && str_len < 512) {
+                const uint8_t *str_data = &data[j + 1];
+
+                /* Check if this looks like a status code */
+                int status = parse_status_code(str_data, str_len);
+                if (status > 0 && stream->status_code == 0) {
+                    stream->status_code = status;
+                    DEBUG_H2("Fallback: extracted literal status %d", status);
+                    continue;
+                }
+
+                /* Check for content-type patterns */
+                if (str_len > 5) {
+                    char temp[256] = {0};
+                    extract_ascii_string(str_data, str_len < 255 ? str_len : 255,
+                                         temp, sizeof(temp));
+                    if (strncasecmp(temp, "text/", 5) == 0 ||
+                        strncasecmp(temp, "application/", 12) == 0 ||
+                        strncasecmp(temp, "image/", 6) == 0) {
+                        if (!stream->content_type[0]) {
+                            safe_strcpy(stream->content_type, sizeof(stream->content_type), temp);
+                            DEBUG_H2("Fallback: extracted content-type '%s'", temp);
+                        }
+                    }
+                }
+            }
+        }
+
+        /* Look for literal ":status" header name followed by value */
+        if (i + 10 < len && data[i] == ':' && data[i+1] == 's' &&
+            data[i+2] == 't' && data[i+3] == 'a' && data[i+4] == 't' &&
+            data[i+5] == 'u' && data[i+6] == 's') {
+            /* Found ":status" - look for numeric value nearby */
+            for (size_t k = i + 7; k < len - 2 && k < i + 20; k++) {
+                int status = parse_status_code(&data[k], len - k);
+                if (status > 0 && stream->status_code == 0) {
+                    stream->status_code = status;
+                    DEBUG_H2("Fallback: found :status %d at offset %zu", status, k);
+                    break;
+                }
+            }
+        }
+    }
+
+    /* If we found a status, mark that we recovered partial info */
+    if (stream->status_code > 0) {
+        DEBUG_H2("Fallback parse successful: status=%d", stream->status_code);
+    }
+}
+
 /* Process a single decoded header from HPACK inflater */
 static void h2_process_response_header(h2_stream_t *stream, const nghttp2_nv *nv) {
     const uint8_t *name = nv->name;
@@ -1070,6 +1331,12 @@ static void h2_process_complete_response_frame(h2_connection_t *conn, const uint
 
                     conn->hpack_error_count++;
                     conn->hpack_success_count = 0;
+
+                    /* Mark stream so we can display partial info */
+                    stream->hpack_decode_failed = true;
+
+                    /* Try fallback parser to extract partial info from raw data */
+                    hpack_fallback_parse(hdr_data, hdr_len, stream);
 
                     /* End current header block properly */
                     nghttp2_hd_inflate_end_headers(conn->response_inflater);
@@ -1343,6 +1610,19 @@ void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *e
         if (http2_init() != 0) {
             DEBUG_H2("http2_init() failed");
             return;
+        }
+    }
+
+    /* DEBUG: Always log frame processing for troubleshooting */
+    if (len >= 9) {
+        uint32_t flen = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | (uint32_t)data[2];
+        uint8_t ftype = data[3];
+        uint32_t sid = ((uint32_t)(data[5] & 0x7f) << 24) | ((uint32_t)data[6] << 16) |
+                       ((uint32_t)data[7] << 8) | (uint32_t)data[8];
+        if (ftype <= 9 && flen <= 65536) {
+            fprintf(stderr, "[H2-FRAME] %s: type=%s stream=%u len=%u (total=%d)\n",
+                    event->event_type == EVENT_SSL_WRITE ? "WRITE" : "READ",
+                    http2_frame_name(ftype), sid, flen, len);
         }
     }
 

@@ -1,13 +1,35 @@
-/*
+/**
+ * @file pool.c
+ * @brief Lock-free object pool implementation
+ *
+ * @details Uses CK ring buffer as a free-list for O(1) alloc/free.
+ * Pre-allocates all objects at initialization time to avoid malloc
+ * in the hot path during event processing.
+ *
+ * @par Memory Layout:
+ * @code
+ *   pool->base ─────────────────────────────────┐
+ *                                               │
+ *   ┌─────────┬─────────┬─────────┬─────────┐   │
+ *   │ Object 0│ Object 1│ Object 2│ Object N│   │ Contiguous allocation
+ *   │ 64-byte │ 64-byte │ 64-byte │ 64-byte │   │ (cache-line aligned)
+ *   │ aligned │ aligned │ aligned │ aligned │   │
+ *   └─────────┴─────────┴─────────┴─────────┘   │
+ *                                               │
+ *   pool->ring (CK ring buffer) ◄───────────────┘
+ *       │
+ *       └── Free-list: pointers to available objects
+ * @endcode
+ *
+ * @par Thread Safety:
+ * - pool_alloc: SPSC dequeue (single consumer per worker)
+ * - pool_free: SPSC enqueue (single producer per worker)
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * pool.c - Lock-free object pool implementation
- *
- * Uses CK ring buffer as a free-list for O(1) alloc/free.
- * Pre-allocates all objects at init time to avoid malloc in hot path.
  */
 
 #include "threading.h"
@@ -16,14 +38,21 @@
 #include <string.h>
 #include <stdio.h>
 
-/*
- * Initialize object pool
+/**
+ * @brief Initialize object pool with pre-allocated storage
  *
- * @param pool      Pool structure to initialize
- * @param obj_size  Size of each object (will be aligned to cache line)
- * @param capacity  Number of objects (will be rounded to power of 2)
+ * Allocates a contiguous block of cache-line aligned objects and
+ * pushes them all onto the free-list ring buffer.
  *
- * @return 0 on success, -1 on failure
+ * @par Capacity Adjustment:
+ * The capacity is rounded up to the next power of 2 as required
+ * by CK ring buffer. The ring is sized to hold one more element
+ * than the actual capacity to avoid the empty/full ambiguity.
+ *
+ * @par Object Alignment:
+ * Objects are aligned to 64-byte cache lines to prevent false
+ * sharing when objects from the same pool are accessed by different
+ * threads (though our design typically has one pool per worker).
  */
 int pool_init(object_pool_t *pool, size_t obj_size, size_t capacity) {
     if (!pool || obj_size == 0 || capacity == 0) {
@@ -95,8 +124,11 @@ int pool_init(object_pool_t *pool, size_t obj_size, size_t capacity) {
     return 0;
 }
 
-/*
- * Destroy object pool and free all memory
+/**
+ * @brief Destroy object pool and free all memory
+ *
+ * Frees the ring buffer and object storage. Does not track or
+ * complain about unreturned objects (caller's responsibility).
  */
 void pool_destroy(object_pool_t *pool) {
     if (!pool) {
@@ -117,12 +149,17 @@ void pool_destroy(object_pool_t *pool) {
     pool->capacity = 0;
 }
 
-/*
- * Allocate object from pool
+/**
+ * @brief Allocate object from pool (lock-free)
  *
- * Thread-safe: Uses lock-free CK ring dequeue
+ * Dequeues an object pointer from the free-list ring buffer.
+ * The object memory was zero-initialized when last freed.
  *
- * @return Pointer to object, or NULL if pool is empty
+ * @note Uses SPSC (single-producer single-consumer) dequeue since
+ *       each worker has its own pool and is the sole consumer.
+ *
+ * @note On failure (pool empty), increments alloc_failures counter
+ *       for diagnostic purposes.
  */
 void *pool_alloc(object_pool_t *pool) {
     if (!pool || !pool->ring_buf) {
@@ -142,14 +179,22 @@ void *pool_alloc(object_pool_t *pool) {
     return NULL;
 }
 
-/*
- * Return object to pool
+/**
+ * @brief Return object to pool (lock-free)
  *
- * Thread-safe: Uses lock-free CK ring enqueue
- * Object is zero-cleared before returning to pool.
+ * Validates the object belongs to this pool, zero-clears it for
+ * security and debugging, then enqueues it back to the free-list.
  *
- * @param pool  Pool to return object to
- * @param obj   Object to return (must have been allocated from this pool)
+ * @par Validation Checks:
+ * - Object pointer within pool's base allocation
+ * - Object pointer properly aligned to obj_size boundary
+ *
+ * @par Security Note:
+ * Zero-clearing prevents sensitive data (like SSL plaintext) from
+ * persisting in reused objects. Also helps catch use-after-free bugs.
+ *
+ * @warning Attempting to free an object not from this pool will
+ *          print an error and return without action.
  */
 void pool_free(object_pool_t *pool, void *obj) {
     if (!pool || !pool->ring_buf || !obj) {
@@ -187,8 +232,15 @@ void pool_free(object_pool_t *pool, void *obj) {
     atomic_fetch_add(&pool->free_count, 1);
 }
 
-/*
- * Get pool statistics
+/**
+ * @brief Get pool statistics (thread-safe)
+ *
+ * Reads atomic counters for pool usage. All output parameters are
+ * optional (pass NULL to skip).
+ *
+ * @par Diagnostic Use:
+ * - allocs - frees = currently allocated objects
+ * - failures > 0 indicates pool exhaustion occurred
  */
 void pool_get_stats(object_pool_t *pool, uint64_t *allocs, uint64_t *frees,
                     uint64_t *failures) {

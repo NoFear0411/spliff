@@ -1,19 +1,40 @@
-/*
- * SPDX-License-Identifier: GPL-3.0-only
+/**
+ * @file state.c
+ * @brief Per-worker state management
  *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * state.c - Per-worker state management
- *
- * Each worker thread has isolated state for:
- * - HTTP/2 connections and streams
- * - ALPN cache
- * - Pending body buffers
+ * @details Each worker thread has isolated state for:
+ * - HTTP/2 connections and streams (nghttp2 sessions, HPACK contexts)
+ * - ALPN cache (protocol negotiation results)
+ * - Pending body buffers (chunked response assembly)
  * - Decompression scratch buffers
  *
- * Connection affinity (same pid+ssl_ctx → same worker) eliminates
- * the need for any locking on this state.
+ * @par Connection Affinity:
+ * The same (pid, ssl_ctx) pair always routes to the same worker via
+ * flow_hash(). This eliminates the need for any locking on per-worker
+ * state - each worker is the sole accessor of its state.
+ *
+ * @par Memory Layout (per worker):
+ * @code
+ *   worker_state_t
+ *       │
+ *       ├── h2_connections[]      [16 slots, LRU eviction]
+ *       │       └── nghttp2_session, HPACK inflater, response_buf
+ *       │
+ *       ├── h2_streams[]          [128 slots, pre-allocated body_bufs]
+ *       │       └── request/response state, headers[], body_buf
+ *       │
+ *       ├── alpn_cache[]          [32 slots, FIFO eviction]
+ *       ├── pending_bodies[]      [4 slots, on-demand accum_buf]
+ *       ├── h1_request_cache[]    [16 slots]
+ *       ├── decomp_buf            [MAX_BODY_BUFFER, shared scratch]
+ *       └── body_buf              [MAX_BODY_BUFFER, HTTP/1 parsing]
+ * @endcode
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
  */
 
 #include "threading.h"
@@ -28,25 +49,43 @@
 #include <nghttp2/nghttp2.h>
 #endif
 
-/* Thread-local storage for current worker state */
+/**
+ * @brief Thread-local storage for current worker state
+ *
+ * Set during worker thread startup via set_current_worker_state().
+ * Allows protocol parsers to access per-worker caches without
+ * passing state through every function call.
+ */
 static __thread worker_state_t *tls_worker_state = NULL;
 
-/*
- * Get current worker's state from thread-local storage
+/**
+ * @brief Get current worker's state from thread-local storage
+ *
+ * @return Worker state pointer, or NULL if not in a worker thread
  */
 worker_state_t *get_current_worker_state(void) {
     return tls_worker_state;
 }
 
-/*
- * Set current worker's state in thread-local storage
+/**
+ * @brief Set current worker's state in thread-local storage
+ *
+ * Called during worker thread initialization to enable protocol
+ * parsers to access per-worker state.
+ *
+ * @param[in] state Worker state to associate with current thread
  */
 void set_current_worker_state(worker_state_t *state) {
     tls_worker_state = state;
 }
 
-/*
- * Get current time in nanoseconds
+/**
+ * @brief Get current time in nanoseconds
+ *
+ * Uses CLOCK_MONOTONIC for consistent timestamps that don't jump
+ * during system time adjustments.
+ *
+ * @return Nanoseconds since arbitrary epoch (suitable for deltas)
  */
 uint64_t get_time_ns(void) {
     struct timespec ts;
@@ -54,16 +93,28 @@ uint64_t get_time_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/*
- * Initialize per-worker state
+/**
+ * @brief Initialize per-worker state
  *
  * Allocates all buffers and initializes data structures for a worker.
- * This is called once per worker thread during startup.
+ * Called once per worker thread during startup.
  *
- * @param state      Worker state to initialize
- * @param worker_id  Worker ID (0 to num_workers-1)
+ * @par Allocation Strategy:
+ * - HTTP/2 connection and stream pools: fixed-size arrays with LRU eviction
+ * - Stream body buffers: pre-allocated to avoid malloc during processing
+ * - Decompression/body buffers: shared scratch space per worker
+ * - Pending body accum_bufs: allocated on-demand, reused across entries
  *
- * @return 0 on success, -1 on failure
+ * @par Cache Line Alignment:
+ * All major allocations use aligned_alloc(64, ...) to prevent false
+ * sharing between workers and improve cache performance.
+ *
+ * @param[out] state     Worker state to initialize
+ * @param[in]  worker_id Worker ID (0 to num_workers-1) for logging
+ *
+ * @return 0 on success, -1 on allocation failure
+ *
+ * @note On failure, partially allocated resources are cleaned up
  */
 int worker_state_init(worker_state_t *state, int worker_id) {
     if (!state) {
@@ -152,10 +203,16 @@ cleanup:
     return -1;
 }
 
-/*
- * Cleanup per-worker state
+/**
+ * @brief Cleanup per-worker state
  *
- * Frees all allocated resources for a worker.
+ * Frees all allocated resources for a worker including:
+ * - nghttp2 sessions and HPACK inflaters
+ * - HTTP/2 connection response buffers
+ * - Stream body buffers
+ * - Pending body accumulation buffers
+ * - Decompression and parsing scratch buffers
+ * - nghttp2 callback structure
  */
 void worker_state_cleanup(worker_state_t *state) {
     if (!state) {
@@ -234,12 +291,26 @@ void worker_state_cleanup(worker_state_t *state) {
     state->initialized = false;
 }
 
-/* ============================================================================
- * Per-Worker HTTP/2 Connection Management
- * ============================================================================ */
+/**
+ * @defgroup state_h2conn HTTP/2 Connection Management
+ * @brief Worker-local HTTP/2 connection pool operations
+ * @{
+ */
 
-/*
- * Find or create HTTP/2 connection for (pid, ssl_ctx) in worker's pool
+/**
+ * @brief Find or create HTTP/2 connection for (pid, ssl_ctx)
+ *
+ * Looks up existing connection in worker's pool. If not found and
+ * create=true, allocates a new slot (evicting LRU if pool is full).
+ *
+ * @par LRU Eviction:
+ * When pool is full, the connection with oldest last_activity_ns is
+ * evicted. This cleans up associated streams and nghttp2 resources.
+ *
+ * @par New Connection Setup:
+ * - Allocates response reassembly buffer (H2_REASSEMBLY_BUF_SIZE)
+ * - Creates HPACK inflater for response header decoding
+ * - nghttp2_session is created lazily when first frame is processed
  */
 h2_connection_local_t *worker_get_h2_connection(worker_state_t *state,
                                                   uint32_t pid, uint64_t ssl_ctx,
@@ -316,8 +387,11 @@ h2_connection_local_t *worker_get_h2_connection(worker_state_t *state,
     return slot;
 }
 
-/*
- * Cleanup HTTP/2 connection
+/**
+ * @brief Cleanup HTTP/2 connection and associated resources
+ *
+ * Destroys nghttp2 session, HPACK inflater, response buffer, and
+ * all streams associated with this connection.
  */
 void worker_cleanup_h2_connection(worker_state_t *state, h2_connection_local_t *conn) {
     if (!state || !conn || !conn->active) {
@@ -347,12 +421,28 @@ void worker_cleanup_h2_connection(worker_state_t *state, h2_connection_local_t *
     state->h2_connection_count--;
 }
 
-/* ============================================================================
- * Per-Worker HTTP/2 Stream Management
- * ============================================================================ */
+/** @} */ /* end state_h2conn */
 
-/*
- * Find or create HTTP/2 stream for (pid, ssl_ctx, stream_id) in worker's pool
+/**
+ * @defgroup state_h2stream HTTP/2 Stream Management
+ * @brief Worker-local HTTP/2 stream pool operations
+ * @{
+ */
+
+/**
+ * @brief Find or create HTTP/2 stream for (pid, ssl_ctx, stream_id)
+ *
+ * Looks up existing stream in worker's pool. If not found and create=true,
+ * allocates a new slot. Prefers evicting closed streams before failing.
+ *
+ * @par Body Buffer Preservation:
+ * Stream body_bufs are pre-allocated during worker_state_init() and
+ * preserved across stream reuse. Only the metadata is cleared.
+ *
+ * @par Eviction Strategy:
+ * 1. First try to find an empty (inactive) slot
+ * 2. If none, evict a stream in H2_STREAM_CLOSED state
+ * 3. If still none, return NULL (caller should retry later)
  */
 h2_stream_local_t *worker_get_h2_stream(worker_state_t *state,
                                           uint32_t pid, uint64_t ssl_ctx,
@@ -419,8 +509,11 @@ h2_stream_local_t *worker_get_h2_stream(worker_state_t *state,
     return slot;
 }
 
-/*
- * Free HTTP/2 stream (clear but keep body_buf allocated)
+/**
+ * @brief Free HTTP/2 stream (clear metadata but preserve body_buf)
+ *
+ * Clears all stream state except the pre-allocated body_buf, which
+ * is reused for the next stream in this slot.
  */
 void worker_free_h2_stream(worker_state_t *state, h2_stream_local_t *stream) {
     if (!state || !stream || !stream->active) {
@@ -438,8 +531,11 @@ void worker_free_h2_stream(worker_state_t *state, h2_stream_local_t *stream) {
     state->h2_stream_count--;
 }
 
-/*
- * Cleanup all streams for a connection
+/**
+ * @brief Cleanup all streams for a connection
+ *
+ * Called when connection closes. Frees all streams matching the
+ * (pid, ssl_ctx) pair.
  */
 void worker_cleanup_h2_streams_for_connection(worker_state_t *state,
                                                 uint32_t pid, uint64_t ssl_ctx) {
@@ -457,12 +553,18 @@ void worker_cleanup_h2_streams_for_connection(worker_state_t *state,
     }
 }
 
-/* ============================================================================
- * Per-Worker ALPN Cache
- * ============================================================================ */
+/** @} */ /* end state_h2stream */
 
-/*
- * Get ALPN protocol for (pid, ssl_ctx)
+/**
+ * @defgroup state_alpn ALPN Cache
+ * @brief Worker-local ALPN protocol cache operations
+ * @{
+ */
+
+/**
+ * @brief Get cached ALPN protocol for connection
+ *
+ * @return Protocol string ("h2", "http/1.1", etc.) or empty string if not cached
  */
 const char *worker_get_alpn(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx) {
     if (!state) {
@@ -479,8 +581,11 @@ const char *worker_get_alpn(worker_state_t *state, uint32_t pid, uint64_t ssl_ct
     return "";
 }
 
-/*
- * Set ALPN protocol for (pid, ssl_ctx)
+/**
+ * @brief Cache ALPN protocol for connection
+ *
+ * Updates existing entry or creates new one. Uses FIFO eviction
+ * when cache is full (evicts slot 0).
  */
 void worker_set_alpn(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
                        const char *alpn) {
@@ -520,12 +625,18 @@ void worker_set_alpn(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
     state->alpn_cache[0].active = true;
 }
 
-/* ============================================================================
- * Per-Worker Pending Body Management
- * ============================================================================ */
+/** @} */ /* end state_alpn */
 
-/*
- * Find pending body for (pid, ssl_ctx)
+/**
+ * @defgroup state_pending Pending Body Management
+ * @brief Worker-local chunked/streaming response assembly
+ * @{
+ */
+
+/**
+ * @brief Find pending body entry for connection
+ *
+ * @return Entry pointer or NULL if no pending body for this connection
  */
 pending_body_entry_t *worker_find_pending_body(worker_state_t *state,
                                                   uint32_t pid, uint64_t ssl_ctx) {
@@ -543,8 +654,14 @@ pending_body_entry_t *worker_find_pending_body(worker_state_t *state,
     return NULL;
 }
 
-/*
- * Create pending body entry
+/**
+ * @brief Create pending body entry for response assembly
+ *
+ * Creates a new entry for accumulating chunked or streaming response
+ * body data. The accumulation buffer is allocated on-demand and reused.
+ *
+ * @par Eviction:
+ * If all slots are in use, evicts slot 0 (FIFO).
  */
 pending_body_entry_t *worker_create_pending_body(worker_state_t *state,
                                                     uint32_t pid, uint64_t ssl_ctx,
@@ -600,8 +717,10 @@ pending_body_entry_t *worker_create_pending_body(worker_state_t *state,
     return slot;
 }
 
-/*
- * Clear pending body entry
+/**
+ * @brief Clear pending body entry
+ *
+ * Resets entry for reuse. Keeps accum_buf allocated for efficiency.
  */
 void worker_clear_pending_body(worker_state_t *state, pending_body_entry_t *entry) {
     if (!state || !entry || !entry->active) {
@@ -620,8 +739,10 @@ void worker_clear_pending_body(worker_state_t *state, pending_body_entry_t *entr
     state->pending_body_count--;
 }
 
-/*
- * Cleanup all pending bodies for a PID
+/**
+ * @brief Cleanup all pending bodies for a process
+ *
+ * Called when process exits to free incomplete response assemblies.
  */
 void worker_cleanup_pending_bodies_pid(worker_state_t *state, uint32_t pid) {
     if (!state) {
@@ -636,12 +757,18 @@ void worker_cleanup_pending_bodies_pid(worker_state_t *state, uint32_t pid) {
     }
 }
 
-/* ============================================================================
- * HTTP/1.1 Request Cache Functions
- * ============================================================================ */
+/** @} */ /* end state_pending */
 
-/*
- * Find cached HTTP/1.1 request for a connection
+/**
+ * @defgroup state_h1cache HTTP/1.1 Request Cache
+ * @brief Worker-local HTTP/1.1 request-response correlation
+ * @{
+ */
+
+/**
+ * @brief Find cached HTTP/1.1 request for connection
+ *
+ * @return Request entry or NULL if no request cached for this connection
  */
 h1_request_entry_t *worker_find_h1_request(worker_state_t *state,
                                             uint32_t pid, uint64_t ssl_ctx) {
@@ -659,8 +786,12 @@ h1_request_entry_t *worker_find_h1_request(worker_state_t *state,
     return NULL;
 }
 
-/*
- * Store HTTP/1.1 request for response correlation
+/**
+ * @brief Cache HTTP/1.1 request for response correlation
+ *
+ * Stores request method, path, and host so they can be displayed
+ * when the response arrives. Updates existing entry or creates new.
+ * Uses FIFO eviction when cache is full.
  */
 void worker_set_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
                            const char *method, const char *path, const char *host) {
@@ -692,8 +823,10 @@ void worker_set_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx
     safe_strcpy(slot->host, sizeof(slot->host), host ? host : "");
 }
 
-/*
- * Clear cached HTTP/1.1 request
+/**
+ * @brief Clear cached HTTP/1.1 request
+ *
+ * Called after response is processed to free the cache slot.
  */
 void worker_clear_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx) {
     h1_request_entry_t *entry = worker_find_h1_request(state, pid, ssl_ctx);
@@ -701,3 +834,5 @@ void worker_clear_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_c
         entry->active = false;
     }
 }
+
+/** @} */ /* end state_h1cache */

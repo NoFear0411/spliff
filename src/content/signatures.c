@@ -1,112 +1,262 @@
-/*
+/**
+ * @file signatures.c
+ * @brief Implementation of file signature (magic bytes) detection
+ *
+ * @details This module implements file type detection based on magic bytes
+ * (file signatures) at the beginning of data. The detection system uses:
+ *
+ * - **Static signature table**: Over 50 signatures with magic bytes, offsets,
+ *   and optional trailers for format validation
+ * - **Sorted index**: Signatures sorted by length (longest first) for
+ *   most-specific-match-wins behavior
+ * - **Special detectors**: Dedicated handlers for container formats like
+ *   ISOBMFF (MP4/MOV/AVIF/HEIC) and RIFF (WebP/WAV/AVI)
+ *
+ * @par Architecture:
+ * @code
+ * signature_detect_full()
+ *    │
+ *    ├── detect_isobmff()  ← MP4/MOV/AVIF/HEIC (ftyp at offset 4)
+ *    ├── detect_riff()     ← WebP/WAV/AVI (RIFF header)
+ *    ├── detect_tar()      ← TAR (ustar at offset 257)
+ *    │
+ *    └── signature table scan (sorted by magic_len descending)
+ * @endcode
+ *
+ * @par Adding New Signatures:
+ * 1. Define magic bytes as static const uint8_t array
+ * 2. Add entry to signatures[] table with file_class and is_binary
+ * 3. Optionally add trailer bytes for validation
+ * 4. The init function auto-sorts by magic_len
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, version 3 of the License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "signatures.h"
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Magic byte signatures - web-relevant formats only.
- * Organized by category for maintainability.
- * Longest signatures should match first (handled by qsort at init).
+/**
+ * @defgroup sig_magic Magic Byte Definitions
+ * @brief Static arrays containing file format magic bytes
+ * @ingroup signatures
+ *
+ * These arrays define the byte sequences used to identify file formats.
+ * Organized by category for maintainability. Longest signatures match
+ * first due to qsort ordering at initialization.
+ * @{
  */
 
-/* === Images === */
+/**
+ * @name Image Format Signatures
+ * @brief Magic bytes for common image formats
+ * @{
+ */
+/** PNG signature: 89 50 4E 47 0D 0A 1A 0A */
 static const uint8_t SIG_PNG[] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
-static const uint8_t SIG_PNG_TRAILER[] = {0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82}; /* IEND chunk */
+/** PNG IEND chunk trailer for validation */
+static const uint8_t SIG_PNG_TRAILER[] = {0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82};
+/** GIF87a signature */
 static const uint8_t SIG_GIF87[] = {'G', 'I', 'F', '8', '7', 'a'};
+/** GIF89a signature (most common) */
 static const uint8_t SIG_GIF89[] = {'G', 'I', 'F', '8', '9', 'a'};
-static const uint8_t SIG_GIF_TRAILER[] = {0x00, 0x3B}; /* GIF trailer */
+/** GIF trailer: 00 3B */
+static const uint8_t SIG_GIF_TRAILER[] = {0x00, 0x3B};
+/** JPEG with JFIF APP0 marker */
 static const uint8_t SIG_JPEG_JFIF[] = {0xFF, 0xD8, 0xFF, 0xE0};
+/** JPEG with EXIF APP1 marker */
 static const uint8_t SIG_JPEG_EXIF[] = {0xFF, 0xD8, 0xFF, 0xE1};
+/** Generic JPEG SOI marker */
 static const uint8_t SIG_JPEG[] = {0xFF, 0xD8, 0xFF};
-static const uint8_t SIG_JPEG_TRAILER[] = {0xFF, 0xD9}; /* EOI marker */
+/** JPEG EOI (End of Image) marker */
+static const uint8_t SIG_JPEG_TRAILER[] = {0xFF, 0xD9};
+/** BMP bitmap signature */
 static const uint8_t SIG_BMP[] = {'B', 'M'};
+/** ICO icon file signature */
 static const uint8_t SIG_ICO[] = {0x00, 0x00, 0x01, 0x00};
-static const uint8_t SIG_CUR[] = {0x00, 0x00, 0x02, 0x00}; /* Cursor file */
-static const uint8_t SIG_WEBP[] = {'R', 'I', 'F', 'F'}; /* Handled specially */
-static const uint8_t SIG_TIFF_LE[] = {0x49, 0x49, 0x2A, 0x00}; /* Little-endian */
-static const uint8_t SIG_TIFF_BE[] = {0x4D, 0x4D, 0x00, 0x2A}; /* Big-endian */
+/** CUR cursor file signature */
+static const uint8_t SIG_CUR[] = {0x00, 0x00, 0x02, 0x00};
+/** RIFF header (WebP uses this, handled by detect_riff()) */
+static const uint8_t SIG_WEBP[] = {'R', 'I', 'F', 'F'};
+/** TIFF little-endian (II) */
+static const uint8_t SIG_TIFF_LE[] = {0x49, 0x49, 0x2A, 0x00};
+/** TIFF big-endian (MM) */
+static const uint8_t SIG_TIFF_BE[] = {0x4D, 0x4D, 0x00, 0x2A};
+/** Adobe Photoshop PSD */
 static const uint8_t SIG_PSD[] = {'8', 'B', 'P', 'S'};
+/** @} */
 
-/* === Video === */
-static const uint8_t SIG_WEBM[] = {0x1A, 0x45, 0xDF, 0xA3}; /* Matroska/WebM */
+/**
+ * @name Video Format Signatures
+ * @brief Magic bytes for video container formats
+ * @note MP4/MOV/AVIF/HEIC are handled by the ISOBMFF detector
+ * @{
+ */
+/** Matroska/WebM EBML header */
+static const uint8_t SIG_WEBM[] = {0x1A, 0x45, 0xDF, 0xA3};
+/** Flash Video container */
 static const uint8_t SIG_FLV[] = {'F', 'L', 'V', 0x01};
-/* MP4/MOV/AVIF/HEIC handled by ISOBMFF detector */
+/** @} */
 
-/* === Audio === */
+/**
+ * @name Audio Format Signatures
+ * @brief Magic bytes for audio file formats
+ * @note WAV files are handled by the RIFF detector
+ * @{
+ */
+/** MP3 with ID3v2 tag header */
 static const uint8_t SIG_MP3_ID3[] = {'I', 'D', '3'};
+/** MP3 frame sync (MPEG 1 Layer 3, 44.1kHz) */
 static const uint8_t SIG_MP3_SYNC[] = {0xFF, 0xFB};
+/** MP3 frame sync variant 2 */
 static const uint8_t SIG_MP3_SYNC2[] = {0xFF, 0xFA};
+/** MP3 frame sync variant 3 */
 static const uint8_t SIG_MP3_SYNC3[] = {0xFF, 0xF3};
+/** Ogg container format */
 static const uint8_t SIG_OGG[] = {'O', 'g', 'g', 'S'};
+/** FLAC audio codec */
 static const uint8_t SIG_FLAC[] = {'f', 'L', 'a', 'C'};
+/** MIDI file header */
 static const uint8_t SIG_MIDI[] = {'M', 'T', 'h', 'd'};
-/* WAV handled by RIFF detector */
+/** @} */
 
-/* === Archives === */
+/**
+ * @name Archive and Compression Signatures
+ * @brief Magic bytes for compressed archives and streams
+ * @note TAR archives are handled specially at offset 257
+ * @{
+ */
+/** ZIP archive (local file header) */
 static const uint8_t SIG_ZIP[] = {'P', 'K', 0x03, 0x04};
-static const uint8_t SIG_ZIP_EMPTY[] = {'P', 'K', 0x05, 0x06}; /* Empty archive */
-static const uint8_t SIG_ZIP_SPAN[] = {'P', 'K', 0x07, 0x08}; /* Spanned archive */
+/** Empty ZIP archive */
+static const uint8_t SIG_ZIP_EMPTY[] = {'P', 'K', 0x05, 0x06};
+/** Spanned ZIP archive */
+static const uint8_t SIG_ZIP_SPAN[] = {'P', 'K', 0x07, 0x08};
+/** GZIP compressed data (RFC 1952) */
 static const uint8_t SIG_GZIP[] = {0x1F, 0x8B};
+/** Zstandard compressed data (RFC 8878) */
 static const uint8_t SIG_ZSTD[] = {0x28, 0xB5, 0x2F, 0xFD};
+/** BZIP2 compressed data */
 static const uint8_t SIG_BZIP2[] = {'B', 'Z', 'h'};
+/** XZ compressed data */
 static const uint8_t SIG_XZ[] = {0xFD, '7', 'z', 'X', 'Z', 0x00};
+/** 7-Zip archive */
 static const uint8_t SIG_7Z[] = {'7', 'z', 0xBC, 0xAF, 0x27, 0x1C};
+/** RAR5 archive */
 static const uint8_t SIG_RAR5[] = {'R', 'a', 'r', '!', 0x1A, 0x07, 0x01, 0x00};
+/** RAR archive (older versions) */
 static const uint8_t SIG_RAR[] = {'R', 'a', 'r', '!', 0x1A, 0x07, 0x00};
+/** LZ4 frame format */
 static const uint8_t SIG_LZ4[] = {0x04, 0x22, 0x4D, 0x18};
-/* TAR handled specially at offset 257 */
+/** @} */
 
-/* === Documents === */
+/**
+ * @name Document Format Signatures
+ * @brief Magic bytes for document file formats
+ * @{
+ */
+/** PDF document header */
 static const uint8_t SIG_PDF[] = {'%', 'P', 'D', 'F', '-'};
-static const uint8_t SIG_PDF_TRAILER[] = {'%', '%', 'E', 'O', 'F'}; /* %%EOF */
+/** PDF end-of-file marker for trailer validation */
+static const uint8_t SIG_PDF_TRAILER[] = {'%', '%', 'E', 'O', 'F'};
+/** PostScript document */
 static const uint8_t SIG_PS[] = {'%', '!'};
+/** Rich Text Format document */
 static const uint8_t SIG_RTF[] = {'{', '\\', 'r', 't', 'f'};
+/** XML declaration prologue */
 static const uint8_t SIG_XML[] = {'<', '?', 'x', 'm', 'l'};
+/** @} */
 
-/* === Fonts === */
+/**
+ * @name Font Format Signatures
+ * @brief Magic bytes for web font formats
+ * @{
+ */
+/** WOFF (Web Open Font Format) 1.0 */
 static const uint8_t SIG_WOFF[] = {'w', 'O', 'F', 'F'};
+/** WOFF2 (compressed web fonts) */
 static const uint8_t SIG_WOFF2[] = {'w', 'O', 'F', '2'};
+/** TrueType font */
 static const uint8_t SIG_TTF[] = {0x00, 0x01, 0x00, 0x00};
+/** OpenType font with CFF outlines */
 static const uint8_t SIG_OTF[] = {'O', 'T', 'T', 'O'};
+/** @} */
 
-/* === Executables/Binary === */
+/**
+ * @name Executable and Binary Signatures
+ * @brief Magic bytes for executable and bytecode formats
+ *
+ * These signatures help identify local file I/O vs. HTTP traffic.
+ * ELF and Mach-O binaries appearing in SSL data typically indicate
+ * file:// reads rather than web downloads.
+ * @{
+ */
+/** WebAssembly binary module */
 static const uint8_t SIG_WASM[] = {0x00, 'a', 's', 'm'};
+/** ELF executable (Linux/Unix) */
 static const uint8_t SIG_ELF[] = {0x7F, 'E', 'L', 'F'};
+/** Mach-O 32-bit (macOS/iOS) big-endian */
 static const uint8_t SIG_MACH_O_32[] = {0xFE, 0xED, 0xFA, 0xCE};
+/** Mach-O 64-bit (macOS/iOS) big-endian */
 static const uint8_t SIG_MACH_O_64[] = {0xFE, 0xED, 0xFA, 0xCF};
+/** Mach-O 32-bit little-endian (reversed) */
 static const uint8_t SIG_MACH_O_32_REV[] = {0xCE, 0xFA, 0xED, 0xFE};
+/** Mach-O 64-bit little-endian (reversed) */
 static const uint8_t SIG_MACH_O_64_REV[] = {0xCF, 0xFA, 0xED, 0xFE};
+/** Java class file */
 static const uint8_t SIG_CLASS[] = {0xCA, 0xFE, 0xBA, 0xBE};
+/** Android DEX bytecode */
 static const uint8_t SIG_DEX[] = {'d', 'e', 'x', '\n'};
+/** @} */
 
-/* === Database === */
+/**
+ * @name Database Signatures
+ * @brief Magic bytes for database file formats
+ * @{
+ */
+/** SQLite 3 database file header */
 static const uint8_t SIG_SQLITE[] = {'S', 'Q', 'L', 'i', 't', 'e', ' ', 'f', 'o', 'r', 'm', 'a', 't', ' ', '3', 0x00};
+/** @} */
 
-/* === TAR at offset 257 === */
+/**
+ * @name TAR Archive Signatures
+ * @brief TAR magic at offset 257 (ustar format)
+ *
+ * TAR archives don't have magic at offset 0; the ustar magic
+ * appears at byte 257. Detected by detect_tar() special handler.
+ * @{
+ */
+/** POSIX ustar format (null-terminated) */
 static const uint8_t SIG_TAR_USTAR[] = {'u', 's', 't', 'a', 'r', 0x00};
+/** GNU tar ustar variant (space-padded) */
 static const uint8_t SIG_TAR_USTAR_SP[] = {'u', 's', 't', 'a', 'r', ' ', ' ', 0x00};
+/** @} */
 
-/*
- * Signature table - entries are sorted by magic_len (descending) at init time.
- * This ensures "most specific wins" - longer matches are checked first.
+/** @} */ /* End of sig_magic group */
+
+/**
+ * @brief Master signature table
+ *
+ * Contains all file format signatures for detection. Entries are
+ * accessed through sorted_index[] after initialization to ensure
+ * longest-match-first behavior (most specific wins).
+ *
+ * @par Table Format:
+ * Each entry contains:
+ * - magic: Pointer to magic byte array
+ * - magic_len: Length of magic bytes
+ * - offset: Byte offset from start (0 for most formats)
+ * - description: Human-readable format name
+ * - file_class: Category for grouping (FILE_CLASS_*)
+ * - is_binary: True if binary content (affects display mode)
+ * - trailer: Optional trailer bytes for validation (NULL if none)
+ * - trailer_len: Length of trailer bytes
+ *
+ * @internal
  */
 static file_signature_t signatures[] = {
     /* Images */
@@ -181,11 +331,41 @@ static file_signature_t signatures[] = {
     {NULL, 0, 0, NULL, FILE_CLASS_UNKNOWN, false, NULL, 0}
 };
 
-/* Sorted index for efficient lookup */
+/**
+ * @brief Sorted index for signature lookup
+ *
+ * Array of indices into signatures[] sorted by magic_len descending.
+ * This ensures longer (more specific) signatures are checked first.
+ * Allocated by signatures_init(), freed by signatures_cleanup().
+ *
+ * @internal
+ */
 static int *sorted_index = NULL;
+
+/**
+ * @brief Number of signatures in the table
+ *
+ * Counted during signatures_init() by iterating until NULL terminator.
+ *
+ * @internal
+ */
 static int signature_count = 0;
 
-/* Comparison function for qsort - sort by magic_len descending (longest first) */
+/**
+ * @brief qsort comparison function for signature index
+ *
+ * Compares two signature indices by their magic_len in descending order.
+ * Used to sort the index so longer (more specific) signatures are
+ * checked before shorter ones.
+ *
+ * @param[in] a Pointer to first index
+ * @param[in] b Pointer to second index
+ *
+ * @return Negative if a > b, positive if a < b, zero if equal
+ *         (reversed for descending order)
+ *
+ * @internal
+ */
 static int compare_by_magic_len(const void *a, const void *b) {
     int idx_a = *(const int *)a;
     int idx_b = *(const int *)b;
@@ -193,7 +373,32 @@ static int compare_by_magic_len(const void *a, const void *b) {
     return signatures[idx_b].magic_len - signatures[idx_a].magic_len;
 }
 
-/* Check for MP4/MOV/AVIF/HEIC (ISO Base Media File Format) at offset 4 */
+/**
+ * @brief Detect ISO Base Media File Format (ISOBMFF) containers
+ *
+ * Checks for MP4, MOV, AVIF, HEIC, and other ISOBMFF-based formats
+ * by looking for 'ftyp' box at offset 4 and identifying the brand
+ * at offset 8.
+ *
+ * @par ISOBMFF Structure:
+ * @code
+ * Offset  Content
+ * 0-3     Box size (big-endian)
+ * 4-7     Box type = "ftyp"
+ * 8-11    Brand (e.g., "isom", "avif", "heic", "mp41")
+ * 12+     Compatible brands
+ * @endcode
+ *
+ * @param[in]  data   Data buffer to analyze
+ * @param[in]  len    Length of data buffer
+ * @param[out] result Detection result structure
+ *
+ * @return true if ISOBMFF format detected, false otherwise
+ *
+ * @note This function sets result->confidence to 8 (ftyp + brand checked)
+ *
+ * @internal
+ */
 static bool detect_isobmff(const uint8_t *data, size_t len, signature_result_t *result) {
     if (len < 12) return false;
 
@@ -252,7 +457,30 @@ static bool detect_isobmff(const uint8_t *data, size_t len, signature_result_t *
     return true;
 }
 
-/* Check RIFF container type (WEBP, WAV, AVI) at offset 8 */
+/**
+ * @brief Detect RIFF container format (WebP, WAV, AVI)
+ *
+ * Checks for RIFF header at offset 0 and identifies the format type
+ * at offset 8. RIFF (Resource Interchange File Format) is used by
+ * WebP images, WAV audio, and AVI video.
+ *
+ * @par RIFF Structure:
+ * @code
+ * Offset  Content
+ * 0-3     "RIFF"
+ * 4-7     File size (little-endian)
+ * 8-11    Format type ("WEBP", "WAVE", "AVI ")
+ * 12+     Format-specific data
+ * @endcode
+ *
+ * @param[in]  data   Data buffer to analyze
+ * @param[in]  len    Length of data buffer
+ * @param[out] result Detection result structure
+ *
+ * @return true if RIFF format detected, false otherwise
+ *
+ * @internal
+ */
 static bool detect_riff(const uint8_t *data, size_t len, signature_result_t *result) {
     if (len < 12) return false;
     if (data[0] != 'R' || data[1] != 'I' || data[2] != 'F' || data[3] != 'F') {
@@ -279,7 +507,31 @@ static bool detect_riff(const uint8_t *data, size_t len, signature_result_t *res
     return true;
 }
 
-/* Check for TAR at offset 257 */
+/**
+ * @brief Detect TAR archive format
+ *
+ * TAR archives use the ustar magic string at offset 257, not at
+ * offset 0 like most formats. This function checks for both
+ * POSIX ustar and GNU tar variants.
+ *
+ * @par TAR Header Structure:
+ * @code
+ * Offset  Length  Content
+ * 0       100     Filename
+ * 100     8       File mode
+ * ...             (other header fields)
+ * 257     6       Magic ("ustar\0" or "ustar ")
+ * 263     2       Version
+ * @endcode
+ *
+ * @param[in]  data   Data buffer to analyze
+ * @param[in]  len    Length of data buffer (must be >= 265)
+ * @param[out] result Detection result structure
+ *
+ * @return true if TAR format detected, false otherwise
+ *
+ * @internal
+ */
 static bool detect_tar(const uint8_t *data, size_t len, signature_result_t *result) {
     if (len < 265) return false;
 
@@ -295,7 +547,23 @@ static bool detect_tar(const uint8_t *data, size_t len, signature_result_t *resu
     return false;
 }
 
-/* Initialize signature detection - builds sorted index */
+/**
+ * @brief Initialize the signature detection system
+ *
+ * Counts signatures in the table and builds a sorted index for
+ * efficient longest-match-first lookup. Must be called before
+ * using other signature detection functions.
+ *
+ * @return 0 on success, -1 on memory allocation failure
+ *
+ * @par Algorithm:
+ * 1. Count signatures by iterating until NULL terminator
+ * 2. Allocate sorted_index array
+ * 3. Initialize with sequential indices
+ * 4. Sort by magic_len descending using qsort()
+ *
+ * @see signatures_cleanup()
+ */
 int signatures_init(void) {
     /* Count signatures */
     signature_count = 0;
@@ -319,14 +587,44 @@ int signatures_init(void) {
     return 0;
 }
 
-/* Cleanup */
+/**
+ * @brief Clean up signature detection resources
+ *
+ * Frees the sorted index array and resets state. Safe to call
+ * multiple times. Should be called at program shutdown.
+ *
+ * @see signatures_init()
+ */
 void signatures_cleanup(void) {
     free(sorted_index);
     sorted_index = NULL;
     signature_count = 0;
 }
 
-/* Full detection with metadata */
+/**
+ * @brief Full file type detection with metadata
+ *
+ * Performs comprehensive signature detection and returns complete
+ * information about the detected format including class, binary flag,
+ * and trailer validation status.
+ *
+ * @par Detection Order:
+ * 1. Special container formats (ISOBMFF, RIFF, TAR) - need deeper inspection
+ * 2. Signature table scan using sorted index (longest matches first)
+ *
+ * @param[in]  data             Data buffer to analyze
+ * @param[in]  len              Length of data buffer (must be >= 2)
+ * @param[in]  validate_trailer Check trailer bytes for formats that have them
+ * @param[out] result           Detection result structure (zeroed if no match)
+ *
+ * @return true if a signature was detected, false otherwise
+ *
+ * @note The result structure is always zeroed before detection begins
+ * @note Trailer validation only occurs if the format has defined trailer
+ *       bytes and validate_trailer is true
+ *
+ * @see signature_detect() for simpler API returning just description
+ */
 bool signature_detect_full(const uint8_t *data, size_t len,
                            bool validate_trailer,
                            signature_result_t *result) {
@@ -372,7 +670,23 @@ bool signature_detect_full(const uint8_t *data, size_t len,
     return false;
 }
 
-/* Legacy API - returns description or NULL */
+/**
+ * @brief Simple file type detection (legacy API)
+ *
+ * Simplified detection that returns only the description string.
+ * For full metadata including file class and binary flag, use
+ * signature_detect_full() instead.
+ *
+ * @param[in] data Data buffer to analyze
+ * @param[in] len  Length of data buffer
+ *
+ * @return Description string if detected (e.g., "PNG image"),
+ *         NULL if no signature matched
+ *
+ * @deprecated Use signature_detect_full() for complete detection info
+ *
+ * @see signature_detect_full()
+ */
 const char *signature_detect(const uint8_t *data, size_t len) {
     signature_result_t result;
     if (signature_detect_full(data, len, false, &result)) {
@@ -381,7 +695,26 @@ const char *signature_detect(const uint8_t *data, size_t len) {
     return NULL;
 }
 
-/* Get human-readable class name */
+/**
+ * @brief Get human-readable name for file class
+ *
+ * Converts a file_class_t enum value to a display-friendly string
+ * suitable for UI output.
+ *
+ * @param[in] file_class The classification category to name
+ *
+ * @return Static string with class name (never NULL):
+ *         - FILE_CLASS_IMAGE → "Image"
+ *         - FILE_CLASS_VIDEO → "Video"
+ *         - FILE_CLASS_AUDIO → "Audio"
+ *         - FILE_CLASS_ARCHIVE → "Archive"
+ *         - FILE_CLASS_DOCUMENT → "Document"
+ *         - FILE_CLASS_FONT → "Font"
+ *         - FILE_CLASS_EXECUTABLE → "Executable"
+ *         - FILE_CLASS_DATABASE → "Database"
+ *         - FILE_CLASS_CONTAINER → "Container"
+ *         - FILE_CLASS_UNKNOWN/other → "Unknown"
+ */
 const char *signature_class_name(file_class_t file_class) {
     switch (file_class) {
         case FILE_CLASS_IMAGE:      return "Image";
@@ -397,7 +730,23 @@ const char *signature_class_name(file_class_t file_class) {
     }
 }
 
-/* Check if content is binary based on description */
+/**
+ * @brief Check if content type is binary based on description
+ *
+ * Looks up the description string in the signature table to
+ * determine if the content should be treated as binary data
+ * (displayed as hexdump rather than text).
+ *
+ * @param[in] description File type description from detection
+ *
+ * @return true if binary content, false if text content
+ *
+ * @note Returns false for NULL description
+ * @note Returns true for descriptions not found in table
+ *       (assumes special detections like ISOBMFF, RIFF, TAR are binary)
+ *
+ * @deprecated Use signature_detect_full() and check result.is_binary instead
+ */
 bool signature_is_binary(const char *description) {
     if (!description) return false;
 
@@ -412,7 +761,27 @@ bool signature_is_binary(const char *description) {
     return true;
 }
 
-/* Check if content is local file I/O (not HTTP traffic) */
+/**
+ * @brief Check if content indicates local file I/O
+ *
+ * Identifies file signatures that suggest the SSL data is from
+ * local file operations (file:// protocol, dlopen, etc.) rather
+ * than HTTP traffic. Used to filter out noise from local file reads.
+ *
+ * @par Detected Local File Types:
+ * - ELF binaries (Linux executables and libraries)
+ * - Mach-O binaries (macOS executables and libraries)
+ * - SQLite databases (local database files)
+ * - Java class files (JVM class loading)
+ *
+ * @param[in] description File type description from detection
+ *
+ * @return true if likely local file I/O, false if HTTP content
+ *
+ * @note This is a heuristic; some valid HTTP downloads could
+ *       match these patterns, but they're rare enough that
+ *       filtering them reduces noise significantly
+ */
 bool signature_is_local_file(const char *description) {
     if (!description) return false;
 

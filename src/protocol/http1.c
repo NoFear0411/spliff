@@ -1,22 +1,37 @@
-/*
+/**
+ * @file http1.c
+ * @brief HTTP/1.1 parser implementation using llhttp
+ *
+ * @details This module implements HTTP/1.1 parsing using llhttp, the
+ * official HTTP parser from Node.js. The parser uses callbacks to
+ * extract message components incrementally.
+ *
+ * @par llhttp Callback Flow:
+ * @code
+ * on_message_begin()
+ *       │
+ *       ├── on_url() [requests] / on_status() [responses]
+ *       │
+ *       ├── on_header_field()  ─┐
+ *       │                       │ (repeated for each header)
+ *       ├── on_header_value()  ─┘
+ *       │
+ *       ├── on_headers_complete()
+ *       │
+ *       ├── on_body() (repeated for body chunks)
+ *       │
+ *       └── on_message_complete()
+ * @endcode
+ *
+ * @par Chunked Encoding:
+ * llhttp automatically decodes chunked transfer encoding. The on_body()
+ * callback receives decoded data, not raw chunks.
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, version 3 of the License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- *
- * http1.c - HTTP/1.1 parser using llhttp
  */
 
 #include "http1.h"
@@ -27,31 +42,67 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/* Parser context - passed via parser->data */
+/**
+ * @brief Parser context structure
+ *
+ * Passed through llhttp via parser->data pointer. Maintains parsing
+ * state and accumulates results into the http_message_t output.
+ *
+ * @internal
+ */
 typedef struct {
-    http_message_t *msg;           /* Output message structure */
-    char current_header_name[MAX_HEADER_NAME];
-    size_t header_name_len;
-    bool in_header_value;
+    http_message_t *msg;           /**< Output message structure */
+    char current_header_name[MAX_HEADER_NAME]; /**< Current header name being parsed */
+    size_t header_name_len;        /**< Current header name length */
+    bool in_header_value;          /**< True if parsing header value */
 
-    /* Body tracking */
-    uint8_t *body_buf;             /* Body buffer (optional) */
-    size_t body_buf_size;
-    size_t body_len;
+    /** @name Body Tracking */
+    /** @{ */
+    uint8_t *body_buf;             /**< Body buffer (optional, may be NULL) */
+    size_t body_buf_size;          /**< Body buffer capacity */
+    size_t body_len;               /**< Current body length accumulated */
+    /** @} */
 
-    /* State */
-    bool headers_complete;
-    bool message_complete;
+    /** @name Parser State */
+    /** @{ */
+    bool headers_complete;         /**< Headers section finished */
+    bool message_complete;         /**< Full message parsed */
+    /** @} */
 } parse_context_t;
 
-/* Global settings (initialized once) */
+/**
+ * @brief Global llhttp settings with callbacks
+ *
+ * Initialized once by http1_init() and shared by all parse operations.
+ *
+ * @internal
+ */
 static llhttp_settings_t g_settings;
+
+/**
+ * @brief Initialization flag
+ * @internal
+ */
 static bool g_initialized = false;
 
-/* ============================================================================
- * llhttp Callbacks
- * ============================================================================ */
+/**
+ * @defgroup http1_callbacks llhttp Callbacks
+ * @brief Parser callback implementations
+ * @ingroup http1
+ * @internal
+ * @{
+ */
 
+/**
+ * @brief Called at start of new HTTP message
+ *
+ * Resets parser context state for the new message.
+ * Does not clear the output msg structure as caller may
+ * have set metadata (pid, comm, etc.) before parsing.
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @return 0 to continue parsing
+ */
 static int on_message_begin(llhttp_t *parser) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
 
@@ -66,6 +117,17 @@ static int on_message_begin(llhttp_t *parser) {
     return 0;
 }
 
+/**
+ * @brief Called with URL data (requests only)
+ *
+ * May be called multiple times as URL arrives in chunks.
+ * Appends to msg->path.
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @param[in]     at     URL fragment pointer
+ * @param[in]     len    URL fragment length
+ * @return 0 to continue parsing
+ */
 static int on_url(llhttp_t *parser, const char *at, size_t len) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
     http_message_t *msg = ctx->msg;
@@ -80,6 +142,16 @@ static int on_url(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Called with status text (responses only)
+ *
+ * Receives the status text portion (e.g., "OK" from "HTTP/1.1 200 OK").
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @param[in]     at     Status text fragment
+ * @param[in]     len    Fragment length
+ * @return 0 to continue parsing
+ */
 static int on_status(llhttp_t *parser, const char *at, size_t len) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
     http_message_t *msg = ctx->msg;
@@ -94,6 +166,17 @@ static int on_status(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Called with header field name
+ *
+ * May be called multiple times for one header if name arrives in chunks.
+ * Accumulates into ctx->current_header_name.
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @param[in]     at     Header name fragment
+ * @param[in]     len    Fragment length
+ * @return 0 to continue parsing
+ */
 static int on_header_field(llhttp_t *parser, const char *at, size_t len) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
 
@@ -113,6 +196,18 @@ static int on_header_field(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Called with header field value
+ *
+ * May be called multiple times for one header if value arrives in chunks.
+ * Copies header name from ctx->current_header_name on first call,
+ * then appends value data.
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @param[in]     at     Header value fragment
+ * @param[in]     len    Fragment length
+ * @return 0 to continue parsing
+ */
 static int on_header_value(llhttp_t *parser, const char *at, size_t len) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
     http_message_t *msg = ctx->msg;
@@ -141,6 +236,16 @@ static int on_header_value(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Called when header value is complete
+ *
+ * Extracts special headers (Host, Content-Type, Content-Encoding,
+ * Content-Length, Transfer-Encoding) into dedicated msg fields.
+ * Increments header_count and resets state for next header.
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @return 0 to continue parsing
+ */
 static int on_header_value_complete(llhttp_t *parser) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
     http_message_t *msg = ctx->msg;
@@ -174,6 +279,17 @@ static int on_header_value_complete(llhttp_t *parser) {
     return 0;
 }
 
+/**
+ * @brief Called when all headers have been parsed
+ *
+ * Determines message direction (request vs response) using llhttp_get_type().
+ * For requests: extracts method name.
+ * For responses: extracts status code.
+ * Sets protocol to PROTO_HTTP1 and extracts HTTP version.
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @return 0 to continue parsing
+ */
 static int on_headers_complete(llhttp_t *parser) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
     http_message_t *msg = ctx->msg;
@@ -206,6 +322,20 @@ static int on_headers_complete(llhttp_t *parser) {
     return 0;
 }
 
+/**
+ * @brief Called with body data
+ *
+ * May be called multiple times as body arrives. Data is already
+ * decoded if chunked transfer encoding was used.
+ *
+ * If ctx->body_buf is provided, accumulates data there up to
+ * ctx->body_buf_size.
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @param[in]     at     Body data fragment
+ * @param[in]     len    Fragment length (already chunk-decoded)
+ * @return 0 to continue parsing
+ */
 static int on_body(llhttp_t *parser, const char *at, size_t len) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
 
@@ -224,17 +354,37 @@ static int on_body(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Called when message is fully parsed
+ *
+ * Sets ctx->message_complete flag to indicate full message received.
+ *
+ * @param[in,out] parser llhttp parser instance
+ * @return 0 to complete parsing
+ */
 static int on_message_complete(llhttp_t *parser) {
     parse_context_t *ctx = (parse_context_t *)parser->data;
     ctx->message_complete = true;
     return 0;
 }
 
-/* ============================================================================
- * Public API
- * ============================================================================ */
+/** @} */ /* End of http1_callbacks group */
 
-/* Initialize HTTP/1.1 parser module */
+/**
+ * @defgroup http1_public HTTP/1.1 Public API
+ * @brief Public parsing functions
+ * @ingroup http1
+ * @{
+ */
+
+/**
+ * @brief Initialize HTTP/1.1 parser module
+ *
+ * Sets up llhttp_settings_t with callback functions. Safe to call
+ * multiple times; subsequent calls are no-ops.
+ *
+ * @return Always 0
+ */
 int http1_init(void) {
     if (g_initialized) return 0;
 
@@ -255,12 +405,26 @@ int http1_init(void) {
     return 0;
 }
 
-/* Cleanup */
+/**
+ * @brief Clean up parser resources
+ *
+ * Resets initialization flag. Currently no resources to free as
+ * llhttp_settings_t is statically allocated.
+ */
 void http1_cleanup(void) {
     g_initialized = false;
 }
 
-/* Check if data looks like HTTP/1.1 request */
+/**
+ * @brief Check if data appears to be HTTP/1.1 request
+ *
+ * Fast heuristic check for HTTP method prefixes without full parsing.
+ * Checks for: GET, POST, PUT, HEAD, DELETE, OPTIONS, PATCH, CONNECT, TRACE.
+ *
+ * @param[in] data Data buffer to check
+ * @param[in] len  Buffer length
+ * @return true if data starts with HTTP method
+ */
 bool http1_is_request(const uint8_t *data, size_t len) {
     if (len < 4) return false;
 
@@ -276,17 +440,39 @@ bool http1_is_request(const uint8_t *data, size_t len) {
             memcmp(data, "TRACE ", 6) == 0);
 }
 
-/* Check if data looks like HTTP/1.1 response */
+/**
+ * @brief Check if data appears to be HTTP/1.1 response
+ *
+ * Checks for "HTTP/1." prefix which indicates HTTP response status line.
+ *
+ * @param[in] data Data buffer to check
+ * @param[in] len  Buffer length
+ * @return true if data starts with HTTP version string
+ */
 bool http1_is_response(const uint8_t *data, size_t len) {
     return len >= 9 && memcmp(data, "HTTP/1.", 7) == 0;
 }
 
-/* Parse HTTP/1.1 message using llhttp
+/**
+ * @brief Parse HTTP/1.1 message using llhttp
  *
- * This function parses HTTP headers and optionally the body.
- * If body_buf is provided, body data is accumulated there (already chunk-decoded).
+ * Full HTTP/1.1 parser that extracts headers and optionally body.
+ * Uses llhttp in HTTP_BOTH mode for automatic request/response detection.
  *
- * Returns: number of bytes parsed, or -1 on error
+ * @par Implementation Notes:
+ * - Message structure is zeroed before parsing
+ * - Auto-initializes if http1_init() not called
+ * - Partial messages are acceptable (headers complete is sufficient)
+ * - Body data is already chunk-decoded by llhttp
+ *
+ * @param[in]  data          Raw HTTP data
+ * @param[in]  len           Data length
+ * @param[out] msg           Output message structure
+ * @param[out] body_buf      Optional body accumulation buffer
+ * @param[in]  body_buf_size Body buffer capacity
+ * @param[out] body_len_out  Output: actual body bytes accumulated
+ *
+ * @return Data length on success (may have partial body), -1 on error
  */
 int http1_parse(const uint8_t *data, size_t len, http_message_t *msg,
                 uint8_t *body_buf, size_t body_buf_size, size_t *body_len_out) {
@@ -327,7 +513,19 @@ int http1_parse(const uint8_t *data, size_t len, http_message_t *msg,
     return (int)len;
 }
 
-/* Parse HTTP/1.1 headers only (compatibility wrapper) */
+/**
+ * @brief Parse HTTP/1.1 headers only (compatibility wrapper)
+ *
+ * Simplified interface that parses headers without body accumulation.
+ * Direction parameter is ignored; llhttp auto-detects.
+ *
+ * @param[in]  data Raw HTTP data
+ * @param[in]  len  Data length
+ * @param[out] msg  Output message structure
+ * @param[in]  dir  Direction hint (ignored)
+ *
+ * @deprecated Use http1_parse() directly
+ */
 void http1_parse_headers(const uint8_t *data, size_t len, http_message_t *msg, direction_t dir) {
     (void)dir;  /* Ignored - llhttp auto-detects direction */
 
@@ -335,9 +533,17 @@ void http1_parse_headers(const uint8_t *data, size_t len, http_message_t *msg, d
     http1_parse(data, len, msg, NULL, 0, NULL);
 }
 
-/* Find body start position (after \r\n\r\n)
- * Note: With llhttp, this is mainly for compatibility.
- * The on_body callback provides body data directly.
+/**
+ * @brief Find body start position
+ *
+ * Locates the header terminator (\\r\\n\\r\\n) and returns the offset
+ * where body content begins.
+ *
+ * @param[in] data Raw HTTP data
+ * @param[in] len  Data length
+ * @return Byte offset of body start, or -1 if not found
+ *
+ * @note Prefer http1_parse() which provides body data via callbacks
  */
 int http1_find_body_start(const uint8_t *data, size_t len) {
     const uint8_t *pos = (const uint8_t *)memmem(data, len, "\r\n\r\n", 4);
@@ -347,10 +553,30 @@ int http1_find_body_start(const uint8_t *data, size_t len) {
     return -1;
 }
 
-/* Decode chunked transfer encoding
+/**
+ * @brief Decode chunked transfer encoding
  *
- * Note: llhttp handles chunked decoding automatically in the on_body callback.
- * This function is kept for compatibility with code that processes raw data.
+ * Manually decodes HTTP/1.1 chunked encoding for compatibility with
+ * code that processes raw data outside the llhttp callback flow.
+ *
+ * @par Chunked Format:
+ * @code
+ * <hex-size>[;chunk-ext]\r\n
+ * <chunk-data>\r\n
+ * ...
+ * 0\r\n
+ * [trailer-headers]\r\n
+ * @endcode
+ *
+ * @param[in]  in       Chunked-encoded input
+ * @param[in]  in_len   Input length
+ * @param[out] out      Decoded output buffer
+ * @param[in]  out_size Output buffer capacity
+ *
+ * @return Bytes written to out, or -1 on error
+ *
+ * @note llhttp handles this automatically in on_body(); this function
+ *       is provided for direct data manipulation scenarios
  */
 int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_size) {
     const uint8_t *pos = in;
@@ -390,3 +616,5 @@ int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t 
 
     return (int)(out_pos - out);
 }
+
+/** @} */ /* End of http1_public group */

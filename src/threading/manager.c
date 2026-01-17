@@ -1,16 +1,48 @@
-/*
+/**
+ * @file manager.c
+ * @brief Threading manager implementation
+ *
+ * @details The threading manager is the top-level coordinator for the
+ * multi-threaded event processing pipeline. It handles:
+ * - Auto-detection of optimal worker count based on CPU cores
+ * - Initialization of all thread contexts
+ * - Thread creation with optional CPU affinity
+ * - Ordered graceful shutdown
+ * - Statistics collection and reporting
+ *
+ * @par Startup Sequence:
+ * @code
+ *   threading_init()
+ *       │
+ *       └── Initialize worker contexts
+ *
+ *   threading_start()
+ *       │
+ *       ├── Initialize dispatcher context
+ *       ├── Initialize output context
+ *       ├── Create worker threads
+ *       ├── Create output thread
+ *       └── Create dispatcher thread
+ * @endcode
+ *
+ * @par Shutdown Sequence:
+ * @code
+ *   threading_shutdown()
+ *       │
+ *       ├── 1. Stop dispatcher (no new events)
+ *       ├── 2. Stop workers (drain input queues)
+ *       └── 3. Stop output (drain output queues)
+ *
+ *   threading_cleanup()
+ *       │
+ *       └── Free all resources
+ * @endcode
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * manager.c - Threading manager implementation
- *
- * Coordinates all threading components:
- * - Auto-detects optimal worker count based on CPU cores
- * - Initializes and starts all threads
- * - Handles graceful shutdown
- * - Collects and prints statistics
  */
 
 #include "threading.h"
@@ -23,18 +55,25 @@
 #include <sys/sysinfo.h>
 #include <signal.h>
 
-/* Global manager for signal handler access */
+/** Global manager for signal handler access */
 static threading_mgr_t *g_threading_mgr = NULL;
 
-/* ============================================================================
- * CPU Detection
- * ============================================================================ */
+/**
+ * @defgroup manager_cpu CPU Detection
+ * @brief Auto-detection of optimal worker count
+ * @{
+ */
 
-/*
- * Calculate default worker count based on available CPU cores
+/**
+ * @brief Calculate default worker count based on available CPU cores
  *
- * Formula: max(1, nprocs - 3) capped at MAX_WORKERS
- * Reserves cores for: main thread, dispatcher, output thread
+ * Uses get_nprocs() to determine available cores and reserves 3 for
+ * system threads (main, dispatcher, output).
+ *
+ * @par Formula:
+ * workers = max(1, nprocs - 3) capped at MAX_WORKERS
+ *
+ * @return Recommended number of worker threads
  */
 int threading_default_workers(void) {
     int nproc = get_nprocs();
@@ -55,18 +94,27 @@ int threading_default_workers(void) {
     return workers;
 }
 
-/* ============================================================================
- * Threading Manager Initialization
- * ============================================================================ */
+/** @} */ /* end manager_cpu */
 
-/*
- * Initialize threading manager
+/**
+ * @defgroup manager_init Manager Initialization
+ * @brief Setup and teardown for threading manager
+ * @{
+ */
+
+/**
+ * @brief Initialize threading manager
  *
- * @param mgr         Manager structure to initialize
- * @param num_workers Number of worker threads (0 = auto-detect)
- * @param pin_cores   Whether to pin threads to CPU cores
+ * Allocates and initializes all worker contexts but does not start
+ * any threads. Call threading_start() to begin processing.
+ *
+ * @param[out] mgr         Manager structure to initialize
+ * @param[in]  num_workers Number of worker threads (0 = auto-detect)
+ * @param[in]  pin_cores   Whether to pin threads to CPU cores
  *
  * @return 0 on success, -1 on failure
+ *
+ * @note On failure, partially initialized workers are cleaned up
  */
 int threading_init(threading_mgr_t *mgr, int num_workers, bool pin_cores) {
     if (!mgr) {
@@ -109,13 +157,22 @@ int threading_init(threading_mgr_t *mgr, int num_workers, bool pin_cores) {
     return 0;
 }
 
-/*
- * Start all threads
+/**
+ * @brief Start all threads
  *
- * @param mgr      Initialized manager
- * @param handler  BPF probe handler to use for dispatcher
+ * Creates and starts all threads in order:
+ * 1. Worker threads (with optional CPU affinity)
+ * 2. Output thread
+ * 3. Dispatcher thread
  *
- * @return 0 on success, -1 on failure
+ * @par CPU Pinning:
+ * If pin_cores is enabled, workers are pinned to cores 3+ to avoid
+ * contention with main/dispatcher/output threads on cores 0-2.
+ *
+ * @param[in] mgr     Initialized manager
+ * @param[in] handler BPF probe handler for dispatcher
+ *
+ * @return 0 on success, -1 on failure (threads cleaned up)
  */
 int threading_start(threading_mgr_t *mgr, probe_handler_t *handler) {
     if (!mgr || !mgr->initialized || !handler) {
@@ -199,12 +256,23 @@ int threading_start(threading_mgr_t *mgr, probe_handler_t *handler) {
     return 0;
 }
 
-/* ============================================================================
- * Shutdown
- * ============================================================================ */
+/** @} */ /* end manager_init */
 
-/*
- * Request graceful shutdown
+/**
+ * @defgroup manager_shutdown Shutdown
+ * @brief Graceful shutdown coordination
+ * @{
+ */
+
+/**
+ * @brief Request graceful shutdown
+ *
+ * Stops threads in order to ensure all events are processed:
+ * 1. Dispatcher stops (no new events accepted)
+ * 2. Workers drain input queues and stop
+ * 3. Output thread drains output queues and stops
+ *
+ * @note This function blocks until all threads have exited.
  */
 void threading_shutdown(threading_mgr_t *mgr) {
     if (!mgr || !mgr->initialized) {
@@ -244,8 +312,11 @@ void threading_shutdown(threading_mgr_t *mgr) {
     fprintf(stderr, "  Output thread stopped\n");
 }
 
-/*
- * Cleanup all resources
+/**
+ * @brief Cleanup all resources
+ *
+ * Frees all allocated memory for workers, dispatcher, and output.
+ * Must be called after threading_shutdown().
  */
 void threading_cleanup(threading_mgr_t *mgr) {
     if (!mgr) {
@@ -266,12 +337,21 @@ void threading_cleanup(threading_mgr_t *mgr) {
     fprintf(stderr, "Threading: cleanup complete\n");
 }
 
-/* ============================================================================
- * Statistics
- * ============================================================================ */
+/** @} */ /* end manager_shutdown */
 
-/*
- * Print threading statistics
+/**
+ * @defgroup manager_stats Statistics
+ * @brief Threading statistics collection and display
+ * @{
+ */
+
+/**
+ * @brief Print threading statistics to stderr
+ *
+ * Outputs comprehensive statistics including:
+ * - Dispatcher events dispatched/dropped
+ * - Per-worker events processed/dropped and wait cycle distribution
+ * - Output thread messages/bytes written
  */
 void threading_print_stats(threading_mgr_t *mgr) {
     if (!mgr || !mgr->initialized) {
@@ -337,20 +417,35 @@ void threading_print_stats(threading_mgr_t *mgr) {
     fprintf(stderr, "\n");
 }
 
-/* ============================================================================
- * Helper Functions
- * ============================================================================ */
+/** @} */ /* end manager_stats */
 
-/*
- * Check if threading is enabled and running
+/**
+ * @defgroup manager_helpers Helper Functions
+ * @brief Global manager access utilities
+ * @{
+ */
+
+/**
+ * @brief Check if threading is enabled and running
+ *
+ * @param[in] mgr Manager to check
+ *
+ * @return true if manager is initialized and not shutting down
  */
 bool threading_is_running(threading_mgr_t *mgr) {
     return mgr && mgr->initialized && !atomic_load(&mgr->shutdown_requested);
 }
 
-/*
- * Get global threading manager (for signal handlers)
+/**
+ * @brief Get global threading manager instance
+ *
+ * Returns the singleton manager set during threading_init().
+ * Useful for signal handlers that need manager access.
+ *
+ * @return Manager pointer, or NULL if not initialized
  */
 threading_mgr_t *threading_get_manager(void) {
     return g_threading_mgr;
 }
+
+/** @} */ /* end manager_helpers */
