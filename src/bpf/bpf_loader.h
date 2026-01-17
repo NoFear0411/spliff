@@ -26,7 +26,7 @@
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
-#define MAX_LINKS 32
+#define SPLIFF_MAX_LINKS 64   /* Renamed to avoid conflict with linux/netlink.h */
 #define MAX_DISCOVERED_LIBS 32   /* Maximum unique library paths to track */
 #define MAX_PATHS_PER_TYPE 8     /* Maximum paths per library type */
 #define MAX_XDP_INTERFACES 32    /* Maximum network interfaces for XDP */
@@ -94,7 +94,7 @@ typedef struct {
 /* BPF loader state */
 typedef struct {
     struct bpf_object *obj;
-    struct bpf_link *links[MAX_LINKS];
+    struct bpf_link *links[SPLIFF_MAX_LINKS];
     int link_count;
     xdp_loader_t xdp;                        /* XDP-specific state */
 } bpf_loader_t;
@@ -115,6 +115,7 @@ typedef enum {
     LIB_NSS,
     LIB_NSS_SSL,
     LIB_WOLFSSL,
+    LIB_BORINGSSL,
     LIB_TYPE_COUNT
 } lib_type_t;
 
@@ -133,6 +134,31 @@ typedef struct {
     bool found;
 } lib_paths_t;
 
+/* Maximum BoringSSL binaries to track */
+#define MAX_BORINGSSL_BINARIES 16
+
+/* Discovered BoringSSL binary - EDR-style detection result
+ * This struct caches everything needed to attach probes, avoiding repeated lookups.
+ * The detection is purely behavioral: any binary with BoringSSL signature and
+ * known build ID gets probed, regardless of its name or path.
+ */
+typedef struct {
+    char path[512];              /* Full path to binary (from /proc/PID/exe) */
+    char build_id[65];           /* ELF build ID hex string */
+    uint64_t binary_size;        /* Binary size in bytes */
+    int process_count;           /* Number of running processes using this binary */
+    bool offsets_known;          /* Build ID found in offset database */
+    /* Cached offsets from database lookup (avoids repeated lookups) */
+    uint64_t ssl_read_offset;    /* File offset of SSL_read */
+    uint64_t ssl_write_offset;   /* File offset of SSL_write */
+    uint64_t ssl_read_impl_offset;   /* Internal ssl_read_impl (Golden Hook) */
+    uint64_t ssl_write_impl_offset;  /* Internal DoPayloadWrite (Golden Hook) */
+    uint64_t do_payload_read_offset; /* DoPayloadRead - best hook point */
+    uint64_t socket_read_offset;     /* ReadIfReady - async I/O entry */
+    uint64_t on_read_ready_offset;   /* OnReadReady - async I/O completion */
+    const char *version_info;    /* Version string from database (or NULL) */
+} discovered_boringssl_t;
+
 /* Discovery result - holds multiple library paths per type */
 typedef struct {
     /* Quick lookup by type (first path found) - backward compatible */
@@ -141,6 +167,10 @@ typedef struct {
 
     /* Extended: all unique paths per type */
     lib_paths_t extended[LIB_TYPE_COUNT];
+
+    /* BoringSSL binaries discovered from running processes (EDR-style) */
+    discovered_boringssl_t boringssl[MAX_BORINGSSL_BINARIES];
+    int boringssl_count;     /* Number of unique BoringSSL binaries found */
 
     /* Statistics */
     int processes_scanned;
@@ -176,6 +206,24 @@ int bpf_loader_attach_uprobe(bpf_loader_t *loader, const char *lib,
                              const char *sym, const char *prog_name,
                              bool is_ret, bool debug);
 
+/* Attach uprobe by file offset (for stripped binaries)
+ * Used for binaries like Chrome with statically linked BoringSSL
+ * where symbols are not available. The offset should be the file offset
+ * of the function prologue, not the virtual address.
+ *
+ * Parameters:
+ *   loader     - BPF loader
+ *   binary     - Path to binary (e.g., "/opt/google/chrome/chrome")
+ *   offset     - File offset of function (from binary scanner)
+ *   prog_name  - Name of BPF program to attach
+ *   is_ret     - True for uretprobe, false for uprobe
+ *   debug      - Enable debug output
+ *
+ * Returns 0 on success, -1 on failure */
+int bpf_loader_attach_uprobe_offset(bpf_loader_t *loader, const char *binary,
+                                     uint64_t offset, const char *prog_name,
+                                     bool is_ret, bool debug);
+
 /* Attach tracepoint - returns 0 on success, -1 on failure */
 int bpf_loader_attach_tracepoint(bpf_loader_t *loader, const char *category,
                                   const char *name, const char *prog_name,
@@ -192,6 +240,28 @@ const char *bpf_loader_lib_type_name(lib_type_t type);
 
 /* Print discovered libraries (for verbose output) */
 void bpf_loader_print_discovery(const lib_discovery_result_t *result);
+
+/* Discover BoringSSL binaries from running processes (EDR-style detection)
+ *
+ * Scans /proc for binaries containing BoringSSL signatures, extracts build IDs,
+ * and looks up offsets in the database. This is a behavioral detection approach:
+ * any binary with BoringSSL signature and known build ID gets discovered,
+ * regardless of its name, path, or the application it belongs to.
+ *
+ * Detection flow:
+ *   1. Enumerate unique binary paths from /proc/PID/exe
+ *   2. Filter by minimum size (performance optimization)
+ *   3. Check for BoringSSL signature in binary
+ *   4. Extract ELF build ID
+ *   5. Look up offsets in embedded database
+ *
+ * @param result         Discovery result to populate (boringssl array)
+ * @param min_size_mb    Minimum binary size in MB to scan (0 = no filter)
+ * @param debug          Enable debug output
+ * @return Number of BoringSSL binaries discovered with known offsets
+ */
+int bpf_loader_discover_boringssl(lib_discovery_result_t *result,
+                                   uint64_t min_size_mb, bool debug);
 
 /* Cleanup BPF resources */
 void bpf_loader_cleanup(bpf_loader_t *loader);

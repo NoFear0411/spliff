@@ -1,15 +1,43 @@
-/*
+/**
+ * @file dispatcher.c
+ * @brief Dispatcher thread implementation
+ *
+ * @details The dispatcher is the single consumer of the BPF ring buffer.
+ * It receives SSL events from kernel eBPF probes and routes them to
+ * worker threads using flow affinity hashing.
+ *
+ * @par Responsibilities:
+ * - Poll BPF ring buffer for SSL events
+ * - Route events to workers using flow_hash(pid, ssl_ctx)
+ * - Handle process lifecycle events (exec, exit) directly
+ * - Handle XDP flow discovery events
+ * - Manage backpressure when worker queues are full
+ *
+ * @par Event Flow:
+ * @code
+ *   eBPF Probes                          Dispatcher                     Workers
+ *       │                                     │                            │
+ *       │ SSL_read/write event                │                            │
+ *       ├────────────────────────────────────►│                            │
+ *       │                                     │ flow_hash(pid,ssl_ctx)     │
+ *       │                                     ├───────────────────────────►│
+ *       │                                     │                            │
+ *       │ Process exit event                  │                            │
+ *       ├────────────────────────────────────►│                            │
+ *       │                                     │ cleanup_pid() (direct)     │
+ *       │                                     ├───────────────────────────►│
+ * @endcode
+ *
+ * @par Flow Affinity:
+ * Events with the same (pid, ssl_ctx) always go to the same worker.
+ * This ensures connection state (HTTP/2 sessions, HPACK contexts)
+ * is only accessed by a single thread, eliminating locking.
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * dispatcher.c - Dispatcher thread implementation
- *
- * The dispatcher thread:
- * - Polls the BPF ring buffer for SSL events
- * - Routes events to workers using flow affinity (same connection → same worker)
- * - Handles backpressure when worker queues are full
  */
 
 #include "threading.h"
@@ -21,15 +49,34 @@
 #include <errno.h>
 #include <arpa/inet.h>  /* For ntohl/ntohs */
 
-/* Global dispatcher context (for BPF callback) */
+/** Global dispatcher context for BPF callback access */
 static dispatcher_ctx_t *g_dispatcher = NULL;
 
-/* ============================================================================
- * Event Dispatch
- * ============================================================================ */
+/**
+ * @defgroup dispatcher_routing Event Routing
+ * @brief Flow affinity routing to workers
+ * @{
+ */
 
-/*
- * Dispatch event to appropriate worker based on flow affinity
+/**
+ * @brief Dispatch event to appropriate worker based on flow affinity
+ *
+ * Copies BPF event data into a worker_event_t, computes routing info,
+ * and enqueues to the target worker's input ring.
+ *
+ * @par Backpressure Handling:
+ * If worker's event pool is empty or input ring is full, the event
+ * is dropped and drop counters are incremented. This prevents the
+ * dispatcher from blocking.
+ *
+ * @par Wake-up Signaling:
+ * If has_work flag was false (worker might be sleeping), writes to
+ * worker's eventfd to wake it up.
+ *
+ * @param[in] ctx       Dispatcher context
+ * @param[in] bpf_event BPF ring buffer event
+ *
+ * @return 0 on success, -1 if event was dropped
  */
 static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
                                      const ssl_data_event_t *bpf_event) {
@@ -93,9 +140,22 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
     return 0;
 }
 
-/*
- * BPF ring buffer callback
- * Called by libbpf for each event in the ring buffer
+/**
+ * @brief BPF ring buffer callback
+ *
+ * Called by probe_handler_poll() for each event in the BPF ring buffer.
+ * Routes SSL data events to workers, handles lifecycle events directly.
+ *
+ * @par Event Routing:
+ * - EVENT_SSL_READ/WRITE: Dispatched to worker via flow affinity
+ * - EVENT_PROCESS_EXEC: Calls lifecycle callback (dynamic SSL detection)
+ * - EVENT_PROCESS_EXIT: Calls dispatcher_cleanup_pid() directly
+ * - EVENT_NSS_SSL_FD: Handled by probe_handler (not dispatched)
+ *
+ * @param[in] event   BPF event data
+ * @param[in] ctx_arg Dispatcher context
+ *
+ * @return 0 to continue processing
  */
 static int dispatcher_bpf_callback(const ssl_data_event_t *event, void *ctx_arg) {
     dispatcher_ctx_t *ctx = (dispatcher_ctx_t *)ctx_arg;
@@ -104,30 +164,61 @@ static int dispatcher_bpf_callback(const ssl_data_event_t *event, void *ctx_arg)
         return 0;
     }
 
-    /* Handle special event types that don't need dispatching */
+    /* Handle special event types that don't need dispatching to workers */
     if (event->event_type == EVENT_NSS_SSL_FD) {
         /* NSS SSL FD tracking is handled by probe_handler */
         return 0;
     }
 
-    /* Dispatch to worker */
+    /* Process lifecycle events - handle directly (not dispatched to workers) */
+    if (event->event_type == EVENT_PROCESS_EXIT) {
+        /* Cleanup all worker resources for this PID */
+        dispatcher_cleanup_pid(ctx, event->pid);
+        return 0;
+    }
+
+    if (event->event_type == EVENT_PROCESS_EXEC) {
+        /* Dynamic SSL library detection via callback */
+        if (ctx->lifecycle_cb) {
+            ctx->lifecycle_cb(event, ctx->lifecycle_ctx);
+        }
+        return 0;
+    }
+
+    /* Dispatch SSL data events to worker */
     dispatch_event_to_worker(ctx, event);
     return 0;
 }
 
-/*
- * Wrapper callback that matches probe_handler's expected signature
+/**
+ * @brief Wrapper callback matching probe_handler's expected signature
+ *
+ * Adapts void return type to int return type expected by BPF ring buffer.
  */
 static void dispatcher_event_callback(const ssl_data_event_t *event, void *ctx) {
     dispatcher_bpf_callback(event, ctx);
 }
 
-/* ============================================================================
- * Dispatcher Initialization
- * ============================================================================ */
+/** @} */ /* end dispatcher_routing */
 
-/*
- * Initialize dispatcher context
+/**
+ * @defgroup dispatcher_init Dispatcher Initialization
+ * @brief Setup and teardown for dispatcher thread
+ * @{
+ */
+
+/**
+ * @brief Initialize dispatcher context
+ *
+ * Sets up dispatcher with references to BPF ring buffer and worker array.
+ * Does not start the dispatcher thread.
+ *
+ * @param[out] ctx         Dispatcher context to initialize
+ * @param[in]  handler     BPF probe handler with ring buffer
+ * @param[in]  workers     Array of worker contexts
+ * @param[in]  num_workers Number of workers
+ *
+ * @return 0 on success, -1 on invalid arguments
  */
 int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
                     worker_ctx_t *workers, int num_workers) {
@@ -150,8 +241,11 @@ int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
     return 0;
 }
 
-/*
- * Cleanup dispatcher context
+/**
+ * @brief Cleanup dispatcher context
+ *
+ * Clears references and global state. Should be called after
+ * dispatcher thread has exited.
  */
 void dispatcher_cleanup(dispatcher_ctx_t *ctx) {
     if (!ctx) {
@@ -162,14 +256,95 @@ void dispatcher_cleanup(dispatcher_ctx_t *ctx) {
     ctx->handler = NULL;
     ctx->workers = NULL;
     ctx->num_workers = 0;
+    ctx->lifecycle_cb = NULL;
+    ctx->lifecycle_ctx = NULL;
 }
 
-/* ============================================================================
- * Dispatcher Thread
- * ============================================================================ */
+/**
+ * @brief Set process lifecycle callback for dynamic SSL detection
+ *
+ * Called when EVENT_PROCESS_EXEC is received. The callback can scan
+ * the new process for SSL libraries and attach probes dynamically.
+ *
+ * @param[in] ctx      Dispatcher context
+ * @param[in] cb       Callback function
+ * @param[in] user_ctx User context passed to callback
+ */
+void dispatcher_set_lifecycle_callback(dispatcher_ctx_t *ctx, process_lifecycle_cb_t cb, void *user_ctx) {
+    if (!ctx) return;
+    ctx->lifecycle_cb = cb;
+    ctx->lifecycle_ctx = user_ctx;
+}
 
-/*
- * Dispatcher thread entry point
+/**
+ * @brief Cleanup all resources for a PID across all workers
+ *
+ * Called when a process exits (EVENT_PROCESS_EXIT). Iterates through
+ * all workers and cleans up:
+ * - HTTP/2 connections and streams
+ * - Pending body buffers
+ * - ALPN cache entries
+ * - HTTP/1.1 request cache entries
+ *
+ * @param[in] ctx Dispatcher context
+ * @param[in] pid Process ID that exited
+ *
+ * @note This accesses worker state directly, which is safe because
+ *       the exit event means no more events will arrive for this PID.
+ */
+void dispatcher_cleanup_pid(dispatcher_ctx_t *ctx, uint32_t pid) {
+    if (!ctx || !ctx->workers) return;
+
+    for (int i = 0; i < ctx->num_workers; i++) {
+        worker_state_t *state = &ctx->workers[i].state;
+
+        /* Cleanup HTTP/2 connections and streams for this PID */
+        for (int j = 0; j < MAX_H2_SESSIONS_PER_WORKER; j++) {
+            h2_connection_local_t *conn = &state->h2_connections[j];
+            if (conn->active && conn->pid == pid) {
+                worker_cleanup_h2_connection(state, conn);
+            }
+        }
+
+        /* Cleanup pending bodies for this PID */
+        worker_cleanup_pending_bodies_pid(state, pid);
+
+        /* Cleanup ALPN cache entries for this PID */
+        for (int j = 0; j < MAX_ALPN_CACHE_PER_WORKER; j++) {
+            if (state->alpn_cache[j].pid == pid) {
+                state->alpn_cache[j].pid = 0;
+                state->alpn_cache[j].ssl_ctx = 0;
+                state->alpn_cache[j].alpn_proto[0] = '\0';
+            }
+        }
+
+        /* Cleanup HTTP/1 request cache for this PID */
+        for (int j = 0; j < MAX_H1_REQUEST_CACHE_PER_WORKER; j++) {
+            if (state->h1_request_cache[j].pid == pid) {
+                state->h1_request_cache[j].pid = 0;
+                state->h1_request_cache[j].ssl_ctx = 0;
+            }
+        }
+    }
+}
+
+/** @} */ /* end dispatcher_init */
+
+/**
+ * @defgroup dispatcher_thread Dispatcher Thread Loop
+ * @brief Main dispatcher thread implementation
+ * @{
+ */
+
+/**
+ * @brief Dispatcher thread entry point
+ *
+ * Main loop that polls the BPF ring buffer and dispatches events.
+ * Runs until running flag is cleared.
+ *
+ * @param[in] arg Pointer to dispatcher_ctx_t
+ *
+ * @return NULL
  */
 void *dispatcher_thread_main(void *arg) {
     dispatcher_ctx_t *ctx = (dispatcher_ctx_t *)arg;
@@ -203,12 +378,19 @@ void *dispatcher_thread_main(void *arg) {
     return NULL;
 }
 
-/* ============================================================================
- * Statistics
- * ============================================================================ */
+/** @} */ /* end dispatcher_thread */
 
-/*
- * Get dispatcher statistics
+/**
+ * @defgroup dispatcher_stats Dispatcher Statistics
+ * @brief Statistics accessors for dispatcher
+ * @{
+ */
+
+/**
+ * @brief Get dispatcher statistics
+ *
+ * Returns atomic counters for events dispatched and dropped.
+ * All output parameters are optional (pass NULL to skip).
  */
 void dispatcher_get_stats(dispatcher_ctx_t *ctx, uint64_t *dispatched,
                           uint64_t *dropped) {
@@ -222,8 +404,11 @@ void dispatcher_get_stats(dispatcher_ctx_t *ctx, uint64_t *dispatched,
     if (dropped) *dropped = atomic_load(&ctx->events_dropped);
 }
 
-/*
- * Get XDP statistics
+/**
+ * @brief Get XDP event statistics
+ *
+ * Returns atomic counters for XDP flow discovery events.
+ * All output parameters are optional (pass NULL to skip).
  */
 void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
                                uint64_t *flows_terminated, uint64_t *ambiguous,
@@ -242,20 +427,24 @@ void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
     if (dropped) *dropped = atomic_load(&ctx->xdp_events_dropped);
 }
 
-/* ============================================================================
- * XDP Event Handling
- * ============================================================================
+/** @} */ /* end dispatcher_stats */
+
+/**
+ * @defgroup dispatcher_xdp XDP Event Handling
+ * @brief XDP flow discovery event processing
+ *
  * Event type is inferred from struct size + tcp_flags:
- *   - 172 bytes = xdp_payload_event_t → AMBIGUOUS (needs PCRE2-JIT)
- *   - 56 bytes + FIN/RST = xdp_packet_event_t → FLOW_END
- *   - 56 bytes otherwise = xdp_packet_event_t → FLOW_NEW
+ * - 172 bytes = xdp_payload_event_t → AMBIGUOUS (needs PCRE2-JIT)
+ * - 56 bytes + FIN/RST = xdp_packet_event_t → FLOW_END
+ * - 56 bytes otherwise = xdp_packet_event_t → FLOW_NEW
+ * @{
  */
 
-/* Debug sampling rate - print 1 in N events to avoid performance issues */
+/** Debug sampling rate - print 1 in N events to avoid performance issues */
 #define XDP_DEBUG_SAMPLE_RATE 1000
 
-/*
- * Get category name for display
+/**
+ * @brief Get human-readable category name for display
  */
 static const char *xdp_category_name(uint8_t category) {
     switch (category) {
@@ -269,8 +458,10 @@ static const char *xdp_category_name(uint8_t category) {
     }
 }
 
-/*
- * Format IPv4 address for display
+/**
+ * @brief Format IPv4 address for display
+ *
+ * Converts network-byte-order IP to dotted-decimal string.
  */
 static void format_ipv4(uint32_t ip_net, char *buf, size_t buf_size) {
     uint32_t ip = ntohl(ip_net);
@@ -281,13 +472,22 @@ static void format_ipv4(uint32_t ip_net, char *buf, size_t buf_size) {
              ip & 0xFF);
 }
 
-/*
- * XDP event handler callback
- * Called by ring_buffer__poll() for each XDP event
+/**
+ * @brief XDP event handler callback
  *
- * Event type is inferred from struct size:
- *   - sizeof(xdp_payload_event_t) = 172 → AMBIGUOUS
- *   - sizeof(xdp_packet_event_t) = 56 → FLOW_NEW or FLOW_END
+ * Called by ring_buffer__poll() for each XDP event. Event type is
+ * inferred from struct size since BPF ring buffers don't carry type info.
+ *
+ * @par Event Types:
+ * - 172 bytes (xdp_payload_event_t): AMBIGUOUS - needs PCRE2-JIT
+ * - 56 bytes (xdp_packet_event_t) + FIN/RST: FLOW_END
+ * - 56 bytes (xdp_packet_event_t) otherwise: FLOW_NEW
+ *
+ * @param[in] ctx     User context (dispatcher_ctx_t*)
+ * @param[in] data    Event data
+ * @param[in] data_sz Event data size
+ *
+ * @return 0 to continue processing
  */
 int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
     dispatcher_ctx_t *dispatcher = (dispatcher_ctx_t *)ctx;
@@ -408,3 +608,5 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
 
     return 0;  /* Continue processing */
 }
+
+/** @} */ /* end dispatcher_xdp */

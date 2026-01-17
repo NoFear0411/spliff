@@ -1,20 +1,25 @@
-/*
+/**
+ * @file display.c
+ * @brief Implementation of console output formatting and display functions
+ *
+ * @details This file implements the display module for spliff, handling
+ * all formatted console output including HTTP traffic, TLS events,
+ * and body content visualization.
+ *
+ * Key features:
+ * - Thread-safe timestamp generation
+ * - Configurable ANSI color output
+ * - Automatic content type detection (text vs binary)
+ * - Human-readable latency formatting
+ * - File signature detection for binary content
+ *
+ * @see display.h for public API documentation
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, version 3 of the License.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 #include "display.h"
@@ -23,26 +28,60 @@
 #include <string.h>
 #include <time.h>
 
-/* Global color setting */
+/**
+ * @brief Global color output setting
+ *
+ * When true, ANSI escape codes are included in output.
+ * When false, all color codes are replaced with empty strings.
+ *
+ * @internal
+ */
 static bool g_use_colors = true;
 
-/* Initialize display module */
+/**
+ * @brief Initialize the display module
+ *
+ * @param use_colors Whether to enable ANSI color output
+ * @return Always returns 0 (success)
+ */
 int display_init(bool use_colors) {
     g_use_colors = use_colors;
     return 0;
 }
 
-/* Cleanup */
+/**
+ * @brief Clean up display module resources
+ *
+ * Currently a no-op, but provided for API completeness and
+ * future extensibility (e.g., flushing buffered output).
+ */
 void display_cleanup(void) {
     /* No cleanup needed */
 }
 
-/* Get color code (respects color setting) */
+/**
+ * @brief Get color code respecting color configuration
+ *
+ * @param color_code The ANSI color code to potentially return
+ * @return The color code if colors enabled, empty string otherwise
+ */
 const char *display_color(const char *color_code) {
     return g_use_colors ? color_code : "";
 }
 
-/* Format latency for display */
+/**
+ * @brief Format latency for human-readable display
+ *
+ * Automatically selects appropriate units based on magnitude:
+ * - Nanoseconds for < 1µs
+ * - Microseconds for < 1ms
+ * - Milliseconds for < 1s
+ * - Seconds for >= 1s
+ *
+ * @param delta_ns Latency in nanoseconds
+ * @param buf      Output buffer
+ * @param size     Size of output buffer
+ */
 void display_format_latency(uint64_t delta_ns, char *buf, size_t size) {
     if (delta_ns < 1000) {
         snprintf(buf, size, "%luns", (unsigned long)delta_ns);
@@ -55,7 +94,15 @@ void display_format_latency(uint64_t delta_ns, char *buf, size_t size) {
     }
 }
 
-/* Get current timestamp string (thread-safe) */
+/**
+ * @brief Get current timestamp as formatted string
+ *
+ * Thread-safe implementation using POSIX localtime_r.
+ * Format: HH:MM:SS.mmm
+ *
+ * @param buf  Output buffer
+ * @param size Size of output buffer
+ */
 void display_get_timestamp(char *buf, size_t size) {
     if (size == 0) return;
     struct timespec ts;
@@ -70,7 +117,16 @@ void display_get_timestamp(char *buf, size_t size) {
     }
 }
 
-/* Display HTTP request */
+/**
+ * @brief Display formatted HTTP request
+ *
+ * Output format:
+ * @code
+ * HH:MM:SS.mmm → METHOD https://host/path ALPN:proto process (pid) [latency] [stream N]
+ * @endcode
+ *
+ * @param msg HTTP message containing request data
+ */
 void display_http_request(const http_message_t *msg) {
     char ts[32];
     display_get_timestamp(ts, sizeof(ts));
@@ -120,7 +176,21 @@ void display_http_request(const http_message_t *msg) {
     printf("\n");
 }
 
-/* Display HTTP response */
+/**
+ * @brief Display formatted HTTP response
+ *
+ * Output format:
+ * @code
+ * HH:MM:SS.mmm ← STATUS https://host/path ALPN:proto content-type (size) process (pid) [latency] [stream N]
+ * @endcode
+ *
+ * Status codes are color-coded:
+ * - 2xx: Green (success)
+ * - 3xx: Yellow (redirect)
+ * - 4xx/5xx: Red (error)
+ *
+ * @param msg HTTP message containing response data
+ */
 void display_http_response(const http_message_t *msg) {
     char ts[32];
     display_get_timestamp(ts, sizeof(ts));
@@ -183,7 +253,11 @@ void display_http_response(const http_message_t *msg) {
     printf("\n");
 }
 
-/* Display HTTP headers */
+/**
+ * @brief Display HTTP headers
+ *
+ * @param msg HTTP message containing headers to display
+ */
 void display_http_headers(const http_message_t *msg) {
     for (int i = 0; i < msg->header_count && i < MAX_HEADERS; i++) {
         printf("  %s%s:%s %s\n",
@@ -192,7 +266,17 @@ void display_http_headers(const http_message_t *msg) {
     }
 }
 
-/* Check if content type indicates text */
+/**
+ * @brief Check if content type indicates text content
+ *
+ * Checks for common text MIME types that should be displayed as-is
+ * rather than as hexdump.
+ *
+ * @param content_type Content-Type header value
+ * @return true if content is textual, false for binary
+ *
+ * @internal
+ */
 static bool is_text_content_type(const char *content_type) {
     if (!content_type || !content_type[0]) return false;
 
@@ -206,7 +290,18 @@ static bool is_text_content_type(const char *content_type) {
             strstr(content_type, "+xml") != NULL);
 }
 
-/* Check if data looks like printable text */
+/**
+ * @brief Check if data appears to be printable text
+ *
+ * Samples the first 512 bytes to determine if the content
+ * is likely text (printable ASCII or valid UTF-8).
+ *
+ * @param data Data buffer to check
+ * @param len  Length of data
+ * @return true if data appears to be text, false if binary
+ *
+ * @internal
+ */
 static bool is_printable_text(const uint8_t *data, size_t len) {
     /* Sample first 512 bytes to check */
     size_t check_len = len > 512 ? 512 : len;
@@ -228,7 +323,17 @@ static bool is_printable_text(const uint8_t *data, size_t len) {
     return true;
 }
 
-/* Display body content */
+/**
+ * @brief Display HTTP body content
+ *
+ * Automatically determines display format based on content type
+ * and data inspection. Text content is printed as-is, binary
+ * content is shown as hexdump.
+ *
+ * @param data         Body data
+ * @param len          Length of body data
+ * @param content_type Content-Type header (may be NULL)
+ */
 void display_body(const uint8_t *data, size_t len, const char *content_type) {
     if (len == 0) return;
 
@@ -279,7 +384,17 @@ void display_body(const uint8_t *data, size_t len, const char *content_type) {
     printf("%s────────────%s\n", display_color(C_DIM), display_color(C_RESET));
 }
 
-/* Display body with file signature detection and hexdump */
+/**
+ * @brief Display body as hexdump with file signature detection
+ *
+ * Always shows hexdump format with automatic file signature
+ * detection using magic bytes. Displays detected file type,
+ * class, and trailer validation status when applicable.
+ *
+ * @param data         Body data
+ * @param len          Length of body data
+ * @param content_type Content-Type header (fallback if no signature detected)
+ */
 void display_body_hex(const uint8_t *data, size_t len, const char *content_type) {
     if (len == 0) return;
 
@@ -341,7 +456,17 @@ void display_body_hex(const uint8_t *data, size_t len, const char *content_type)
     printf("%s────────────%s\n", display_color(C_DIM), display_color(C_RESET));
 }
 
-/* Display TLS handshake event */
+/**
+ * @brief Display TLS handshake event
+ *
+ * Shows completed TLS handshakes with timing information.
+ * Skips in-progress events (result < 0) to reduce noise.
+ *
+ * @param pid      Process ID
+ * @param comm     Process name
+ * @param delta_ns Handshake duration in nanoseconds
+ * @param result   Handshake result code
+ */
 void display_handshake(uint32_t pid, const char *comm, uint64_t delta_ns, int result) {
     char ts[32];
     display_get_timestamp(ts, sizeof(ts));

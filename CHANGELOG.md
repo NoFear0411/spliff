@@ -2,6 +2,48 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.0] - 2026-01-18
+
+### Added
+- **Comprehensive Doxygen Documentation**: Full API documentation for all modules
+  - File-level documentation with architecture diagrams
+  - Function documentation with parameters, return values, and usage notes
+  - Structure documentation with field descriptions
+  - Grouped functions by category using `@defgroup`
+  - ASCII diagrams in `@code` blocks for visual architecture understanding
+  - CMake integration: `make docs` generates HTML documentation
+
+- **Dynamic Process Monitoring**: EDR-style process lifecycle tracking
+  - BPF tracepoints for `sched_process_exec` and `sched_process_fork`
+  - Runtime detection of processes starting after spliff launch
+  - Dynamic uprobe attachment to newly discovered SSL libraries
+  - Process exit cleanup via `sched_process_exit` tracepoint
+
+- **BoringSSL/Chromium Detection (Experimental)**: Browser SSL interception
+  - Heuristic binary scanning for stripped BoringSSL binaries
+  - Automatic detection of Chrome, Chromium, Brave, and Edge browsers
+  - Function offset discovery without debug symbols
+  - Path-based deduplication prevents duplicate probe attachment
+  - **Note**: Experimental feature - may be flaky due to stripped binaries
+
+- **HPACK Fallback Parser**: Mid-stream HTTP/2 recovery
+  - Attempts literal header parsing when HPACK decompression fails
+  - Improves capture success rate for mid-connection attachments
+
+### Changed
+- **Documentation**: All source files now include comprehensive Doxygen comments
+  - Threading module: threading.h, manager.c, dispatcher.c, worker.c, output.c, state.c, pool.c
+  - Protocol module: http1.c, http2.c
+  - Content module: decompressor.c, signatures.c
+  - Output module: display.c
+  - Utility module: safe_str.c
+
+### Known Issues
+- **Chrome/Chromium Support**: Experimental and may cause crashes or miss traffic
+  - BoringSSL offsets vary between browser versions and distributions
+  - No stable ABI - function signatures may change without notice
+  - Recommended to use Firefox (NSS) for reliable browser traffic capture
+
 ## [0.8.1] - 2026-01-13
 
 ### Fixed

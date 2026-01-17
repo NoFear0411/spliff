@@ -34,6 +34,7 @@
 #define EVENT_ALPN         4
 #define EVENT_NSS_SSL_FD   5  // NSS SSL_ImportFD tracking (verified TLS connection)
 #define EVENT_XDP_PACKET   6  // XDP packet metadata event
+#define EVENT_PROCESS_EXEC 7  // New process exec - dynamic probe attachment
 
 // Address families for socket filtering
 #define AF_UNIX     1   // Unix domain socket (IPC - filter out)
@@ -65,6 +66,7 @@ struct ssl_args {
     __u64 ssl_ctx;        // SSL context pointer
     __u64 buf_ptr;        // Buffer pointer
     __u32 len;            // Requested length
+    __u64 out_len_ptr;    // Output length pointer (for SSL_read_ex/SSL_write_ex)
 };
 
 // Handshake state saved between entry and exit probes
@@ -273,6 +275,35 @@ struct {
     __type(key, __u64);    // PRFileDesc pointer
     __type(value, __u8);
 } nss_ssl_fds SEC(".maps");
+
+// Debug counter for SSL operations (to verify probes still fire)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} ssl_op_counter SEC(".maps");
+
+// =============================================================================
+// Chrome Async I/O Tracking - SSLClientSocketImpl buffer correlation
+// =============================================================================
+// Chrome uses async I/O: SSLClientSocketImpl::Read() may return immediately
+// with ERR_IO_PENDING. When data arrives, OnReadReady() is called.
+// We need to track the IOBuffer* where data will eventually be stored.
+//
+// Map: SSLClientSocketImpl* (this ptr) → socket_read_args
+struct socket_read_args {
+    __u64 io_buffer;     // IOBuffer* where data will be stored
+    __u32 buf_len;       // Requested read length
+    __u64 timestamp_ns;  // When Read() was called
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 2048);
+    __type(key, __u64);    // SSLClientSocketImpl* (this ptr)
+    __type(value, struct socket_read_args);
+} socket_read_map SEC(".maps");
 
 // =============================================================================
 // XDP Maps - Flow Tracking, Socket Cookie Correlation, Session Registry
@@ -634,6 +665,198 @@ static __always_inline void update_session_protocol(__u64 ssl_ctx, __u32 protoco
 
 
 // =============================================================================
+// Chrome/BoringSSL Internal Probes (Golden Hooks)
+// =============================================================================
+//
+// =============================================================================
+// Chrome/BoringSSL Internal Function Probes
+// =============================================================================
+//
+// IMPORTANT: From Ghidra decompilation of Chromium 143:
+//
+// ssl_read_impl(SSL *ssl) - ONLY takes SSL* pointer!
+//   - RDI: SSL* context (ONLY argument)
+//   - Returns: int (bytes available or error code)
+//   - Buffer is NOT passed - data goes to internal SSL buffers
+//   - SSL_read then does memcpy from internal buffer to user buffer
+//
+// SSL_read(SSL*, void* buf, int len) - Standard 3-arg signature
+//   - This is the correct hook point for capturing read data
+//   - Entry: save buf/len, Exit: read data using return value
+//
+// SSL_write(SSL*, void* buf, int len) - Standard 3-arg signature
+//   - Entry: capture data immediately from buf
+//   - Exit: get bytes written from return value
+//
+// DoPayloadRead(this, span.data, span.size) - base::span passed by value
+//   - RSI contains data pointer, RDX contains size
+//
+// DoPayloadWrite(this) - NO buffer arguments!
+//   - Buffer is at *(this+0x50)+0x10, length at this+0x58
+//   - Cannot capture write data from arguments
+// =============================================================================
+
+// NOTE: ssl_read_impl only takes SSL* - we use this for correlation only.
+// Actual data capture happens via SSL_read (probe_ssl_rw_enter/probe_ssl_read_exit)
+SEC("uprobe/ssl_read_impl_enter")
+int BPF_UPROBE(probe_ssl_read_impl_enter, void *ssl_ctx) {
+    __u32 tid = get_tid();
+
+    bpf_printk("SSL_READ_IMPL_ENTER: ssl=%lx tid=%u (correlation only)",
+               (unsigned long)ssl_ctx, tid);
+
+    // Just save SSL* for correlation - no buffer info available here
+    struct ssl_args args = {
+        .ssl_ctx = (__u64)ssl_ctx,
+        .buf_ptr = 0,  // Not available - ssl_read_impl has no buf arg
+        .len = 0,      // Not available
+    };
+
+    bpf_map_update_elem(&ssl_args_map, &tid, &args, BPF_ANY);
+
+    __u64 ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY);
+
+    return 0;
+}
+
+// DoPayloadWrite is a C++ method: this pointer in RDI
+// The IOBuffer is stored in the object, not passed as argument
+SEC("uprobe/do_payload_write_enter")
+int BPF_UPROBE(probe_do_payload_write_enter, void *this_ptr) {
+    __u32 tid = get_tid();
+
+    // For DoPayloadWrite, 'this' is SSLClientSocketImpl*
+    // We store it as ssl_ctx for correlation purposes
+    struct ssl_args args = {
+        .ssl_ctx = (__u64)this_ptr,
+        .buf_ptr = 0,  // IOBuffer is in object state
+        .len = 0,
+    };
+
+    bpf_map_update_elem(&ssl_args_map, &tid, &args, BPF_ANY);
+
+    __u64 ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY);
+
+    return 0;
+}
+
+// =============================================================================
+// Chrome Async I/O Probes - SSLClientSocketImpl::Read and OnReadReady
+// =============================================================================
+//
+// Chrome's network stack uses async I/O:
+//   1. Read(IOBuffer*, int, callback) is called - may return ERR_IO_PENDING
+//   2. When data arrives, OnReadReady() is called
+//   3. OnReadReady() internally calls SSL_read() to drain data
+//
+// We save the IOBuffer* on Read() entry, then when SSL_read exits with data,
+// we can correlate and capture the actual decrypted content.
+
+// SSLClientSocketImpl::ReadIfReady(net::IOBuffer*, int, base::OnceCallback)
+// C++ method: this in RDI, IOBuffer* in RSI, buf_len in RDX
+// IOBuffer inherits from RefCounted. Layout: [vtable:8][data_:8]
+// From Ghidra analysis: data_ (raw char*) is at offset +8
+SEC("uprobe/socket_read_enter")
+int BPF_UPROBE(probe_socket_read_enter, void *this_ptr, void *io_buffer, int buf_len) {
+    __u64 this_key = (__u64)this_ptr;
+    __u32 tid = get_tid();
+
+    // Dereference IOBuffer to get the actual char* data_ pointer
+    // IOBuffer layout: data_ is at offset +8 (after vtable)
+    void *raw_buffer = NULL;
+    if (io_buffer) {
+        int ret = bpf_probe_read_user(&raw_buffer, sizeof(raw_buffer),
+                                       (void *)((char *)io_buffer + 0x8));
+        if (ret != 0) {
+            bpf_printk("SOCKET_READ: failed to read IOBuffer data_ ptr");
+            return 0;
+        }
+    }
+
+    // Save the IOBuffer mapping for async completion
+    struct socket_read_args args = {
+        .io_buffer = (__u64)raw_buffer,
+        .buf_len = (__u32)buf_len,
+        .timestamp_ns = bpf_ktime_get_ns(),
+    };
+
+    bpf_map_update_elem(&socket_read_map, &this_key, &args, BPF_ANY);
+
+    // Also save in ssl_args_map so ssl_read_exit can correlate
+    struct ssl_args ssl_args = {
+        .ssl_ctx = this_key,
+        .buf_ptr = (__u64)raw_buffer,
+        .len = (__u32)buf_len,
+    };
+    bpf_map_update_elem(&ssl_args_map, &tid, &ssl_args, BPF_ANY);
+
+    __u64 ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY);
+
+    bpf_printk("SOCKET_READ: this=%lx iobuf=%lx raw=%lx len=%d",
+               (unsigned long)this_ptr, (unsigned long)io_buffer,
+               (unsigned long)raw_buffer, buf_len);
+
+    return 0;
+}
+
+// =============================================================================
+// SSLClientSocketImpl::DoPayloadRead - THE BEST HOOK POINT
+// =============================================================================
+// DoPayloadRead receives the raw char* buffer directly (already extracted from IOBuffer).
+// From Chromium disassembly:
+//   - arg1 (rdi): this pointer (SSLClientSocketImpl*)
+//   - arg2 (rsi): raw char* buffer pointer
+//   - arg3 (rdx): buffer length
+// This is called before SSL_read and has direct access to the buffer.
+SEC("uprobe/do_payload_read_enter")
+int BPF_UPROBE(probe_do_payload_read_enter, void *this_ptr, void *buf, int buf_len) {
+    __u32 tid = get_tid();
+
+    bpf_printk("DO_PAYLOAD_READ: this=%lx buf=%lx len=%d tid=%u",
+               (unsigned long)this_ptr, (unsigned long)buf, buf_len, tid);
+
+    // Save the buffer info - ssl_read_impl_enter/exit will use this
+    struct ssl_args ssl_args = {
+        .ssl_ctx = (__u64)this_ptr,  // this pointer for correlation
+        .buf_ptr = (__u64)buf,       // Raw buffer pointer (char*)
+        .len = (__u32)buf_len,
+    };
+    bpf_map_update_elem(&ssl_args_map, &tid, &ssl_args, BPF_ANY);
+
+    __u64 ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY);
+
+    return 0;
+}
+
+// SSLClientSocketImpl::OnReadReady() - async completion callback
+// C++ method: this in RDI (no other args - it's a void() callback)
+// Note: OnReadReady and OnWriteReady share the same address due to ICF optimization
+// We use the 'this' pointer to distinguish read vs write context
+SEC("uprobe/on_read_ready")
+int BPF_UPROBE(probe_on_read_ready, void *this_ptr) {
+    __u64 this_key = (__u64)this_ptr;
+
+    // Look up saved IOBuffer from Read() entry
+    struct socket_read_args *saved = bpf_map_lookup_elem(&socket_read_map, &this_key);
+    if (saved) {
+        bpf_printk("ON_READ_READY: this=%lx iobuf=%lx (async completion)",
+                   (unsigned long)this_ptr, (unsigned long)saved->io_buffer);
+
+        // The actual SSL_read call will happen next and be captured by ssl_read_exit
+        // We just log here for debugging the async flow
+    } else {
+        bpf_printk("ON_READ_READY: this=%lx (no saved buffer - write ready?)",
+                   (unsigned long)this_ptr);
+    }
+
+    return 0;
+}
+
+// =============================================================================
 // SSL Read/Write Entry Probe
 // Called for: SSL_read, SSL_write, gnutls_record_recv, gnutls_record_send,
 //             PR_Read, PR_Write, PR_Recv, PR_Send
@@ -642,6 +865,17 @@ static __always_inline void update_session_protocol(__u64 ssl_ctx, __u32 protoco
 SEC("uprobe/ssl_rw_enter")
 int BPF_UPROBE(probe_ssl_rw_enter, void *ssl_ctx, void *buf, int num) {
     __u32 tid = get_tid();
+
+    // Debug: print every SSL_read/SSL_write call for Chrome debugging
+    bpf_printk("SSL_RW_ENTER: ssl=%lx buf=%lx num=%d tid=%u",
+               (unsigned long)ssl_ctx, (unsigned long)buf, num, tid);
+
+    // Debug: count SSL operations
+    __u32 zero = 0;
+    __u64 *counter = bpf_map_lookup_elem(&ssl_op_counter, &zero);
+    if (counter) {
+        __sync_fetch_and_add(counter, 1);
+    }
 
     // Save SSL context, buffer address and length for the exit probe
     struct ssl_args args = {
@@ -667,13 +901,13 @@ SEC("uretprobe/ssl_read_exit")
 int BPF_URETPROBE(probe_ssl_read_exit) {
     __u32 tid = get_tid();
     __u32 zero = 0;
-    
+
     // Lookup saved arguments
     struct ssl_args *args = bpf_map_lookup_elem(&ssl_args_map, &tid);
     if (!args) {
         return 0;
     }
-    
+
     // Get return value (bytes read)
     int ret = PT_REGS_RC((struct pt_regs *)ctx);
     if (ret <= 0) {
@@ -792,6 +1026,208 @@ int BPF_URETPROBE(probe_ssl_write_exit) {
         }
     }
     
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
+
+    // Submit event - size must be bounded for verifier
+    __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
+    if (submit_size > sizeof(struct ssl_data_event)) {
+        submit_size = sizeof(struct ssl_data_event);
+    }
+    bpf_ringbuf_output(&ssl_events, event, submit_size & 0xFFFF, 0);
+
+    // Cleanup
+    bpf_map_delete_elem(&ssl_args_map, &tid);
+    bpf_map_delete_elem(&start_ns, &tid);
+
+    return 0;
+}
+
+// =============================================================================
+// SSL_read_ex / SSL_write_ex Entry Probe (OpenSSL 3.x)
+// int SSL_read_ex(SSL *ssl, void *buf, size_t num, size_t *readbytes)
+// int SSL_write_ex(SSL *ssl, const void *buf, size_t num, size_t *written)
+// Returns 1 on success, 0 on failure. Actual bytes in output pointer.
+// =============================================================================
+
+SEC("uprobe/ssl_rw_ex_enter")
+int BPF_UPROBE(probe_ssl_rw_ex_enter, void *ssl_ctx, void *buf, size_t num, size_t *out_len) {
+    __u32 tid = get_tid();
+
+    // Save SSL context, buffer address, length, and output length pointer
+    struct ssl_args args = {
+        .ssl_ctx = (__u64)ssl_ctx,
+        .buf_ptr = (__u64)buf,
+        .len = (__u32)num,
+        .out_len_ptr = (__u64)out_len,
+    };
+
+    bpf_map_update_elem(&ssl_args_map, &tid, &args, BPF_ANY);
+
+    // Save start timestamp for latency calculation
+    __u64 ts = bpf_ktime_get_ns();
+    bpf_map_update_elem(&start_ns, &tid, &ts, BPF_ANY);
+
+    return 0;
+}
+
+// =============================================================================
+// SSL_read_ex Exit Probe
+// =============================================================================
+
+SEC("uretprobe/ssl_read_ex_exit")
+int BPF_URETPROBE(probe_ssl_read_ex_exit) {
+    __u32 tid = get_tid();
+    __u32 zero = 0;
+
+    // Lookup saved arguments
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_args_map, &tid);
+    if (!args) {
+        return 0;
+    }
+
+    // Get return value (1=success, 0=failure for _ex variants)
+    int ret = PT_REGS_RC((struct pt_regs *)ctx);
+    if (ret != 1) {
+        // Failure - no data
+        bpf_map_delete_elem(&ssl_args_map, &tid);
+        bpf_map_delete_elem(&start_ns, &tid);
+        return 0;
+    }
+
+    // Read actual bytes from output pointer
+    size_t bytes_read = 0;
+    if (args->out_len_ptr != 0) {
+        bpf_probe_read_user(&bytes_read, sizeof(bytes_read), (void *)args->out_len_ptr);
+    }
+
+    if (bytes_read == 0) {
+        bpf_map_delete_elem(&ssl_args_map, &tid);
+        bpf_map_delete_elem(&start_ns, &tid);
+        return 0;
+    }
+
+    // Get event buffer
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        bpf_map_delete_elem(&ssl_args_map, &tid);
+        bpf_map_delete_elem(&start_ns, &tid);
+        return 0;
+    }
+
+    // Fill metadata
+    fill_event_metadata(event);
+    event->event_type = EVENT_SSL_READ;
+    event->len = (__u32)bytes_read;
+    event->ssl_ctx = args->ssl_ctx;
+
+    // Calculate latency
+    __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
+    if (tsp) {
+        event->delta_ns = event->timestamp_ns - *tsp;
+    }
+
+    // Copy data from userspace buffer
+    __u32 buf_copy_size = (__u32)bytes_read;
+    if (buf_copy_size > MAX_BUF_SIZE) {
+        buf_copy_size = MAX_BUF_SIZE;
+    }
+
+    event->buf_filled = 0;
+    if (args->buf_ptr != 0) {
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        if (err == 0) {
+            event->buf_filled = buf_copy_size;
+        }
+    }
+
+    // Track this PID for process exit cleanup
+    track_pid(event->pid);
+
+    // Submit event - size must be bounded for verifier
+    __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
+    if (submit_size > sizeof(struct ssl_data_event)) {
+        submit_size = sizeof(struct ssl_data_event);
+    }
+    bpf_ringbuf_output(&ssl_events, event, submit_size & 0xFFFF, 0);
+
+    // Cleanup
+    bpf_map_delete_elem(&ssl_args_map, &tid);
+    bpf_map_delete_elem(&start_ns, &tid);
+
+    return 0;
+}
+
+// =============================================================================
+// SSL_write_ex Exit Probe
+// =============================================================================
+
+SEC("uretprobe/ssl_write_ex_exit")
+int BPF_URETPROBE(probe_ssl_write_ex_exit) {
+    __u32 tid = get_tid();
+    __u32 zero = 0;
+
+    // Lookup saved arguments
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_args_map, &tid);
+    if (!args) {
+        return 0;
+    }
+
+    // Get return value (1=success, 0=failure for _ex variants)
+    int ret = PT_REGS_RC((struct pt_regs *)ctx);
+    if (ret != 1) {
+        // Failure - no data
+        bpf_map_delete_elem(&ssl_args_map, &tid);
+        bpf_map_delete_elem(&start_ns, &tid);
+        return 0;
+    }
+
+    // Read actual bytes from output pointer
+    size_t bytes_written = 0;
+    if (args->out_len_ptr != 0) {
+        bpf_probe_read_user(&bytes_written, sizeof(bytes_written), (void *)args->out_len_ptr);
+    }
+
+    if (bytes_written == 0) {
+        bpf_map_delete_elem(&ssl_args_map, &tid);
+        bpf_map_delete_elem(&start_ns, &tid);
+        return 0;
+    }
+
+    // Get event buffer
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        bpf_map_delete_elem(&ssl_args_map, &tid);
+        bpf_map_delete_elem(&start_ns, &tid);
+        return 0;
+    }
+
+    // Fill metadata
+    fill_event_metadata(event);
+    event->event_type = EVENT_SSL_WRITE;
+    event->len = (__u32)bytes_written;
+    event->ssl_ctx = args->ssl_ctx;
+
+    // Calculate latency
+    __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
+    if (tsp) {
+        event->delta_ns = event->timestamp_ns - *tsp;
+    }
+
+    // Copy data from userspace buffer
+    __u32 buf_copy_size = (__u32)bytes_written;
+    if (buf_copy_size > MAX_BUF_SIZE) {
+        buf_copy_size = MAX_BUF_SIZE;
+    }
+
+    event->buf_filled = 0;
+    if (args->buf_ptr != 0) {
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        if (err == 0) {
+            event->buf_filled = buf_copy_size;
+        }
+    }
+
     // Track this PID for process exit cleanup
     track_pid(event->pid);
 
@@ -1786,6 +2222,80 @@ int BPF_UPROBE(probe_gnutls_deinit, void *session) {
 }
 
 // =============================================================================
+// Syscall Correlation Hooks (for Chrome/BoringSSL FD discovery)
+// =============================================================================
+//
+// Chrome's BoringSSL doesn't call SSL_set_fd, so we can't track SSL* → fd
+// via that hook. Instead, we use "EDR Proxy" correlation:
+//
+// 1. When SSL_read/SSL_write is called, ssl_args_map[tid] has the SSL* pointer
+// 2. Internally, BoringSSL calls write()/read()/sendto()/recvfrom() syscalls
+// 3. These syscall hooks fire WHILE still inside SSL_read/SSL_write (same thread)
+// 4. We check if ssl_args_map[tid] exists - if yes, we found the fd!
+// 5. We update ssl_to_fd[SSL*] = fd for future lookups
+//
+// This works because SSL operations are synchronous and single-threaded.
+// =============================================================================
+
+// Helper to correlate SSL context with file descriptor
+static __always_inline void try_correlate_ssl_fd(__s32 fd) {
+    // Only correlate valid fds (skip stdin/stdout/stderr)
+    if (fd < 3) return;
+
+    __u32 tid = bpf_get_current_pid_tgid() & 0xFFFFFFFF;
+
+    // Check if this thread is currently inside an SSL_read/SSL_write
+    struct ssl_args *args = bpf_map_lookup_elem(&ssl_args_map, &tid);
+    if (!args) {
+        return;
+    }
+
+    __u64 ssl_ctx = args->ssl_ctx;
+    if (!ssl_ctx) return;
+
+    // Check if we already have this mapping (avoid redundant updates)
+    __s32 *existing = bpf_map_lookup_elem(&ssl_to_fd, &ssl_ctx);
+    if (existing) return;
+
+    // Found a new SSL* → fd correlation! Store it.
+    bpf_map_update_elem(&ssl_to_fd, &ssl_ctx, &fd, BPF_NOEXIST);
+    bpf_printk("CORRELATED: tid=%u ssl=%lx fd=%d", tid, ssl_ctx, fd);
+}
+
+// Syscall hook: write(int fd, const void *buf, size_t count)
+// Raw tracepoint gives us access to syscall args directly
+SEC("tracepoint/syscalls/sys_enter_write")
+int trace_sys_enter_write(struct trace_event_raw_sys_enter *ctx) {
+    __s32 fd = (__s32)ctx->args[0];
+    try_correlate_ssl_fd(fd);
+    return 0;
+}
+
+// Syscall hook: read(int fd, void *buf, size_t count)
+SEC("tracepoint/syscalls/sys_enter_read")
+int trace_sys_enter_read(struct trace_event_raw_sys_enter *ctx) {
+    __s32 fd = (__s32)ctx->args[0];
+    try_correlate_ssl_fd(fd);
+    return 0;
+}
+
+// Syscall hook: sendto(int fd, const void *buf, size_t len, int flags, ...)
+SEC("tracepoint/syscalls/sys_enter_sendto")
+int trace_sys_enter_sendto(struct trace_event_raw_sys_enter *ctx) {
+    __s32 fd = (__s32)ctx->args[0];
+    try_correlate_ssl_fd(fd);
+    return 0;
+}
+
+// Syscall hook: recvfrom(int fd, void *buf, size_t len, int flags, ...)
+SEC("tracepoint/syscalls/sys_enter_recvfrom")
+int trace_sys_enter_recvfrom(struct trace_event_raw_sys_enter *ctx) {
+    __s32 fd = (__s32)ctx->args[0];
+    try_correlate_ssl_fd(fd);
+    return 0;
+}
+
+// =============================================================================
 // Process Exit Tracepoint
 // Notifies userspace when a tracked process exits for session cleanup
 // =============================================================================
@@ -1829,6 +2339,70 @@ int handle_process_exit(void *ctx) {
     // Submit event (small, no buffer data)
     bpf_ringbuf_output(&ssl_events, event,
                        sizeof(struct ssl_data_event) - MAX_BUF_SIZE, 0);
+
+    return 0;
+}
+
+// =============================================================================
+// Process Exec Tracepoint - Dynamic SSL Library Detection
+// Notifies userspace when ANY new process starts so it can check for SSL libs
+// Supports: OpenSSL, GnuTLS, NSS/NSPR, BoringSSL, WolfSSL
+// =============================================================================
+
+SEC("tracepoint/sched/sched_process_exec")
+int handle_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid = pid_tgid >> 32;
+    __u32 zero = 0;
+
+    // Get event buffer from per-CPU heap
+    struct ssl_data_event *event = bpf_map_lookup_elem(&ssl_data_heap, &zero);
+    if (!event) {
+        return 0;
+    }
+
+    // Fill basic metadata
+    event->timestamp_ns = bpf_ktime_get_ns();
+    event->pid = pid;
+    event->tid = (__u32)pid_tgid;
+    event->uid = (__u32)bpf_get_current_uid_gid();
+    event->event_type = EVENT_PROCESS_EXEC;
+    event->len = 0;
+    event->delta_ns = 0;
+    event->ssl_ctx = 0;
+
+    // Get process name - userspace uses this for quick filtering
+    // (e.g., skip known non-SSL processes like "ls", "cat", etc.)
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    event->buf_filled = 0;
+
+    // Submit event - userspace will check /proc/PID/maps for SSL libraries
+    bpf_ringbuf_output(&ssl_events, event,
+                       sizeof(struct ssl_data_event) - MAX_BUF_SIZE, 0);
+
+    return 0;
+}
+
+// =============================================================================
+// Process Fork Tracepoint - Track child processes of SSL-using parents
+// Important for multi-process apps (Chrome, Firefox, Electron apps)
+// =============================================================================
+
+SEC("tracepoint/sched/sched_process_fork")
+int handle_process_fork(struct trace_event_raw_sched_process_fork *ctx) {
+    // Get parent and child PIDs
+    __u32 parent_pid = BPF_CORE_READ(ctx, parent_pid);
+    __u32 child_pid = BPF_CORE_READ(ctx, child_pid);
+
+    // Check if parent is tracked (has SSL activity)
+    __u8 *parent_tracked = bpf_map_lookup_elem(&tracked_pids, &parent_pid);
+    if (!parent_tracked) {
+        return 0;  // Parent not tracked, ignore fork
+    }
+
+    // Mark child as tracked too (inherits parent's SSL libraries)
+    __u8 tracked = 1;
+    bpf_map_update_elem(&tracked_pids, &child_pid, &tracked, BPF_ANY);
 
     return 0;
 }

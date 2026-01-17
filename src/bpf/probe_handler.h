@@ -31,14 +31,17 @@
 #define PID_CACHE_SIZE 1024
 #define NSS_CONN_CACHE_SIZE 256  /* Max tracked NSS external connections */
 
-/* Event types */
+/* Event types - MUST match BPF side (spliff.bpf.c)
+ * Note: EVENT_XDP_PACKET (6) is defined in spliff.h as a macro */
 enum event_type {
     EVENT_SSL_READ = 0,
     EVENT_SSL_WRITE = 1,
     EVENT_HANDSHAKE = 2,
     EVENT_PROCESS_EXIT = 3,
     EVENT_ALPN = 4,
-    EVENT_NSS_SSL_FD = 5   /* NSS SSL_ImportFD tracking (verified TLS connection) */
+    EVENT_NSS_SSL_FD = 5,  /* NSS SSL_ImportFD tracking (verified TLS connection) */
+    /* 6 = EVENT_XDP_PACKET (defined in spliff.h) */
+    EVENT_PROCESS_EXEC = 7 /* New process exec - dynamic probe attachment */
 };
 
 /* SSL data event from BPF (must match BPF side) */

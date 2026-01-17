@@ -1,18 +1,49 @@
-/*
+/**
+ * @file threading.h
+ * @brief Multi-threaded event processing infrastructure
+ *
+ * @details This module provides the threading architecture for spliff's
+ * high-performance event processing pipeline. The design uses lock-free
+ * data structures and connection affinity to achieve scalability.
+ *
+ * @par Thread Architecture:
+ * @code
+ *   Main Thread
+ *       │
+ *       ▼
+ *   Dispatcher Thread ──► polls BPF ring buffer
+ *       │
+ *       ├──► Worker 0 ──► processes connections 0, N, 2N, ...
+ *       ├──► Worker 1 ──► processes connections 1, N+1, 2N+1, ...
+ *       └──► Worker K ──► processes connections K, N+K, 2N+K, ...
+ *                │
+ *                └──► Output Thread ──► serializes to stdout
+ * @endcode
+ *
+ * @par Connection Affinity:
+ * Events are routed to workers using a hash of (pid, ssl_ctx). This
+ * ensures all events for a single connection always go to the same worker,
+ * eliminating need for locks on per-connection state (HTTP/2 sessions,
+ * HPACK contexts, stream buffers).
+ *
+ * @par Lock-Free Data Structures:
+ * - CK ring buffers for inter-thread queues
+ * - Object pools for zero-allocation fast path
+ * - Atomic counters for statistics
+ * - eventfd for sleep/wake coordination
+ *
+ * @par Per-Worker State:
+ * Each worker maintains isolated copies of:
+ * - HTTP/2 connection pool (nghttp2 sessions)
+ * - HTTP/2 stream pool (per-stream buffers)
+ * - ALPN cache (protocol negotiation results)
+ * - Pending body tracking (chunked response assembly)
+ *
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
+ *
  * SPDX-License-Identifier: GPL-3.0-only
- *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
- *
- * threading.h - Multi-threaded event processing infrastructure
- *
- * Architecture:
- *   Main Thread -> Dispatcher Thread -> Worker Threads -> Output Thread
- *
- * The dispatcher polls BPF ring buffer and routes events to workers
- * using connection affinity (same pid+ssl_ctx always goes to same worker).
- * Workers process events with per-worker state (no locks needed).
- * Output thread serializes formatted output to stdout.
  */
 
 #ifndef THREADING_H
@@ -28,466 +59,1037 @@
 #include "../bpf/probe_handler.h"
 #include "../protocol/http2.h"  /* For h2_stream_state_t, frame types */
 
-/* ============================================================================
- * Configuration Constants
- * ============================================================================ */
+/**
+ * @defgroup threading_config Threading Configuration Constants
+ * @brief Tuning parameters for the threading subsystem
+ * @{
+ */
 
-/* Ring buffer sizes (must be power of 2) */
-#define EVENT_RING_SIZE         4096
-#define OUTPUT_RING_SIZE        4096
+/**
+ * @name Ring Buffer Sizes
+ * Must be power of 2 for CK ring buffer efficiency.
+ * @{
+ */
+#define EVENT_RING_SIZE         4096    /**< Worker input queue capacity */
+#define OUTPUT_RING_SIZE        4096    /**< Output queue capacity */
+/** @} */
 
-/* Object pool sizes */
-#define EVENT_POOL_SIZE         4096
-#define OUTPUT_POOL_SIZE        1024
+/**
+ * @name Object Pool Sizes
+ * Pre-allocated objects for zero-malloc fast path.
+ * @{
+ */
+#define EVENT_POOL_SIZE         4096    /**< Event objects per worker */
+#define OUTPUT_POOL_SIZE        1024    /**< Output message objects per worker */
+/** @} */
 
-/* Adaptive wait parameters */
-#define SPIN_ITERATIONS         1000    /* ~1-2 microseconds */
-#define YIELD_ITERATIONS        10      /* ~10-100 microseconds */
-#define POLL_TIMEOUT_MS         10      /* 10ms max sleep */
+/**
+ * @name Adaptive Wait Parameters
+ * Three-tier wait strategy: spin -> yield -> sleep.
+ * @{
+ */
+#define SPIN_ITERATIONS         1000    /**< Busy-spin iterations (~1-2 us) */
+#define YIELD_ITERATIONS        10      /**< sched_yield iterations (~10-100 us) */
+#define POLL_TIMEOUT_MS         10      /**< epoll/poll timeout (ms) */
+/** @} */
 
-/* Batch processing */
-#define BATCH_SIZE              32
+/**
+ * @name Batch Processing
+ * @{
+ */
+#define BATCH_SIZE              32      /**< Events processed per batch */
+/** @} */
 
-/* Per-worker limits (scaled by worker count) */
-#define MAX_H2_SESSIONS_PER_WORKER      16
-#define MAX_H2_STREAMS_PER_WORKER       128
-#define MAX_ALPN_CACHE_PER_WORKER       32
-#define MAX_PENDING_BODIES_PER_WORKER   4
+/**
+ * @name Per-Worker Resource Limits
+ * Each worker maintains isolated pools sized by these limits.
+ * @{
+ */
+#define MAX_H2_SESSIONS_PER_WORKER      16   /**< HTTP/2 connections per worker */
+#define MAX_H2_STREAMS_PER_WORKER       128  /**< HTTP/2 streams per worker */
+#define MAX_ALPN_CACHE_PER_WORKER       32   /**< ALPN cache entries per worker */
+#define MAX_PENDING_BODIES_PER_WORKER   4    /**< Pending body buffers per worker */
+/** @} */
 
-/* Maximum workers */
-#define MAX_WORKERS             16
+/**
+ * @name Global Limits
+ * @{
+ */
+#define MAX_WORKERS             16      /**< Maximum worker thread count */
+/** @} */
 
-/* Output message max size */
-#define OUTPUT_MSG_MAX_SIZE     (64 * 1024)  /* 64KB formatted output */
+/**
+ * @name Output Sizing
+ * @{
+ */
+#define OUTPUT_MSG_MAX_SIZE     (64 * 1024)  /**< Max formatted output (64KB) */
+/** @} */
 
-/* ============================================================================
- * Forward Declarations
- * ============================================================================ */
+/** @} */ /* end threading_config group */
 
-struct nghttp2_session;
-struct nghttp2_hd_inflater;
-struct nghttp2_session_callbacks;
+/**
+ * @defgroup threading_forward Forward Declarations
+ * @brief External types used by threading module
+ * @{
+ */
+struct nghttp2_session;           /**< nghttp2 HTTP/2 session handle */
+struct nghttp2_hd_inflater;       /**< nghttp2 HPACK decompressor */
+struct nghttp2_session_callbacks; /**< nghttp2 callback table */
+/** @} */
 
-/* ============================================================================
- * HTTP/2 Structures (per-worker local versions)
- * ============================================================================ */
+/**
+ * @defgroup threading_h2 HTTP/2 Per-Worker Structures
+ * @brief Worker-local HTTP/2 state to avoid cross-thread locking
+ * @{
+ */
 
-/* Response reassembly buffer size (per-worker) */
+/** Response reassembly buffer size for fragmented HTTP/2 frames */
 #define H2_REASSEMBLY_BUF_SIZE 65536
 
 /* Note: h2_stream_state_t and H2_BODY_BUFFER_SIZE are defined in http2.h */
 
-/*
- * Per-connection HTTP/2 session state (worker-local)
+/**
+ * @brief Per-connection HTTP/2 session state (worker-local)
+ *
+ * Each worker maintains its own pool of HTTP/2 connections. Connection
+ * affinity routing ensures the same (pid, ssl_ctx) always goes to the
+ * same worker, so no locking is needed on this state.
+ *
+ * @par Session Parsing Strategy:
+ * - server_session parses client requests (we're acting as "server")
+ * - response_inflater decodes server response headers (separate HPACK context)
+ * - This dual-context approach handles both directions of HTTP/2 traffic
  */
 typedef struct h2_connection_local {
-    uint32_t pid;
-    uint64_t ssl_ctx;
-    bool active;
+    uint32_t pid;           /**< Process ID owning this connection */
+    uint64_t ssl_ctx;       /**< SSL context pointer (connection identifier) */
+    bool active;            /**< true if slot is in use */
 
-    /* nghttp2 server session for parsing requests */
+    /** nghttp2 server session for parsing client->server requests */
     struct nghttp2_session *server_session;
 
-    /* HPACK inflater for decoding response headers */
+    /** HPACK inflater for decoding server->client response headers */
     struct nghttp2_hd_inflater *response_inflater;
 
-    /* Connection state */
-    bool client_preface_seen;
-    bool server_settings_seen;
+    bool client_preface_seen;   /**< Received HTTP/2 client connection preface */
+    bool server_settings_seen;  /**< Received server SETTINGS frame */
 
-    /* Response reassembly buffer for fragmented frames */
+    /** Buffer for reassembling fragmented response frames */
     uint8_t *response_buf;
-    size_t response_buf_len;
+    size_t response_buf_len;    /**< Current data in response_buf */
 
-    /* Timestamp for LRU cleanup */
-    uint64_t last_activity_ns;
+    uint64_t last_activity_ns;  /**< Timestamp for LRU eviction */
 
-    /* Process name cache */
-    char comm[TASK_COMM_LEN];
-
-    /* ALPN negotiated protocol */
-    char alpn_proto[16];
+    char comm[TASK_COMM_LEN];   /**< Cached process name */
+    char alpn_proto[16];        /**< Negotiated ALPN protocol (e.g., "h2") */
 } h2_connection_local_t;
 
-/*
- * Per-stream HTTP/2 state (worker-local)
+/**
+ * @brief Per-stream HTTP/2 state (worker-local)
+ *
+ * Tracks individual HTTP/2 streams within a connection. HTTP/2 multiplexes
+ * multiple request/response pairs over a single connection, each identified
+ * by a unique stream ID.
+ *
+ * @par Stream Lifecycle:
+ * 1. Created when HEADERS frame opens new stream
+ * 2. Accumulates request headers, then request body (if any)
+ * 3. Receives response headers, then response body
+ * 4. Freed when stream closes (END_STREAM, RST_STREAM, or connection close)
+ *
+ * @par Lookup Key:
+ * Streams are uniquely identified by (pid, ssl_ctx, stream_id).
  */
 typedef struct h2_stream_local {
-    /* Key */
-    uint32_t pid;
-    uint64_t ssl_ctx;
-    int32_t stream_id;
-    bool active;
+    /** @name Stream Identity (Lookup Key) */
+    /** @{ */
+    uint32_t pid;           /**< Process ID */
+    uint64_t ssl_ctx;       /**< SSL context pointer */
+    int32_t stream_id;      /**< HTTP/2 stream identifier (odd=client, even=server) */
+    bool active;            /**< true if slot is in use */
+    /** @} */
 
-    /* State machine */
-    h2_stream_state_t state;
+    h2_stream_state_t state;  /**< Current stream state (IDLE, OPEN, HALF_CLOSED, etc.) */
 
-    /* Request info */
-    char method[MAX_METHOD_LEN];
-    char path[MAX_PATH_LEN];
-    char authority[MAX_HEADER_VALUE];
-    char scheme[16];
-    uint64_t request_time_ns;
-    bool request_headers_done;
-    bool request_complete;
+    /** @name Request Information */
+    /** @{ */
+    char method[MAX_METHOD_LEN];        /**< HTTP method (GET, POST, etc.) */
+    char path[MAX_PATH_LEN];            /**< Request path with query string */
+    char authority[MAX_HEADER_VALUE];   /**< :authority pseudo-header (host) */
+    char scheme[16];                    /**< :scheme pseudo-header (https) */
+    uint64_t request_time_ns;           /**< Timestamp when request started */
+    bool request_headers_done;          /**< All request headers received */
+    bool request_complete;              /**< Request fully received (including body) */
+    /** @} */
 
-    /* Response info */
-    int status_code;
-    char content_type[256];
-    char content_encoding[64];
-    size_t content_length;
-    uint64_t response_time_ns;
-    bool response_headers_done;
-    bool response_complete;
+    /** @name Response Information */
+    /** @{ */
+    int status_code;                /**< HTTP status code (200, 404, etc.) */
+    char content_type[256];         /**< Content-Type header value */
+    char content_encoding[64];      /**< Content-Encoding (gzip, br, etc.) */
+    size_t content_length;          /**< Content-Length if specified, 0 otherwise */
+    uint64_t response_time_ns;      /**< Timestamp when response started */
+    bool response_headers_done;     /**< All response headers received */
+    bool response_complete;         /**< Response fully received */
+    /** @} */
 
-    /* Headers storage */
-    http_header_t headers[MAX_HEADERS];
-    int header_count;
-    bool headers_displayed;
+    /** @name Headers Storage */
+    /** @{ */
+    http_header_t headers[MAX_HEADERS]; /**< Collected headers array */
+    int header_count;                   /**< Number of headers stored */
+    bool headers_displayed;             /**< Already output to user */
+    /** @} */
 
-    /* Body accumulation */
-    uint8_t *body_buf;
-    size_t body_buf_size;
-    size_t body_len;
+    /** @name Body Accumulation */
+    /** @{ */
+    uint8_t *body_buf;      /**< Dynamically allocated body buffer */
+    size_t body_buf_size;   /**< Allocated capacity of body_buf */
+    size_t body_len;        /**< Actual body bytes received */
+    /** @} */
 
-    /* Metadata for display */
-    uint64_t delta_ns;
-    char comm[TASK_COMM_LEN];
+    /** @name Display Metadata */
+    /** @{ */
+    uint64_t delta_ns;          /**< Time delta for output formatting */
+    char comm[TASK_COMM_LEN];   /**< Process name for display */
+    /** @} */
 } h2_stream_local_t;
 
-/* ============================================================================
- * Event Structure (for inter-thread communication)
- * ============================================================================ */
+/** @} */ /* end threading_h2 group */
 
-/*
- * Worker event - copied from BPF ring buffer
- * This is what gets enqueued to worker input rings
+/**
+ * @defgroup threading_event Event Structures
+ * @brief Inter-thread communication data structures
+ * @{
+ */
+
+/**
+ * @brief Worker event - copied from BPF ring buffer
+ *
+ * The dispatcher copies events from the BPF ring buffer into these
+ * structures and enqueues them to worker input rings. This decouples
+ * the BPF ring buffer consumption rate from worker processing rate.
+ *
+ * @par Memory Management:
+ * Allocated from per-worker object pools (event_pool) to avoid malloc
+ * in the hot path. Freed back to pool after processing.
+ *
+ * @par Routing:
+ * worker_id and flow_hash are pre-computed by the dispatcher for
+ * efficient event distribution.
  */
 typedef struct worker_event {
-    /* BPF event metadata */
-    uint64_t timestamp_ns;
-    uint64_t delta_ns;
-    uint64_t ssl_ctx;
-    uint32_t pid;
-    uint32_t tid;
-    uint32_t uid;
-    uint32_t event_type;
-    int32_t buf_filled;
-    char comm[TASK_COMM_LEN];
+    /** @name BPF Event Metadata */
+    /** @{ */
+    uint64_t timestamp_ns;      /**< Kernel timestamp (CLOCK_MONOTONIC) */
+    uint64_t delta_ns;          /**< Time since previous event */
+    uint64_t ssl_ctx;           /**< SSL context pointer (connection ID) */
+    uint32_t pid;               /**< Process ID */
+    uint32_t tid;               /**< Thread ID */
+    uint32_t uid;               /**< User ID */
+    uint32_t event_type;        /**< Event type (EVENT_SSL_READ, etc.) */
+    int32_t buf_filled;         /**< Bytes captured (-1 if error) */
+    char comm[TASK_COMM_LEN];   /**< Process command name */
+    /** @} */
 
-    /* Pre-computed routing */
-    uint32_t worker_id;
-    uint32_t flow_hash;
+    /** @name Routing Information */
+    /** @{ */
+    uint32_t worker_id;     /**< Target worker (pre-computed by dispatcher) */
+    uint32_t flow_hash;     /**< FNV-1a hash of (pid, ssl_ctx) */
+    /** @} */
 
-    /* Payload (variable length, up to MAX_BUF_SIZE) */
-    uint32_t data_len;
-    uint8_t data[MAX_BUF_SIZE];
+    /** @name Payload */
+    /** @{ */
+    uint32_t data_len;              /**< Actual payload length */
+    uint8_t data[MAX_BUF_SIZE];     /**< SSL plaintext data (up to 16KB) */
+    /** @} */
 } worker_event_t;
 
-/* ============================================================================
- * Output Message Structure
- * ============================================================================ */
-
-/*
- * Formatted output message - produced by workers, consumed by output thread
+/**
+ * @brief Formatted output message - produced by workers, consumed by output thread
+ *
+ * Workers format SSL events into human-readable or JSON output and enqueue
+ * these messages to the output thread. The output thread serializes messages
+ * to stdout/file in timestamp order.
+ *
+ * @par Ordering Guarantees:
+ * - Messages sorted by timestamp_ns, then sequence
+ * - sequence breaks ties when multiple events have same timestamp
+ * - Output thread may buffer briefly to ensure ordering
+ *
+ * @par Memory Management:
+ * Allocated from per-worker output_pool. Freed by output thread after writing.
  */
 typedef struct output_msg {
-    uint64_t timestamp_ns;      /* For ordering */
-    uint32_t sequence;          /* Sequence within same timestamp */
-    uint32_t worker_id;         /* Source worker */
-    size_t len;                 /* Output length */
-    char data[OUTPUT_MSG_MAX_SIZE];
+    uint64_t timestamp_ns;  /**< Event timestamp for ordering */
+    uint32_t sequence;      /**< Sequence number (breaks timestamp ties) */
+    uint32_t worker_id;     /**< Source worker for debugging */
+    size_t len;             /**< Length of formatted data */
+    char data[OUTPUT_MSG_MAX_SIZE]; /**< Formatted output string */
 } output_msg_t;
 
-/* ============================================================================
- * Object Pool
- * ============================================================================ */
+/** @} */ /* end threading_event group */
 
-/*
- * Lock-free object pool using a simple free-list
- * Pre-allocates objects to avoid malloc in hot path
+/**
+ * @defgroup threading_pool Object Pool
+ * @brief Lock-free object pool for zero-allocation fast path
+ * @{
+ */
+
+/**
+ * @brief Lock-free object pool using CK ring free-list
+ *
+ * Pre-allocates a fixed number of objects at initialization time.
+ * Allocation and deallocation are O(1) lock-free operations using
+ * a CK ring buffer as a free-list.
+ *
+ * @par Usage Pattern:
+ * @code
+ * object_pool_t pool;
+ * pool_init(&pool, sizeof(worker_event_t), 4096);
+ *
+ * worker_event_t *evt = pool_alloc(&pool);
+ * if (evt) {
+ *     // use evt...
+ *     pool_free(&pool, evt);
+ * }
+ *
+ * pool_destroy(&pool);
+ * @endcode
+ *
+ * @par Thread Safety:
+ * All operations are lock-free and safe for concurrent access.
  */
 typedef struct object_pool {
-    void *base;                 /* Base allocation */
-    size_t obj_size;            /* Size of each object */
-    size_t capacity;            /* Total objects */
+    void *base;                 /**< Base memory allocation (contiguous block) */
+    size_t obj_size;            /**< Size of each object in bytes */
+    size_t capacity;            /**< Total number of objects in pool */
 
-    /* Lock-free free-list */
+    /** Lock-free free-list implemented as CK ring buffer */
     ck_ring_t ring;
     ck_ring_buffer_t *ring_buf;
 
-    /* Statistics */
-    _Atomic uint64_t alloc_count;
-    _Atomic uint64_t free_count;
-    _Atomic uint64_t alloc_failures;
+    /** @name Statistics (atomic for thread-safe reads) */
+    /** @{ */
+    _Atomic uint64_t alloc_count;       /**< Total successful allocations */
+    _Atomic uint64_t free_count;        /**< Total deallocations */
+    _Atomic uint64_t alloc_failures;    /**< Allocation failures (pool exhausted) */
+    /** @} */
 } object_pool_t;
 
-/* Pool API */
+/**
+ * @name Pool API
+ * @{
+ */
+
+/**
+ * @brief Initialize object pool with pre-allocated objects
+ *
+ * @param[out] pool     Pool to initialize
+ * @param[in]  obj_size Size of each object in bytes
+ * @param[in]  capacity Number of objects to pre-allocate (should be power of 2)
+ *
+ * @return 0 on success, -1 on allocation failure
+ */
 int pool_init(object_pool_t *pool, size_t obj_size, size_t capacity);
+
+/**
+ * @brief Destroy pool and free all memory
+ *
+ * @param[in] pool Pool to destroy
+ *
+ * @warning All allocated objects must be returned before calling this
+ */
 void pool_destroy(object_pool_t *pool);
+
+/**
+ * @brief Allocate object from pool (lock-free)
+ *
+ * @param[in] pool Pool to allocate from
+ *
+ * @return Pointer to object, or NULL if pool exhausted
+ *
+ * @note O(1) lock-free operation
+ */
 void *pool_alloc(object_pool_t *pool);
+
+/**
+ * @brief Return object to pool (lock-free)
+ *
+ * @param[in] pool Pool to return object to
+ * @param[in] obj  Object to free (must have come from this pool)
+ *
+ * @note O(1) lock-free operation
+ */
 void pool_free(object_pool_t *pool, void *obj);
 
-/* ============================================================================
- * ALPN Cache Entry (per-worker)
- * ============================================================================ */
+/** @} */ /* end Pool API */
+/** @} */ /* end threading_pool group */
 
+/**
+ * @defgroup threading_cache Per-Worker Cache Structures
+ * @brief Worker-local caches for connection metadata
+ * @{
+ */
+
+/**
+ * @brief ALPN cache entry for protocol negotiation results
+ *
+ * Caches the Application-Layer Protocol Negotiation (ALPN) result for
+ * each SSL connection. Used to determine whether to parse traffic as
+ * HTTP/1.1, HTTP/2, or another protocol.
+ *
+ * @par Lookup Key: (pid, ssl_ctx)
+ */
 typedef struct {
-    uint32_t pid;
-    uint64_t ssl_ctx;
-    char alpn_proto[16];
-    bool active;
+    uint32_t pid;           /**< Process ID */
+    uint64_t ssl_ctx;       /**< SSL context pointer */
+    char alpn_proto[16];    /**< Negotiated protocol ("h2", "http/1.1", etc.) */
+    bool active;            /**< true if entry is in use */
 } alpn_cache_entry_t;
 
-/* ============================================================================
- * Pending Body Entry (per-worker)
- * ============================================================================ */
-
+/**
+ * @brief Pending body entry for chunked/streaming response assembly
+ *
+ * When an HTTP response body arrives in multiple SSL_read calls, this
+ * structure accumulates the fragments until the complete body is received.
+ * Supports decompression of gzip/brotli/zstd encoded bodies.
+ *
+ * @par Lookup Key: (pid, ssl_ctx)
+ *
+ * @par Memory Management:
+ * accum_buf is dynamically allocated and grows as needed. Freed when
+ * body is complete or connection closes.
+ */
 typedef struct {
-    uint32_t pid;
-    uint64_t ssl_ctx;
-    size_t expected_len;
-    size_t received_len;
-    char content_type[256];
-    char content_encoding[64];
-    bool active;
-    bool header_printed;
-    bool needs_decompression;
-    uint8_t *accum_buf;         /* Dynamically allocated */
-    size_t accum_len;
-    size_t accum_capacity;
+    uint32_t pid;               /**< Process ID */
+    uint64_t ssl_ctx;           /**< SSL context pointer */
+    size_t expected_len;        /**< Content-Length (0 if chunked/unknown) */
+    size_t received_len;        /**< Bytes received so far */
+    char content_type[256];     /**< Content-Type for display */
+    char content_encoding[64];  /**< Content-Encoding (gzip, br, zstd) */
+    bool active;                /**< true if entry is in use */
+    bool header_printed;        /**< Response header already output */
+    bool needs_decompression;   /**< Body requires decompression */
+    uint8_t *accum_buf;         /**< Accumulation buffer (dynamically allocated) */
+    size_t accum_len;           /**< Current data in accum_buf */
+    size_t accum_capacity;      /**< Allocated capacity of accum_buf */
 } pending_body_entry_t;
 
-/* ============================================================================
- * HTTP/1.1 Request Cache Entry (per-worker)
- * ============================================================================ */
+/** @} */ /* end threading_cache group */
 
+/**
+ * @defgroup threading_h1cache HTTP/1.1 Request Cache
+ * @brief Request-response correlation for HTTP/1.1
+ * @{
+ */
+
+/** Maximum HTTP/1.1 request cache entries per worker */
 #define MAX_H1_REQUEST_CACHE_PER_WORKER 16
 
+/**
+ * @brief HTTP/1.1 request cache entry for request-response correlation
+ *
+ * HTTP/1.1 is request-response sequential on a single connection. We cache
+ * the most recent request details so when the response arrives, we can
+ * display them together (method, path, status code).
+ *
+ * @par Lookup Key: (pid, ssl_ctx)
+ *
+ * @note Only one request cached per connection since HTTP/1.1 is sequential.
+ *       HTTP/2 uses stream IDs for correlation instead.
+ */
 typedef struct {
-    uint32_t pid;
-    uint64_t ssl_ctx;
-    char method[16];
-    char path[512];
-    char host[256];      /* From Host header */
-    bool active;
+    uint32_t pid;       /**< Process ID */
+    uint64_t ssl_ctx;   /**< SSL context pointer */
+    char method[16];    /**< HTTP method (GET, POST, etc.) */
+    char path[512];     /**< Request path with query string */
+    char host[256];     /**< Host header value */
+    bool active;        /**< true if entry is in use */
 } h1_request_entry_t;
 
-/* ============================================================================
- * Per-Worker State
- * ============================================================================ */
+/** @} */ /* end threading_h1cache group */
 
-/*
- * Worker-local state - replaces global arrays
- * Each worker has isolated state, eliminating need for locks
+/**
+ * @defgroup threading_state Per-Worker State
+ * @brief Worker-local state eliminating cross-thread locking
+ * @{
+ */
+
+/**
+ * @brief Worker-local state container
+ *
+ * Each worker thread maintains isolated state for all connections it handles.
+ * Connection affinity routing ensures the same (pid, ssl_ctx) always routes
+ * to the same worker, so no locks are needed on this state.
+ *
+ * @par State Components:
+ * - HTTP/2 connection pool: nghttp2 sessions and HPACK contexts
+ * - HTTP/2 stream pool: per-stream request/response state
+ * - ALPN cache: protocol negotiation results
+ * - Pending bodies: chunked response assembly buffers
+ * - HTTP/1.1 cache: request-response correlation
+ * - Scratch buffers: decompression and body parsing
+ *
+ * @par Scaling:
+ * Each worker has fixed-size pools. Total system capacity scales linearly
+ * with worker count (e.g., 4 workers = 4x connection capacity).
  */
 typedef struct worker_state {
-    int worker_id;
+    int worker_id;          /**< Worker index (0 to num_workers-1) */
 
-    /* HTTP/2 connection pool */
-    h2_connection_local_t *h2_connections;
-    int h2_connection_count;
-    int h2_connection_capacity;
+    /** @name HTTP/2 Connection Pool */
+    /** @{ */
+    h2_connection_local_t *h2_connections;  /**< Connection state array */
+    int h2_connection_count;                /**< Active connections */
+    int h2_connection_capacity;             /**< Array capacity */
+    /** @} */
 
-    /* HTTP/2 stream pool */
-    h2_stream_local_t *h2_streams;
-    int h2_stream_count;
-    int h2_stream_capacity;
+    /** @name HTTP/2 Stream Pool */
+    /** @{ */
+    h2_stream_local_t *h2_streams;  /**< Stream state array */
+    int h2_stream_count;            /**< Active streams */
+    int h2_stream_capacity;         /**< Array capacity */
+    /** @} */
 
-    /* ALPN cache */
-    alpn_cache_entry_t alpn_cache[MAX_ALPN_CACHE_PER_WORKER];
-    int alpn_cache_count;
+    /** @name ALPN Cache */
+    /** @{ */
+    alpn_cache_entry_t alpn_cache[MAX_ALPN_CACHE_PER_WORKER]; /**< Protocol cache */
+    int alpn_cache_count;           /**< Active entries */
+    /** @} */
 
-    /* Pending bodies */
-    pending_body_entry_t pending_bodies[MAX_PENDING_BODIES_PER_WORKER];
-    int pending_body_count;
+    /** @name Pending Bodies */
+    /** @{ */
+    pending_body_entry_t pending_bodies[MAX_PENDING_BODIES_PER_WORKER]; /**< Body assembly */
+    int pending_body_count;         /**< Active entries */
+    /** @} */
 
-    /* HTTP/1.1 request cache (for request-response correlation) */
-    h1_request_entry_t h1_request_cache[MAX_H1_REQUEST_CACHE_PER_WORKER];
-    int h1_request_count;
+    /** @name HTTP/1.1 Request Cache */
+    /** @{ */
+    h1_request_entry_t h1_request_cache[MAX_H1_REQUEST_CACHE_PER_WORKER]; /**< Request cache */
+    int h1_request_count;           /**< Active entries */
+    /** @} */
 
-    /* Decompression buffer (per-worker to avoid static buffer races) */
-    uint8_t *decomp_buf;
-    size_t decomp_buf_size;
+    /** @name Scratch Buffers */
+    /** @{ */
+    uint8_t *decomp_buf;        /**< Decompression output buffer */
+    size_t decomp_buf_size;     /**< decomp_buf capacity */
+    uint8_t *body_buf;          /**< HTTP/1 body parsing buffer */
+    size_t body_buf_size;       /**< body_buf capacity */
+    /** @} */
 
-    /* HTTP/1 body buffer */
-    uint8_t *body_buf;
-    size_t body_buf_size;
-
-    /* nghttp2 session callbacks (thread-local copy) */
+    /** nghttp2 session callbacks (thread-local copy for safety) */
     struct nghttp2_session_callbacks *h2_callbacks;
 
-    /* Initialization flag */
-    bool initialized;
+    bool initialized;           /**< true after successful init */
 } worker_state_t;
 
-/* Worker state API */
+/**
+ * @name Worker State API
+ * @{
+ */
+
+/**
+ * @brief Initialize worker state with allocated pools
+ *
+ * @param[out] state     State structure to initialize
+ * @param[in]  worker_id Worker index (for logging/debugging)
+ *
+ * @return 0 on success, -1 on allocation failure
+ */
 int worker_state_init(worker_state_t *state, int worker_id);
+
+/**
+ * @brief Cleanup worker state and free all resources
+ *
+ * @param[in] state State to cleanup
+ */
 void worker_state_cleanup(worker_state_t *state);
 
-/* ============================================================================
- * Worker Context
- * ============================================================================ */
+/** @} */ /* end Worker State API */
+/** @} */ /* end threading_state group */
 
-/*
- * Per-worker thread context
+/**
+ * @defgroup threading_worker Worker Thread
+ * @brief Per-worker thread context and API
+ * @{
+ */
+
+/**
+ * @brief Per-worker thread context
+ *
+ * Each worker thread processes events from its input queue, parses
+ * SSL traffic, and enqueues formatted output to the output thread.
+ *
+ * @par Queue Architecture:
+ * - in_ring: Dispatcher enqueues events here (SPSC: single producer)
+ * - out_ring: Worker enqueues formatted output (SPSC: single producer)
+ *
+ * @par Adaptive Wait Strategy:
+ * Workers use a three-tier wait when input queue is empty:
+ * 1. Spin: SPIN_ITERATIONS busy-loop (~1-2 us latency)
+ * 2. Yield: YIELD_ITERATIONS sched_yield() (~10-100 us)
+ * 3. Sleep: epoll_wait on wakeup_fd (~1-10 ms)
+ *
+ * @par Memory Management:
+ * - event_pool: Pre-allocated event objects (returned to pool after processing)
+ * - output_pool: Pre-allocated output messages (freed by output thread)
  */
 typedef struct worker_ctx {
-    int worker_id;
-    pthread_t thread;
+    int worker_id;              /**< Worker index (0 to num_workers-1) */
+    pthread_t thread;           /**< Worker thread handle */
 
-    /* Input queue (dispatcher -> worker) */
-    ck_ring_t in_ring;
-    ck_ring_buffer_t *in_buffer;
+    /** @name Input Queue (dispatcher -> worker) */
+    /** @{ */
+    ck_ring_t in_ring;              /**< Lock-free SPSC ring buffer */
+    ck_ring_buffer_t *in_buffer;    /**< Ring buffer storage */
+    /** @} */
 
-    /* Output queue (worker -> output thread) */
-    ck_ring_t out_ring;
-    ck_ring_buffer_t *out_buffer;
+    /** @name Output Queue (worker -> output thread) */
+    /** @{ */
+    ck_ring_t out_ring;             /**< Lock-free SPSC ring buffer */
+    ck_ring_buffer_t *out_buffer;   /**< Ring buffer storage */
+    /** @} */
 
-    /* Wake-up signaling */
-    int wakeup_fd;              /* eventfd for sleep/wake */
-    _Atomic bool has_work;      /* Fast-path check before sleep */
+    /** @name Wake-up Signaling */
+    /** @{ */
+    int wakeup_fd;              /**< eventfd for sleep/wake coordination */
+    _Atomic bool has_work;      /**< Fast-path check before sleeping */
+    /** @} */
 
-    /* Per-worker state (HTTP/2 sessions, caches, buffers) */
+    /** Per-worker protocol state (HTTP/2, caches, buffers) */
     worker_state_t state;
 
-    /* Object pools */
-    object_pool_t event_pool;   /* For incoming events */
-    object_pool_t output_pool;  /* For outgoing formatted messages */
+    /** @name Object Pools */
+    /** @{ */
+    object_pool_t event_pool;   /**< Pool for incoming event objects */
+    object_pool_t output_pool;  /**< Pool for outgoing formatted messages */
+    /** @} */
 
-    /* Statistics */
-    _Atomic uint64_t events_processed;
-    _Atomic uint64_t events_dropped;
-    _Atomic uint64_t spin_cycles;
-    _Atomic uint64_t yield_cycles;
-    _Atomic uint64_t sleep_cycles;
+    /** @name Statistics (atomic for thread-safe reads) */
+    /** @{ */
+    _Atomic uint64_t events_processed;  /**< Total events handled */
+    _Atomic uint64_t events_dropped;    /**< Events dropped (queue full) */
+    _Atomic uint64_t spin_cycles;       /**< Time spent in spin wait */
+    _Atomic uint64_t yield_cycles;      /**< Time spent in yield wait */
+    _Atomic uint64_t sleep_cycles;      /**< Time spent sleeping */
+    /** @} */
 
-    /* Control */
-    _Atomic bool running;
+    _Atomic bool running;       /**< false signals thread to exit */
 } worker_ctx_t;
 
-/* Worker API */
+/**
+ * @name Worker API
+ * @{
+ */
+
+/**
+ * @brief Initialize worker context
+ *
+ * Allocates queues, pools, and initializes per-worker state.
+ *
+ * @param[out] ctx       Worker context to initialize
+ * @param[in]  worker_id Worker index
+ *
+ * @return 0 on success, -1 on failure
+ */
 int worker_init(worker_ctx_t *ctx, int worker_id);
+
+/**
+ * @brief Cleanup worker context and free resources
+ *
+ * @param[in] ctx Worker context to cleanup
+ */
 void worker_cleanup(worker_ctx_t *ctx);
+
+/**
+ * @brief Worker thread main function
+ *
+ * Thread entry point. Loops processing events until running becomes false.
+ *
+ * @param[in] arg Pointer to worker_ctx_t
+ *
+ * @return NULL
+ */
 void *worker_thread_main(void *arg);
 
-/* ============================================================================
- * Dispatcher Context
- * ============================================================================ */
+/** @} */ /* end Worker API */
+/** @} */ /* end threading_worker group */
 
-/*
- * Dispatcher thread context
- * Polls BPF ring buffer and routes events to workers
+/**
+ * @defgroup threading_dispatcher Dispatcher Thread
+ * @brief BPF ring buffer consumer and event router
+ * @{
+ */
+
+/**
+ * @brief Process lifecycle callback type
+ *
+ * Called directly by dispatcher for process exec/exit events.
+ * These events are not dispatched to workers - they're handled
+ * immediately for dynamic SSL library detection.
+ *
+ * @param[in] event BPF event data
+ * @param[in] ctx   User-provided context
+ */
+typedef void (*process_lifecycle_cb_t)(const ssl_data_event_t *event, void *ctx);
+
+/**
+ * @brief Dispatcher thread context
+ *
+ * The dispatcher is the single consumer of the BPF ring buffer. It:
+ * 1. Polls the BPF ring buffer for SSL events
+ * 2. Computes flow affinity hash for each event
+ * 3. Routes events to the appropriate worker
+ * 4. Handles process lifecycle events directly (not routed to workers)
+ *
+ * @par Event Routing:
+ * Events are routed using flow_hash(pid, ssl_ctx) % num_workers.
+ * This ensures all events for a connection go to the same worker.
+ *
+ * @par XDP Integration:
+ * Also handles XDP flow discovery/termination events for network
+ * correlation with SSL traffic.
  */
 typedef struct dispatcher_ctx {
-    pthread_t thread;
+    pthread_t thread;           /**< Dispatcher thread handle */
 
-    /* BPF ring buffer handle */
-    probe_handler_t *handler;
+    probe_handler_t *handler;   /**< BPF ring buffer handle */
 
-    /* Worker array */
-    worker_ctx_t *workers;
-    int num_workers;
+    /** @name Worker Array */
+    /** @{ */
+    worker_ctx_t *workers;      /**< Array of worker contexts */
+    int num_workers;            /**< Number of workers */
+    /** @} */
 
-    /* Statistics */
-    _Atomic uint64_t events_dispatched;
-    _Atomic uint64_t events_dropped;
+    /** @name Process Lifecycle Callback */
+    /** @{ */
+    process_lifecycle_cb_t lifecycle_cb; /**< Callback for exec/exit events */
+    void *lifecycle_ctx;                 /**< User context for callback */
+    /** @} */
 
-    /* XDP statistics */
-    _Atomic uint64_t xdp_flows_discovered;
-    _Atomic uint64_t xdp_flows_terminated;
-    _Atomic uint64_t xdp_ambiguous_events;
-    _Atomic uint64_t xdp_events_dropped;
-    _Atomic uint64_t xdp_debug_samples;      /* Debug output sampling counter */
+    /** @name Statistics (atomic for thread-safe reads) */
+    /** @{ */
+    _Atomic uint64_t events_dispatched; /**< Events routed to workers */
+    _Atomic uint64_t events_dropped;    /**< Events dropped (queue full) */
+    /** @} */
 
-    /* Control */
-    _Atomic bool running;
+    /** @name XDP Statistics */
+    /** @{ */
+    _Atomic uint64_t xdp_flows_discovered;  /**< New flows detected */
+    _Atomic uint64_t xdp_flows_terminated;  /**< Flows closed/timed out */
+    _Atomic uint64_t xdp_ambiguous_events;  /**< Ambiguous protocol events */
+    _Atomic uint64_t xdp_events_dropped;    /**< XDP events dropped */
+    _Atomic uint64_t xdp_debug_samples;     /**< Debug sampling counter */
+    /** @} */
+
+    _Atomic bool running;       /**< false signals thread to exit */
 } dispatcher_ctx_t;
 
-/* Dispatcher API */
+/**
+ * @name Dispatcher API
+ * @{
+ */
+
+/**
+ * @brief Initialize dispatcher context
+ *
+ * @param[out] ctx         Dispatcher context to initialize
+ * @param[in]  handler     BPF ring buffer handle
+ * @param[in]  workers     Array of worker contexts
+ * @param[in]  num_workers Number of workers
+ *
+ * @return 0 on success, -1 on failure
+ */
 int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
                     worker_ctx_t *workers, int num_workers);
+
+/**
+ * @brief Cleanup dispatcher context
+ *
+ * @param[in] ctx Dispatcher context to cleanup
+ */
 void dispatcher_cleanup(dispatcher_ctx_t *ctx);
+
+/**
+ * @brief Dispatcher thread main function
+ *
+ * Thread entry point. Polls BPF ring buffer and routes events until
+ * running becomes false.
+ *
+ * @param[in] arg Pointer to dispatcher_ctx_t
+ *
+ * @return NULL
+ */
 void *dispatcher_thread_main(void *arg);
 
-/* XDP event handler - can be used as callback for bpf_loader_xdp_set_event_callback()
- * Handles flow discovery, termination, and ambiguous traffic events */
+/**
+ * @brief Set process lifecycle callback for dynamic SSL detection
+ *
+ * @param[in] ctx      Dispatcher context
+ * @param[in] cb       Callback function
+ * @param[in] user_ctx User context passed to callback
+ */
+void dispatcher_set_lifecycle_callback(dispatcher_ctx_t *ctx,
+                                        process_lifecycle_cb_t cb,
+                                        void *user_ctx);
+
+/**
+ * @brief Cleanup all state for a terminated process
+ *
+ * Called when a process exits. Cleans up HTTP/2 sessions, streams,
+ * caches, and pending bodies across all workers.
+ *
+ * @param[in] ctx Dispatcher context
+ * @param[in] pid Process ID that exited
+ */
+void dispatcher_cleanup_pid(dispatcher_ctx_t *ctx, uint32_t pid);
+
+/**
+ * @brief XDP event handler callback
+ *
+ * Can be registered with bpf_loader_xdp_set_event_callback() to handle
+ * XDP flow discovery, termination, and ambiguous traffic events.
+ *
+ * @param[in] ctx     User context (dispatcher_ctx_t*)
+ * @param[in] data    Event data
+ * @param[in] data_sz Event data size
+ *
+ * @return 0 on success
+ */
 int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz);
 
-/* ============================================================================
- * Output Context
- * ============================================================================ */
+/** @} */ /* end Dispatcher API */
+/** @} */ /* end threading_dispatcher group */
 
-/*
- * Output thread context
- * Collects formatted output from workers and serializes to stdout
+/**
+ * @defgroup threading_output Output Thread
+ * @brief Serializes formatted output from all workers
+ * @{
+ */
+
+/**
+ * @brief Output thread context
+ *
+ * The output thread collects formatted messages from all worker output
+ * queues and writes them to stdout or a file. It ensures ordered output
+ * even with parallel workers.
+ *
+ * @par Collection Strategy:
+ * Round-robins across worker output queues, collecting messages and
+ * writing them in timestamp order.
+ *
+ * @par Ordering:
+ * Messages are written in timestamp order using output_msg_t::timestamp_ns.
+ * The sequence field breaks ties for events with identical timestamps.
  */
 typedef struct output_ctx {
-    pthread_t thread;
+    pthread_t thread;           /**< Output thread handle */
 
-    /* Worker array (for output ring access) */
-    worker_ctx_t *workers;
-    int num_workers;
+    /** @name Worker Access */
+    /** @{ */
+    worker_ctx_t *workers;      /**< Worker array (for output queue access) */
+    int num_workers;            /**< Number of workers to collect from */
+    /** @} */
 
-    /* Output file (NULL = stdout) */
-    FILE *output_file;
+    FILE *output_file;          /**< Output destination (NULL = stdout) */
 
-    /* Statistics */
-    _Atomic uint64_t messages_written;
-    _Atomic uint64_t bytes_written;
+    /** @name Statistics (atomic for thread-safe reads) */
+    /** @{ */
+    _Atomic uint64_t messages_written;  /**< Total messages written */
+    _Atomic uint64_t bytes_written;     /**< Total bytes written */
+    /** @} */
 
-    /* Control */
-    _Atomic bool running;
+    _Atomic bool running;       /**< false signals thread to exit */
 } output_ctx_t;
 
-/* Output API */
+/**
+ * @name Output Thread API
+ * @{
+ */
+
+/**
+ * @brief Initialize output thread context
+ *
+ * @param[out] ctx         Output context to initialize
+ * @param[in]  workers     Worker array (for output queue access)
+ * @param[in]  num_workers Number of workers
+ * @param[in]  output_file Output destination (NULL for stdout)
+ *
+ * @return 0 on success, -1 on failure
+ */
 int output_init(output_ctx_t *ctx, worker_ctx_t *workers, int num_workers,
                 FILE *output_file);
+
+/**
+ * @brief Cleanup output thread context
+ *
+ * @param[in] ctx Output context to cleanup
+ */
 void output_cleanup(output_ctx_t *ctx);
+
+/**
+ * @brief Output thread main function
+ *
+ * Thread entry point. Collects and writes output until running becomes false.
+ *
+ * @param[in] arg Pointer to output_ctx_t
+ *
+ * @return NULL
+ */
 void *output_thread_main(void *arg);
 
-/* ============================================================================
- * Threading Manager
- * ============================================================================ */
+/** @} */ /* end Output Thread API */
+/** @} */ /* end threading_output group */
 
-/*
- * Main threading manager - coordinates all threads
+/**
+ * @defgroup threading_manager Threading Manager
+ * @brief Top-level coordinator for all threads
+ * @{
+ */
+
+/**
+ * @brief Main threading manager - coordinates all threads
+ *
+ * The threading manager is the top-level controller for the threading
+ * subsystem. It owns all thread contexts and coordinates startup/shutdown.
+ *
+ * @par Thread Ownership:
+ * - 1 dispatcher thread
+ * - N worker threads (configurable, typically CPU cores - 1)
+ * - 1 output thread
+ *
+ * @par Lifecycle:
+ * 1. threading_init() - allocate and initialize contexts
+ * 2. threading_start() - start all threads
+ * 3. (run until shutdown requested)
+ * 4. threading_shutdown() - signal threads to stop
+ * 5. threading_cleanup() - join threads and free resources
  */
 typedef struct threading_mgr {
-    /* Thread contexts */
-    dispatcher_ctx_t dispatcher;
-    worker_ctx_t workers[MAX_WORKERS];
-    output_ctx_t output;
+    /** @name Thread Contexts */
+    /** @{ */
+    dispatcher_ctx_t dispatcher;            /**< Dispatcher context */
+    worker_ctx_t workers[MAX_WORKERS];      /**< Worker contexts array */
+    output_ctx_t output;                    /**< Output thread context */
+    /** @} */
 
-    /* Configuration */
-    int num_workers;
-    bool pin_cores;
+    /** @name Configuration */
+    /** @{ */
+    int num_workers;        /**< Active worker count */
+    bool pin_cores;         /**< Pin threads to CPU cores */
+    /** @} */
 
-    /* State */
-    bool initialized;
-    _Atomic bool shutdown_requested;
+    /** @name State */
+    /** @{ */
+    bool initialized;               /**< true after successful init */
+    _Atomic bool shutdown_requested; /**< Signals shutdown in progress */
+    /** @} */
 } threading_mgr_t;
 
-/* Threading manager API */
+/**
+ * @name Threading Manager API
+ * @{
+ */
+
+/**
+ * @brief Initialize threading manager
+ *
+ * Allocates and initializes all thread contexts but does not start threads.
+ *
+ * @param[out] mgr         Manager to initialize
+ * @param[in]  num_workers Number of worker threads (0 = auto-detect)
+ * @param[in]  pin_cores   Pin threads to specific CPU cores
+ *
+ * @return 0 on success, -1 on failure
+ *
+ * @note Use threading_default_workers() to determine optimal worker count
+ */
 int threading_init(threading_mgr_t *mgr, int num_workers, bool pin_cores);
+
+/**
+ * @brief Start all threads
+ *
+ * Starts dispatcher, workers, and output threads.
+ *
+ * @param[in] mgr     Initialized manager
+ * @param[in] handler BPF ring buffer handle for dispatcher
+ *
+ * @return 0 on success, -1 on failure
+ */
 int threading_start(threading_mgr_t *mgr, probe_handler_t *handler);
+
+/**
+ * @brief Request graceful shutdown
+ *
+ * Signals all threads to stop. Call threading_cleanup() to wait for
+ * threads to exit and free resources.
+ *
+ * @param[in] mgr Manager to shutdown
+ */
 void threading_shutdown(threading_mgr_t *mgr);
+
+/**
+ * @brief Wait for threads and cleanup resources
+ *
+ * Joins all threads and frees allocated memory.
+ *
+ * @param[in] mgr Manager to cleanup
+ *
+ * @note Must call threading_shutdown() first
+ */
 void threading_cleanup(threading_mgr_t *mgr);
+
+/**
+ * @brief Print threading statistics
+ *
+ * Outputs statistics for dispatcher, workers, and output thread
+ * including events processed, dropped, and wait cycle breakdown.
+ *
+ * @param[in] mgr Manager to print stats for
+ */
 void threading_print_stats(threading_mgr_t *mgr);
 
-/* Calculate default worker count based on CPU cores */
+/**
+ * @brief Calculate optimal worker count
+ *
+ * Returns CPU_CORES - 2 (reserving cores for dispatcher and output),
+ * with minimum of 1 and maximum of MAX_WORKERS.
+ *
+ * @return Recommended number of worker threads
+ */
 int threading_default_workers(void);
 
-/* ============================================================================
- * Utility Functions
- * ============================================================================ */
+/** @} */ /* end Threading Manager API */
+/** @} */ /* end threading_manager group */
 
-/* Flow affinity hash - same (pid, ssl_ctx) always maps to same worker */
+/**
+ * @defgroup threading_util Utility Functions
+ * @brief Helper functions for threading subsystem
+ * @{
+ */
+
+/**
+ * @brief Compute flow affinity hash
+ *
+ * Uses FNV-1a hash algorithm for good distribution across workers.
+ * The same (pid, ssl_ctx) pair always produces the same hash, ensuring
+ * connection affinity.
+ *
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ *
+ * @return 32-bit hash value
+ *
+ * @par Algorithm:
+ * FNV-1a with 64-bit prime, truncated to 32 bits:
+ * - XOR each input component
+ * - Multiply by FNV prime (1099511628211)
+ * - Include both halves of ssl_ctx for better distribution
+ */
 static inline uint32_t flow_hash(uint32_t pid, uint64_t ssl_ctx) {
-    /* FNV-1a hash for good distribution */
-    uint64_t hash = 14695981039346656037ULL;
+    uint64_t hash = 14695981039346656037ULL;  /* FNV offset basis */
     hash ^= pid;
-    hash *= 1099511628211ULL;
+    hash *= 1099511628211ULL;                  /* FNV prime */
     hash ^= ssl_ctx;
     hash *= 1099511628211ULL;
     hash ^= (ssl_ctx >> 32);
@@ -495,85 +1097,371 @@ static inline uint32_t flow_hash(uint32_t pid, uint64_t ssl_ctx) {
     return (uint32_t)hash;
 }
 
-/* Get worker ID for a given flow */
+/**
+ * @brief Get worker ID for a connection
+ *
+ * Maps a (pid, ssl_ctx) pair to a worker index using flow affinity hash.
+ *
+ * @param[in] pid         Process ID
+ * @param[in] ssl_ctx     SSL context pointer
+ * @param[in] num_workers Total number of workers
+ *
+ * @return Worker index (0 to num_workers-1)
+ */
 static inline int get_worker_id(uint32_t pid, uint64_t ssl_ctx, int num_workers) {
     return flow_hash(pid, ssl_ctx) % num_workers;
 }
 
-/* Get current time in nanoseconds */
+/**
+ * @brief Get current time in nanoseconds
+ *
+ * Returns CLOCK_MONOTONIC time for consistent timestamps.
+ *
+ * @return Nanoseconds since arbitrary epoch
+ */
 uint64_t get_time_ns(void);
 
-/* Thread-local accessor for current worker state */
+/**
+ * @brief Get thread-local worker state
+ *
+ * Returns the worker_state_t for the current worker thread.
+ * Used by protocol parsers to access per-worker caches.
+ *
+ * @return Worker state pointer, or NULL if not a worker thread
+ */
 worker_state_t *get_current_worker_state(void);
+
+/**
+ * @brief Set thread-local worker state
+ *
+ * Called during worker thread initialization to set up TLS.
+ *
+ * @param[in] state Worker state to associate with current thread
+ */
 void set_current_worker_state(worker_state_t *state);
 
-/* ============================================================================
- * Per-Worker HTTP/2 Management Functions
- * ============================================================================ */
+/** @} */ /* end threading_util group */
 
-/* Connection management */
+/**
+ * @defgroup threading_h2mgmt Per-Worker HTTP/2 Management
+ * @brief Worker-local HTTP/2 session and stream management
+ * @{
+ */
+
+/**
+ * @name Connection Management
+ * @{
+ */
+
+/**
+ * @brief Get or create HTTP/2 connection state
+ *
+ * @param[in] state   Worker state
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ * @param[in] create  true to create if not found
+ *
+ * @return Connection state, or NULL if not found/couldn't create
+ */
 h2_connection_local_t *worker_get_h2_connection(worker_state_t *state,
                                                   uint32_t pid, uint64_t ssl_ctx,
                                                   bool create);
+
+/**
+ * @brief Cleanup HTTP/2 connection and associated streams
+ *
+ * Destroys nghttp2 session, HPACK inflater, and all streams.
+ *
+ * @param[in] state Worker state
+ * @param[in] conn  Connection to cleanup
+ */
 void worker_cleanup_h2_connection(worker_state_t *state, h2_connection_local_t *conn);
 
-/* Stream management */
+/** @} */
+
+/**
+ * @name Stream Management
+ * @{
+ */
+
+/**
+ * @brief Get or create HTTP/2 stream state
+ *
+ * @param[in] state     Worker state
+ * @param[in] pid       Process ID
+ * @param[in] ssl_ctx   SSL context pointer
+ * @param[in] stream_id HTTP/2 stream identifier
+ * @param[in] create    true to create if not found
+ *
+ * @return Stream state, or NULL if not found/couldn't create
+ */
 h2_stream_local_t *worker_get_h2_stream(worker_state_t *state,
                                           uint32_t pid, uint64_t ssl_ctx,
                                           int32_t stream_id, bool create);
+
+/**
+ * @brief Free HTTP/2 stream state
+ *
+ * @param[in] state  Worker state
+ * @param[in] stream Stream to free
+ */
 void worker_free_h2_stream(worker_state_t *state, h2_stream_local_t *stream);
+
+/**
+ * @brief Cleanup all streams for a connection
+ *
+ * Called when connection closes to free all associated streams.
+ *
+ * @param[in] state   Worker state
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ */
 void worker_cleanup_h2_streams_for_connection(worker_state_t *state,
                                                 uint32_t pid, uint64_t ssl_ctx);
 
-/* ALPN cache */
+/** @} */
+
+/**
+ * @name ALPN Cache
+ * @{
+ */
+
+/**
+ * @brief Get cached ALPN protocol for connection
+ *
+ * @param[in] state   Worker state
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ *
+ * @return Protocol string ("h2", "http/1.1", etc.), or NULL if not cached
+ */
 const char *worker_get_alpn(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx);
+
+/**
+ * @brief Cache ALPN protocol for connection
+ *
+ * @param[in] state   Worker state
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ * @param[in] alpn    Protocol string to cache
+ */
 void worker_set_alpn(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
                        const char *alpn);
 
-/* Pending body management */
+/** @} */
+
+/**
+ * @name Pending Body Management
+ * @{
+ */
+
+/**
+ * @brief Find pending body entry for connection
+ *
+ * @param[in] state   Worker state
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ *
+ * @return Pending body entry, or NULL if none
+ */
 pending_body_entry_t *worker_find_pending_body(worker_state_t *state,
                                                   uint32_t pid, uint64_t ssl_ctx);
+
+/**
+ * @brief Create pending body entry for response assembly
+ *
+ * @param[in] state            Worker state
+ * @param[in] pid              Process ID
+ * @param[in] ssl_ctx          SSL context pointer
+ * @param[in] expected_len     Content-Length (0 if unknown/chunked)
+ * @param[in] content_type     Content-Type header value
+ * @param[in] content_encoding Content-Encoding (gzip, br, etc.)
+ *
+ * @return New entry, or NULL if pool exhausted
+ */
 pending_body_entry_t *worker_create_pending_body(worker_state_t *state,
                                                     uint32_t pid, uint64_t ssl_ctx,
                                                     size_t expected_len,
                                                     const char *content_type,
                                                     const char *content_encoding);
+
+/**
+ * @brief Clear and free pending body entry
+ *
+ * @param[in] state Worker state
+ * @param[in] entry Entry to clear
+ */
 void worker_clear_pending_body(worker_state_t *state, pending_body_entry_t *entry);
+
+/**
+ * @brief Cleanup all pending bodies for a process
+ *
+ * Called when process exits.
+ *
+ * @param[in] state Worker state
+ * @param[in] pid   Process ID
+ */
 void worker_cleanup_pending_bodies_pid(worker_state_t *state, uint32_t pid);
 
-/* HTTP/1.1 request cache management (for request-response correlation) */
+/** @} */
+
+/**
+ * @name HTTP/1.1 Request Cache
+ * @{
+ */
+
+/**
+ * @brief Find cached HTTP/1.1 request for connection
+ *
+ * @param[in] state   Worker state
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ *
+ * @return Request entry, or NULL if none cached
+ */
 h1_request_entry_t *worker_find_h1_request(worker_state_t *state,
                                             uint32_t pid, uint64_t ssl_ctx);
+
+/**
+ * @brief Cache HTTP/1.1 request for response correlation
+ *
+ * @param[in] state   Worker state
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ * @param[in] method  HTTP method
+ * @param[in] path    Request path
+ * @param[in] host    Host header value
+ */
 void worker_set_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
                            const char *method, const char *path, const char *host);
+
+/**
+ * @brief Clear cached HTTP/1.1 request
+ *
+ * @param[in] state   Worker state
+ * @param[in] pid     Process ID
+ * @param[in] ssl_ctx SSL context pointer
+ */
 void worker_clear_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx);
 
-/* ============================================================================
- * Statistics Functions
- * ============================================================================ */
+/** @} */
+/** @} */ /* end threading_h2mgmt group */
 
+/**
+ * @defgroup threading_stats Statistics Functions
+ * @brief Thread-safe statistics accessors
+ * @{
+ */
+
+/**
+ * @brief Get object pool statistics
+ *
+ * @param[in]  pool     Pool to query
+ * @param[out] allocs   Total allocations (optional, NULL to skip)
+ * @param[out] frees    Total deallocations (optional)
+ * @param[out] failures Allocation failures (optional)
+ */
 void pool_get_stats(object_pool_t *pool, uint64_t *allocs, uint64_t *frees,
                     uint64_t *failures);
+
+/**
+ * @brief Get dispatcher statistics
+ *
+ * @param[in]  ctx        Dispatcher context
+ * @param[out] dispatched Events dispatched to workers (optional)
+ * @param[out] dropped    Events dropped (optional)
+ */
 void dispatcher_get_stats(dispatcher_ctx_t *ctx, uint64_t *dispatched,
                           uint64_t *dropped);
+
+/**
+ * @brief Get dispatcher XDP statistics
+ *
+ * @param[in]  ctx              Dispatcher context
+ * @param[out] flows_discovered New flows detected (optional)
+ * @param[out] flows_terminated Flows closed (optional)
+ * @param[out] ambiguous        Ambiguous events (optional)
+ * @param[out] dropped          Dropped XDP events (optional)
+ */
 void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
                                uint64_t *flows_terminated, uint64_t *ambiguous,
                                uint64_t *dropped);
+
+/**
+ * @brief Get output thread statistics
+ *
+ * @param[in]  ctx      Output context
+ * @param[out] messages Messages written (optional)
+ * @param[out] bytes    Bytes written (optional)
+ */
 void output_get_stats(output_ctx_t *ctx, uint64_t *messages, uint64_t *bytes);
 
-/* ============================================================================
- * Output Helpers (for workers to enqueue formatted output)
- * ============================================================================ */
+/** @} */ /* end threading_stats group */
 
+/**
+ * @defgroup threading_outhelp Output Helpers
+ * @brief Worker functions for enqueueing formatted output
+ * @{
+ */
+
+/**
+ * @brief Allocate output message from worker's pool
+ *
+ * @param[in] worker Worker context
+ *
+ * @return Output message, or NULL if pool exhausted
+ */
 output_msg_t *output_alloc(worker_ctx_t *worker);
+
+/**
+ * @brief Enqueue output message to output thread
+ *
+ * @param[in] worker Worker context
+ * @param[in] msg    Message to enqueue (ownership transferred)
+ *
+ * @return 0 on success, -1 if queue full
+ */
 int output_enqueue(worker_ctx_t *worker, output_msg_t *msg);
+
+/**
+ * @brief Format and enqueue output message (printf-style)
+ *
+ * Convenience function combining output_alloc, snprintf, and output_enqueue.
+ *
+ * @param[in] worker Worker context
+ * @param[in] fmt    printf format string
+ * @param[in] ...    Format arguments
+ *
+ * @return 0 on success, -1 on failure
+ */
 int output_write(worker_ctx_t *worker, const char *fmt, ...);
 
-/* ============================================================================
- * Manager Helpers
- * ============================================================================ */
+/** @} */ /* end threading_outhelp group */
 
+/**
+ * @defgroup threading_helpers Manager Helpers
+ * @brief Global manager access functions
+ * @{
+ */
+
+/**
+ * @brief Check if threading manager is running
+ *
+ * @param[in] mgr Manager to check
+ *
+ * @return true if threads are running
+ */
 bool threading_is_running(threading_mgr_t *mgr);
+
+/**
+ * @brief Get global threading manager instance
+ *
+ * Returns the singleton manager created by threading_init().
+ *
+ * @return Manager pointer, or NULL if not initialized
+ */
 threading_mgr_t *threading_get_manager(void);
+
+/** @} */ /* end threading_helpers group */
 
 #endif /* THREADING_H */

@@ -1,0 +1,365 @@
+# Doxyfile 1.14.0 - Configuration for spliff documentation
+#
+# This file describes the settings to be used by Doxygen for spliff,
+# an eBPF-based SSL/TLS traffic sniffer.
+
+#---------------------------------------------------------------------------
+# Project related configuration options
+#---------------------------------------------------------------------------
+
+# Project name shown in the generated documentation
+PROJECT_NAME           = "spliff"
+
+# Project version or revision number
+PROJECT_NUMBER         = "1.0.0"
+
+# Brief description of the project
+PROJECT_BRIEF          = "eBPF-based SSL/TLS Traffic Sniffer"
+
+# Logo file for the project (optional)
+PROJECT_LOGO           =
+
+# Output directory for generated documentation
+OUTPUT_DIRECTORY       = docs
+
+# Create timestamp in output
+TIMESTAMP              = YES
+
+#---------------------------------------------------------------------------
+# Build related configuration options
+#---------------------------------------------------------------------------
+
+# Extract all entities, not just documented ones
+EXTRACT_ALL            = NO
+
+# Extract private class members
+EXTRACT_PRIVATE        = YES
+
+# Extract static members
+EXTRACT_STATIC         = YES
+
+# Extract local classes/structs from function bodies
+EXTRACT_LOCAL_CLASSES  = YES
+
+# Hide undocumented members
+HIDE_UNDOC_MEMBERS     = NO
+
+# Hide undocumented classes
+HIDE_UNDOC_CLASSES     = NO
+
+# Brief descriptions included in member descriptions
+BRIEF_MEMBER_DESC      = YES
+
+# Repeat brief description before detailed description
+REPEAT_BRIEF           = YES
+
+# Always show detailed section even if only brief
+ALWAYS_DETAILED_SEC    = NO
+
+# Show include files in file documentation
+SHOW_INCLUDE_FILES     = YES
+
+# Sort members alphabetically
+SORT_MEMBER_DOCS       = YES
+
+# Sort brief descriptions alphabetically
+SORT_BRIEF_DOCS        = NO
+
+# Sort members by scope
+SORT_MEMBERS_CTORS_1ST = YES
+
+# Show used files list
+SHOW_USED_FILES        = YES
+
+# Show file list
+SHOW_FILES             = YES
+
+# Show namespaces
+SHOW_NAMESPACES        = YES
+
+#---------------------------------------------------------------------------
+# Configuration options related to warning and progress messages
+#---------------------------------------------------------------------------
+
+# Be quiet (only report warnings and errors)
+QUIET                  = NO
+
+# Show warnings
+WARNINGS               = YES
+
+# Warn if undocumented members
+WARN_IF_UNDOCUMENTED   = YES
+
+# Warn if doc error
+WARN_IF_DOC_ERROR      = YES
+
+# Warn on incomplete params
+WARN_IF_INCOMPLETE_DOC = YES
+
+# Warn format string
+WARN_FORMAT            = "$file:$line: $text"
+
+# Log file for warnings
+WARN_LOGFILE           =
+
+#---------------------------------------------------------------------------
+# Configuration options related to the input files
+#---------------------------------------------------------------------------
+
+# Input files and directories
+INPUT                  = src \
+                         README.md
+
+# Input encoding
+INPUT_ENCODING         = UTF-8
+
+# File patterns to process
+FILE_PATTERNS          = *.c \
+                         *.h \
+                         *.md
+
+# Recursive search
+RECURSIVE              = YES
+
+# Exclude patterns
+EXCLUDE                = src/bpf/vmlinux.h
+
+# Exclude symbols
+EXCLUDE_SYMBOLS        =
+
+# Exclude patterns
+EXCLUDE_PATTERNS       = */build*/* \
+                         */.git/*
+
+# Use README.md as main page
+USE_MDFILE_AS_MAINPAGE = README.md
+
+#---------------------------------------------------------------------------
+# Configuration options related to source browsing
+#---------------------------------------------------------------------------
+
+# Include source code
+SOURCE_BROWSER         = YES
+
+# Show line numbers
+INLINE_SOURCES         = NO
+
+# Strip code comments
+STRIP_CODE_COMMENTS    = NO
+
+# Reference generated docs in source
+REFERENCED_BY_RELATION = YES
+
+# Reference source in generated docs
+REFERENCES_RELATION    = YES
+
+# Reference linked sources
+REFERENCES_LINK_SOURCE = YES
+
+# Use htags for source browsing
+USE_HTAGS              = NO
+
+# Verbatim headers
+VERBATIM_HEADERS       = YES
+
+#---------------------------------------------------------------------------
+# Configuration options related to the alphabetical class index
+#---------------------------------------------------------------------------
+
+# Generate alphabetical index
+ALPHABETICAL_INDEX     = YES
+
+#---------------------------------------------------------------------------
+# Configuration options related to the HTML output
+#---------------------------------------------------------------------------
+
+# Generate HTML output
+GENERATE_HTML          = YES
+
+# HTML output directory
+HTML_OUTPUT            = html
+
+# HTML file extension
+HTML_FILE_EXTENSION    = .html
+
+# HTML header file
+HTML_HEADER            =
+
+# HTML footer file
+HTML_FOOTER            =
+
+# HTML stylesheet
+HTML_STYLESHEET        =
+
+# Extra HTML stylesheet
+HTML_EXTRA_STYLESHEET  =
+
+# HTML colorstyle
+HTML_COLORSTYLE        = AUTO_LIGHT
+
+# Dynamic sidebar
+HTML_DYNAMIC_MENUS     = YES
+
+# Dynamic sections
+HTML_DYNAMIC_SECTIONS  = YES
+
+# Index entry classes
+HTML_INDEX_NUM_ENTRIES = 100
+
+# Generate tree view
+GENERATE_TREEVIEW      = YES
+
+# Tree view width
+TREEVIEW_WIDTH         = 250
+
+# Full sidebar
+FULL_SIDEBAR           = NO
+
+# External groups
+EXT_LINKS_IN_WINDOW    = NO
+
+# Obfuscate email
+OBFUSCATE_EMAILS       = YES
+
+# Search engine
+SEARCHENGINE           = YES
+
+# Server-based search
+SERVER_BASED_SEARCH    = NO
+
+#---------------------------------------------------------------------------
+# Configuration options related to the LaTeX output
+#---------------------------------------------------------------------------
+
+# Generate LaTeX output
+GENERATE_LATEX         = NO
+
+#---------------------------------------------------------------------------
+# Configuration options related to the RTF output
+#---------------------------------------------------------------------------
+
+# Generate RTF output
+GENERATE_RTF           = NO
+
+#---------------------------------------------------------------------------
+# Configuration options related to the man page output
+#---------------------------------------------------------------------------
+
+# Generate man pages
+GENERATE_MAN           = YES
+
+# Man output directory
+MAN_OUTPUT             = man
+
+# Man file extension
+MAN_EXTENSION          = .3
+
+# Man section
+MAN_SUBDIR             =
+
+# Links in man pages
+MAN_LINKS              = NO
+
+#---------------------------------------------------------------------------
+# Configuration options related to the XML output
+#---------------------------------------------------------------------------
+
+# Generate XML output
+GENERATE_XML           = NO
+
+#---------------------------------------------------------------------------
+# Configuration options related to the preprocessor
+#---------------------------------------------------------------------------
+
+# Enable preprocessing
+ENABLE_PREPROCESSING   = YES
+
+# Macro expansion
+MACRO_EXPANSION        = YES
+
+# Expand only predefined macros
+EXPAND_ONLY_PREDEF     = NO
+
+# Search includes
+SEARCH_INCLUDES        = YES
+
+# Include paths
+INCLUDE_PATH           = src/include \
+                         src/bpf \
+                         src/protocol \
+                         src/content \
+                         src/output \
+                         src/threading \
+                         src/util
+
+# Include file patterns
+INCLUDE_FILE_PATTERNS  =
+
+# Predefined macros
+PREDEFINED             = __attribute__(x)= \
+                         HAVE_THREADING=1 \
+                         _GNU_SOURCE=1
+
+# Expand as defined
+EXPAND_AS_DEFINED      =
+
+# Skip function macros
+SKIP_FUNCTION_MACROS   = YES
+
+#---------------------------------------------------------------------------
+# Configuration options related to the dot tool
+#---------------------------------------------------------------------------
+
+# Use dot for diagrams
+HAVE_DOT               = YES
+
+# Dot tool path
+DOT_PATH               =
+
+# Class diagrams
+CLASS_DIAGRAMS         = YES
+
+# Collaboration diagrams
+COLLABORATION_GRAPH    = YES
+
+# Group graphs
+GROUP_GRAPHS           = YES
+
+# Include dependency graphs
+INCLUDE_GRAPH          = YES
+
+# Included by graphs
+INCLUDED_BY_GRAPH      = YES
+
+# Call graphs
+CALL_GRAPH             = YES
+
+# Caller graphs
+CALLER_GRAPH           = YES
+
+# Graphical hierarchy
+GRAPHICAL_HIERARCHY    = YES
+
+# Directory graphs
+DIRECTORY_GRAPH        = YES
+
+# Dot image format
+DOT_IMAGE_FORMAT       = svg
+
+# Interactive SVG
+INTERACTIVE_SVG        = YES
+
+# Dot graph max nodes
+DOT_GRAPH_MAX_NODES    = 50
+
+# Max dot graph depth
+MAX_DOT_GRAPH_DEPTH    = 0
+
+# Dot transparent
+DOT_TRANSPARENT        = NO
+
+# Dot multi targets
+DOT_MULTI_TARGETS      = YES
+
+# Generate legend
+GENERATE_LEGEND        = YES
