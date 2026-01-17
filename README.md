@@ -14,7 +14,7 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 
 ### SSL/TLS Library Support
 - **OpenSSL**: `SSL_read`, `SSL_write`, `SSL_read_ex`, `SSL_write_ex`, `SSL_connect`
-- **BoringSSL** ⚠️: Experimental support for Chrome/Chromium/Brave/Edge (see [Known Limitations](#known-limitations))
+- **BoringSSL** ⚠️: Experimental support for Chrome/Chromium/Brave/ (see [Known Limitations](#known-limitations))
 - **GnuTLS**: `gnutls_record_recv`, `gnutls_record_send`, `gnutls_handshake`
 - **NSS/NSPR**: `PR_Read`, `PR_Write`, `PR_Recv`, `PR_Send`, `SSL_ForceHandshake`
 - **WolfSSL**: `wolfSSL_read`, `wolfSSL_write`
@@ -25,6 +25,13 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | HTTP/1.1 | llhttp | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
 | HTTP/2 | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
 
+### Dynamic Process Monitoring (v0.9.0+)
+- **EDR-Style Process Scanning**: Discovers SSL libraries in running processes via `/proc/PID/maps`
+- **Runtime Browser Detection**: Detects Chrome/Chromium/Brave/ at startup (experimental)
+- **BoringSSL Binary Scanning**: Heuristic function offset detection for stripped binaries
+- **Process Lifecycle Events**: BPF tracepoints for `sched_process_exec` and `sched_process_fork`
+- **Deduplication**: Path-based caching prevents duplicate probe attachment
+
 ### XDP Packet-Level Tracking (v0.8.0+)
 - **High-Performance Flow Tracking**: XDP programs at network interface level
 - **Auto-Attach**: Discovers and attaches to all suitable interfaces (physical/virtual)
@@ -32,13 +39,6 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **sock_ops Cookie Caching**: "Golden Thread" correlation between packets and SSL sessions
 - **Connection Warm-up**: Seeds existing TCP connections at startup via netlink SOCK_DIAG
 - **XDP Statistics**: Debug-mode metrics (packets, flows, gatekeeper hits)
-
-### Dynamic Process Monitoring (v0.9.0+)
-- **EDR-Style Process Scanning**: Discovers SSL libraries in running processes via `/proc/PID/maps`
-- **Runtime Browser Detection**: Detects Chrome/Chromium/Brave/Edge at startup (experimental)
-- **BoringSSL Binary Scanning**: Heuristic function offset detection for stripped binaries
-- **Process Lifecycle Events**: BPF tracepoints for `sched_process_exec` and `sched_process_fork`
-- **Deduplication**: Path-based caching prevents duplicate probe attachment
 
 ### BPF-Level Filtering (v0.7.0+)
 - **Socket Family Detection**: Filters AF_UNIX (IPC) at kernel level
@@ -251,7 +251,7 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │                      ║ BPF Uprobes ║  Intercept decrypted data                    │
 │                      ╚══════╤══════╝                                              │
 │                             │                                                     │
-│   ┌─────────────────────────▼─────────────────────────┐                           │
+│   ┌─────────────────────────▼──────────────────────────┐                          │
 │   │                      spliff                        │                          │
 │   │                                                    │                          │
 │   │  ┌────────────────┐      ┌────────────────┐        │                          │
@@ -409,7 +409,7 @@ See [docs/](docs/) for detailed implementation plans.
 
 ## Known Limitations
 
-- **⚠️ Chrome/Chromium Support (Experimental)**: Support for Chrome, Chromium, Brave, and Edge browsers is **experimental and may be flaky**. These browsers use statically-linked BoringSSL with stripped debug symbols, making function offset detection unreliable:
+- **⚠️ Chrome/Chromium Support (Experimental)**: Support for Chrome, Chromium, Brave, browsers is **experimental and may be flaky**. These browsers use statically-linked BoringSSL with stripped debug symbols, making function offset detection unreliable:
   - Offsets vary between browser versions, builds, and distributions
   - No stable ABI - Google frequently changes internal structures
   - Detection relies on heuristic binary scanning that may fail or cause crashes
@@ -478,19 +478,37 @@ BPF code (`src/bpf/spliff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel r
 
 ## Acknowledgments
 
-### Libraries
-- [libbpf](https://github.com/libbpf/libbpf) - eBPF CO-RE library
-- [llhttp](https://github.com/nodejs/llhttp) - HTTP/1.1 parser from Node.js
-- [nghttp2](https://github.com/nghttp2/nghttp2) - HTTP/2 library with HPACK
-- [Concurrency Kit](https://github.com/concurrencykit/ck) - Lock-free data structures
-- [zstd](https://github.com/facebook/zstd) - Zstandard compression
-- [brotli](https://github.com/google/brotli) - Brotli compression
+### Core Libraries
+- [libbpf](https://github.com/libbpf/libbpf) - eBPF CO-RE library for portable BPF programs
+- [libelf](https://sourceware.org/elfutils/) - ELF binary parsing for library discovery
+- [libxdp](https://github.com/xdp-project/xdp-tools) - XDP program loading and management
 
-### Resources
-- [Linux kernel BPF documentation](https://docs.kernel.org/bpf/)
-- [XDP Tutorial](https://github.com/xdp-project/xdp-tutorial)
+### Protocol Parsing
+- [llhttp](https://github.com/nodejs/llhttp) - HTTP/1.1 parser from Node.js
+- [nghttp2](https://github.com/nghttp2/nghttp2) - HTTP/2 library with HPACK compression
+- [PCRE2](https://github.com/PCRE2Project/pcre2) - Perl Compatible Regular Expressions (pattern matching)
+
+### Concurrency & Memory
+- [Concurrency Kit](https://github.com/concurrencykit/ck) - Lock-free data structures (SPSC rings, spinlocks)
+- [liburcu](https://liburcu.org/) - Userspace Read-Copy-Update (optional)
+- [jemalloc](https://github.com/jemalloc/jemalloc) - Memory allocator (optional)
+
+### Compression
+- [zlib](https://zlib.net/) - gzip/deflate decompression
+- [zstd](https://github.com/facebook/zstd) - Zstandard compression by Facebook
+- [brotli](https://github.com/google/brotli) - Brotli compression by Google
+
+### Documentation
+- [Doxygen](https://www.doxygen.nl/) - API documentation generation
+
+### Technical Resources
+- [Linux kernel BPF documentation](https://docs.kernel.org/bpf/) - Official BPF docs
+- [XDP Tutorial](https://github.com/xdp-project/xdp-tutorial) - Hands-on XDP programming
 - [BPF Performance Tools](https://www.brendangregg.com/bpf-performance-tools-book.html) by Brendan Gregg
+- [RFC 7540](https://datatracker.ietf.org/doc/html/rfc7540) - HTTP/2 specification
+- [RFC 7541](https://datatracker.ietf.org/doc/html/rfc7541) - HPACK header compression
+- [RFC 8446](https://datatracker.ietf.org/doc/html/rfc8446) - TLS 1.3 specification
 
 ### Development
 - [Claude](https://www.anthropic.com/claude) by Anthropic - AI assistant that wrote this codebase
-- [Claude Code](https://claude.ai/claude-code) - CLI tool for AI-assisted development
+- [Claude Code](https://claude.ai/code) - CLI tool for AI-assisted development
