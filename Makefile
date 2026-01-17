@@ -11,7 +11,7 @@
 
 .PHONY: all release debug tests test clean distclean install \
         coverage coverage-html coverage-clean \
-        package-deb package-rpm help
+        package-deb package-rpm docs clean-docs help
 
 # Build directories
 BUILD_DIR_DEBUG := build-debug
@@ -74,6 +74,25 @@ tests: debug
 
 # Alias for tests
 test: tests
+
+# ============================================================================
+# Documentation Targets
+# ============================================================================
+
+# Generate Doxygen API documentation
+docs:
+	@echo "==> Configuring for documentation..."
+	@cmake -B $(BUILD_DIR_DEBUG) -DCMAKE_BUILD_TYPE=Debug
+	@echo "==> Generating API documentation with Doxygen..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target docs
+	@echo "==> Documentation generated: docs/html/index.html"
+	@echo "    Open with: xdg-open docs/html/index.html"
+
+# Clean generated documentation
+clean-docs:
+	@echo "==> Cleaning generated documentation..."
+	@rm -rf docs/html docs/man docs/latex
+	@echo "==> Documentation cleaned"
 
 # ============================================================================
 # Clean Targets
@@ -177,6 +196,10 @@ help:
 	@echo "  make tests            Build and run all tests"
 	@echo "  make clean            Remove all build artifacts and configuration"
 	@echo "  make install          Install to /usr/local/bin (requires sudo)"
+	@echo ""
+	@echo "Documentation targets:"
+	@echo "  make docs             Generate Doxygen API documentation"
+	@echo "  make clean-docs       Remove generated documentation"
 	@echo ""
 	@echo "Coverage targets:"
 	@echo "  make coverage         Build with gcov and run tests"
