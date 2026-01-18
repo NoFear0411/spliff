@@ -303,38 +303,44 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │  │  ┌─────────────────────────────────────────────────────────────────────────┐     │    │
 │  │  │                    XDP (eXpress Data Path)                              │     │    │
 │  │  │                                                                         │     │    │
-│  │  │   NIC ──► Packet ──► Flow State Machine ──► Protocol Classify ──►       │     │    │
+│  │  │   NIC ──► Packet ──► Flow State Machine ──► Protocol Classify           │     │    │
 │  │  │           │         (SYN/DATA/FIN/RST)     (TLS/HTTP2/HTTP1)            │     │    │
-│  │  │           │                                       │                     │     │    │
-│  │  │           ▼                                       ▼                     │     │    │
-│  │  │      flow_states map                      xdp_events ring ──► userspace │     │    │
-│  │  │                                                                         │     │    │
-│  │  └──────────────────────────────────┬──────────────────────────────────────┘     │    │
-│  │                                     │                                            │    │
-│  │                          flow_cookie_map ◄──────────────────────┐                │    │
-│  │                        (5-tuple → socket cookie)                │                │    │
-│  │                          "Golden Thread" link                   │                │    │
-│  │                                     │                           │                │    │
-│  │  ┌──────────────────────────────────▼─────────────────────────────────────┐      │    │
-│  │  │                    sock_ops (Socket Events)                            │      │    │
-│  │  │                                                                        │      │    │
-│  │  │   TCP Connect ──► ACTIVE_ESTABLISHED_CB ──► Cache socket cookie        │      │    │
-│  │  │   TCP Accept  ──► PASSIVE_ESTABLISHED_CB ──► in flow_cookie_map        │      │    │
-│  │  │   TCP Close   ──► STATE_CB ──► Cleanup stale entries                   │      │    │
-│  │  │                                                                        │      │    │
-│  │  └────────────────────────────────────────────────────────────────────────┘      │    │
-│  │                                                                                  │    │
-│  │  ┌────────────────────────────────────────────────────────────────────────┐      │    │
-│  │  │                    Uprobes (SSL Library Hooks)                         │      │    │
-│  │  │                                                                        │      │    │
-│  │  │   SSL_read/write  ──► Capture decrypted data ──► ssl_events ring       │      │    │
-│  │  │   SSL_set_fd      ──► Map SSL* → fd → socket cookie                    │      │    │
-│  │  │   SSL_get_alpn    ──► Detect HTTP/1.1 vs HTTP/2                        │      │    │
-│  │  │   SSL_free        ──► Cleanup tracked sessions                         │      │    │
-│  │  │                                                                        │      │    │
-│  │  │   Supported: OpenSSL, GnuTLS, NSS, WolfSSL, BoringSSL (experimental)   │      │    │
-│  │  │                                                                        │      │    │
-│  │  └────────────────────────────────────────────────────────────────────────┘      │    │
+│  │  │           ▼                                       │                     │     │    │
+│  │  │      flow_states map                              ▼                     │     │    │
+│  │  │           │                              xdp_events ring ──► userspace  │     │    │
+│  │  │           │                                                             │     │    │
+│  │  └───────────┼─────────────────────────────────────────────────────────────┘     │    │
+│  │              │                                                                   │    │
+│  │              │ lookup                                                            │    │
+│  │              ▼                                                                   │    │
+│  │  ╔═══════════════════════════════════════════════════════════════════════════╗   │    │
+│  │  ║                    SOCKET COOKIE - "Golden Thread"                        ║   │    │
+│  │  ║                                                                           ║   │    │
+│  │  ║              ┌─────────────────┐       ┌─────────────────┐                ║   │    │
+│  │  ║              │ flow_cookie_map │       │   ssl_to_fd     │                ║   │    │
+│  │  ║              │ (5-tuple:cookie)│       │ (SSL*:fd:cookie)│                ║   │    │
+│  │  ║              └────────┬────────┘       └────────┬────────┘                ║   │    │
+│  │  ║                       │                         │                         ║   │    │
+│  │  ║                       └────────────┬────────────┘                         ║   │    │
+│  │  ║                                    │                                      ║   │    │
+│  │  ║                           Socket Cookie (u64)                             ║   │    │
+│  │  ║                      Links: Packets ↔ Sockets ↔ TLS Data                  ║   │    │
+│  │  ║                                    │                                      ║   │    │
+│  │  ╚════════════════════════════════════╪══════════════════════════════════════╝   │    │
+│  │                 ┌─────────────────────┼─────────────────────┐                    │    │
+│  │                 │                     │                     │                    │    │
+│  │                 ▼                     ▼                     ▼                    │    │
+│  │  ┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐      │    │
+│  │  │   sock_ops           │ │   Uprobes            │ │   (correlation)      │      │    │
+│  │  │   (Socket Events)    │ │   (TLS Interception) │ │                      │      │    │
+│  │  ├──────────────────────┤ ├──────────────────────┤ │  XDP packet metadata │      │    │
+│  │  │ • ESTABLISHED_CB     │ │ • SSL_read/write     │ │  + sock state        │      │    │
+│  │  │   → cache cookie     │ │   → decrypt data     │ │  + TLS plaintext     │      │    │
+│  │  │ • STATE_CB           │ │ • SSL_set_fd         │ │  + PID/process       │      │    │
+│  │  │   → cleanup on close │ │   → link SSL*→cookie │ │                      │      │    │
+│  │  │                      │ │ • SSL_get_alpn       │ │  = Complete L7 view  │      │    │
+│  │  │                      │ │   → protocol detect  │ │                      │      │    │
+│  │  └──────────────────────┘ └──────────────────────┘ └──────────────────────┘      │    │
 │  │                                                                                  │    │
 │  │  ┌────────────────────────────────────────────────────────────────────────┐      │    │
 │  │  │                    Tracepoints (Process Lifecycle)                     │      │    │
@@ -353,30 +359,46 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 ### The "Golden Thread" – How Correlation Works
 
 ```
-    ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
-    │     XDP     │         │  sock_ops   │         │   Uprobes   │
-    │  (packets)  │         │  (sockets)  │         │ (TLS data)  │
-    └──────┬──────┘         └──────┬──────┘         └──────┬──────┘
-           │                       │                       │
-           │    flow_cookie_map    │    ssl_to_fd map      │
-           │   ┌───────────────┐   │   ┌───────────────┐   │
-           └──►│ 5-tuple:cookie│◄──┴──►│ SSL*:fd:cookie│◄──┘
-               └───────────────┘       └───────────────┘
-                       │                       │
-                       └───────────┬───────────┘
-                                   ▼
-                          Socket Cookie (u64)
-                      Unique per-connection identifier
-                                   │
-                                   ▼
-                    ┌─────────────────────────────┐
-                    │   Unified Per-Flow View     │
-                    │  • Packet metadata (XDP)    │
-                    │  • TCP state (sock_ops)     │
-                    │  • Decrypted TLS (uprobes)  │
-                    │  • PID, process name        │
-                    └─────────────────────────────┘
+                            SOCKET COOKIE (u64)
+                     ═══════════════════════════════
+                     Unique per-TCP-connection identifier
+                     generated by kernel, cached by sock_ops
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+        ▼                   ▼                   ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│      XDP      │   │   sock_ops    │   │    Uprobes    │
+│   (packets)   │   │   (sockets)   │   │  (TLS data)   │
+├───────────────┤   ├───────────────┤   ├───────────────┤
+│ • Raw packets │   │ • TCP state   │   │ • Decrypted   │
+│ • 5-tuple     │   │ • Connection  │   │   plaintext   │
+│ • Flow state  │   │   lifecycle   │   │ • SSL context │
+│ • Protocol ID │   │ • Cookie gen  │   │ • ALPN proto  │
+└───────┬───────┘   └───────┬───────┘   └───────┬───────┘
+        │                   │                   │
+        │  flow_cookie_map  │                   │  ssl_to_fd map
+        │  (5-tuple→cookie) │                   │  (SSL*→fd→cookie)
+        │                   │                   │
+        └───────────────────┴───────────────────┘
+                            │
+                            ▼
+              ┌─────────────────────────────┐
+              │   UNIFIED PER-FLOW VIEW     │
+              │                             │
+              │  Packet  +  Socket  +  TLS  │
+              │  metadata   state    data   │
+              │                             │
+              │  → Complete L7 visibility   │
+              │  → PID + process name       │
+              │  → Request/response corr.   │
+              └─────────────────────────────┘
 ```
+
+**Why this matters:** Commercial EDRs typically only see packets OR decrypted TLS, not both
+correlated to the same flow. The socket cookie is the "golden thread" that ties all three
+data sources together, giving spliff complete visibility into what data went over which
+connection from which process.
 
 ### Data Flow
 
