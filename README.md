@@ -233,104 +233,161 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────────────────────────┐
-│                                 User Space                                        │
-│                                                                                   │
-│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                           │
-│   │    curl     │    │   Firefox   │    │   Chrome    │     Applications          │
-│   └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                           │
-│          │                  │                  │                                  │
-│   ┌──────▼──────┐    ┌──────▼──────┐    ┌──────▼──────┐                           │
-│   │   OpenSSL   │    │     NSS     │    │  BoringSSL  │     SSL/TLS Libraries     │ 
-│   │ SSL_read()  │    │  PR_Read()  │    │ SSL_read()  │                           │
-│   └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                           │
-│          │                  │                  │                                  │
-│          └──────────────────┼──────────────────┘                                  │
-│                             │                                                     │
-│                      ╔══════▼══════╗                                              │
-│                      ║ BPF Uprobes ║  Intercept decrypted data                    │
-│                      ╚══════╤══════╝                                              │
-│                             │                                                     │
-│   ┌─────────────────────────▼──────────────────────────┐                          │
-│   │                      spliff                        │                          │
-│   │                                                    │                          │
-│   │  ┌────────────────┐      ┌────────────────┐        │                          │
-│   │  │ Uprobe Events  │      │  XDP Events    │        │   Dual Ring Buffers      │
-│   │  │  (SSL data)    │      │ (packet meta)  │        │                          │
-│   │  └───────┬────────┘      └───────┬────────┘        │                          │
-│   │          │                       │                 │                          │
-│   │          └───────────┬───────────┘                 │                          │
-│   │                      │                             │                          │
-│   │           ┌──────────▼──────────┐                  │                          │
-│   │           │  Dispatcher Thread  │   Routes by (pid, ssl_ctx)                  │
-│   │           └──────────┬──────────┘                  │                          │
-│   │                      │                             │                          │
-│   │          ┌───────────┼───────────┐                 │                          │
-│   │          ▼           ▼           ▼                 │                          │
-│   │     ┌────────┐  ┌────────┐  ┌────────┐             │                          │
-│   │     │Worker 0│  │Worker 1│  │Worker N│   Lock-free SPSC queues                │
-│   │     │ HTTP/1 │  │ HTTP/2 │  │ HTTP/1 │   Per-worker state isolation           │
-│   │     │ HTTP/2 │  │ HTTP/1 │  │ HTTP/2 │                                        │
-│   │     └───┬────┘  └───┬────┘  └───┬────┘             │                          │
-│   │         │           │           │                  │                          │
-│   │         └───────────┼───────────┘                  │                          │
-│   │                     ▼                              │                          │
-│   │          ┌─────────────────────┐                   │                          │
-│   │          │   Output Thread     │   Serialized stdout                          │
-│   │          └─────────────────────┘                   │                          │
-│   └────────────────────────────────────────────────────┘                          │
-│                                                                                   │
-├───────────────────────────────────────────────────────────────────────────────────┤
-│                                 Kernel Space                                      │
-│                                                                                   │
-│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
-│  │                                                                             │  │
-│  │   ┌───────────────────────────────────────────────────────────────────┐     │  │
-│  │   │                    XDP (eXpress Data Path)                        │     │  │
-│  │   │                                                                   │     │  │
-│  │   │  • Attaches to all network interfaces (native/SKB mode)           │     │  │
-│  │   │  • Flow tracking: SYN → DATA → FIN/RST lifecycle                  │     │  │
-│  │   │  • Protocol classification: TLS, HTTP/2, HTTP/1.x                 │     │  │
-│  │   │  • Emits packet metadata to xdp_events ring buffer                │     │  │
-│  │   │                                                                   │     │  │
-│  │   └───────────────────────────────────────────────────────────────────┘     │  │
-│  │                              │                                              │  │
-│  │                              │ flow_cookie_map                              │  │
-│  │                              │ (5-tuple → socket cookie)                    │  │
-│  │                              │                                              │  │
-│  │   ┌───────────────────────────────────────────────────────────────────┐     │  │
-│  │   │                    sock_ops (Connection Tracking)                 │     │  │
-│  │   │                                                                   │     │  │
-│  │   │  • Hooks ACTIVE_ESTABLISHED_CB, PASSIVE_ESTABLISHED_CB            │     │  │
-│  │   │  • Caches socket cookies for XDP correlation                      │     │  │
-│  │   │  • Enables "Golden Thread" between packets and SSL sessions       │     │  │
-│  │   │                                                                   │     │  │
-│  │   └───────────────────────────────────────────────────────────────────┘     │  │
-│  │                                                                             │  │
-│  │   ┌───────────────────────────────────────────────────────────────────┐     │  │
-│  │   │                    Uprobes (SSL Interception)                     │     │  │
-│  │   │                                                                   │     │  │
-│  │   │  • Captures SSL_read/SSL_write arguments and return values        │     │  │
-│  │   │  • Copies decrypted data to ssl_events ring buffer                │     │  │
-│  │   │  • Tracks SSL context → file descriptor mapping                   │     │  │
-│  │   │  • Socket family detection (AF_INET vs AF_UNIX filtering)         │     │  │
-│  │   │  • ALPN protocol detection hooks                                  │     │  │
-│  │   │                                                                   │     │  │
-│  │   └───────────────────────────────────────────────────────────────────┘     │  │
-│  │                                                                             │  │
-│  └─────────────────────────────────────────────────────────────────────────────┘  │
-│                                                                                   │
-└───────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                                    USER SPACE                                           │
+│                                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐    │
+│  │                              Applications                                        │    │
+│  │   ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐               │    │
+│  │   │  curl   │  │ Firefox │  │ Chrome  │  │  Brave  │  │  wget   │               │    │
+│  │   └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘               │    │
+│  │        │            │            │            │            │                     │    │
+│  │   ┌────▼────┐  ┌────▼────┐  ┌────▼────────────▼────┐  ┌────▼────┐               │    │
+│  │   │ OpenSSL │  │   NSS   │  │     BoringSSL ⚠️     │  │ GnuTLS  │  SSL Libraries │    │
+│  │   └────┬────┘  └────┬────┘  └──────────┬──────────┘  └────┬────┘               │    │
+│  │        │            │                  │                  │                     │    │
+│  │        └────────────┴────────┬─────────┴──────────────────┘                     │    │
+│  └──────────────────────────────┼──────────────────────────────────────────────────┘    │
+│                                 │                                                       │
+│                          ╔══════▼══════╗                                                │
+│                          ║ BPF Uprobes ║ ◄─── Dynamic attachment via /proc/PID/maps     │
+│                          ╚══════╤══════╝      + BoringSSL binary scanning               │
+│                                 │                                                       │
+│  ┌──────────────────────────────▼──────────────────────────────────────────────────┐    │
+│  │                              spliff                                              │    │
+│  │                                                                                  │    │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐     │    │
+│  │  │                        Ring Buffer Consumers                            │     │    │
+│  │  │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │     │    │
+│  │  │   │ ssl_events   │  │ xdp_events   │  │ process_events│                 │     │    │
+│  │  │   │ (TLS data)   │  │ (packets)    │  │ (exec/fork)   │                 │     │    │
+│  │  │   └──────┬───────┘  └──────┬───────┘  └───────┬───────┘                 │     │    │
+│  │  └──────────┼─────────────────┼──────────────────┼──────────────────────────┘     │    │
+│  │             │                 │                  │                                │    │
+│  │             │    ┌────────────┴──────────────────┘                                │    │
+│  │             │    │    "Golden Thread" Correlation                                 │    │
+│  │             │    │    (socket cookie links all three)                             │    │
+│  │             ▼    ▼                                                                │    │
+│  │  ┌─────────────────────────┐                                                      │    │
+│  │  │   Dispatcher Thread     │ ◄─── Connection affinity: hash(pid, ssl_ctx)         │    │
+│  │  │   • Event routing       │      Routes same connection to same worker           │    │
+│  │  │   • Dynamic probe mgmt  │                                                      │    │
+│  │  └───────────┬─────────────┘                                                      │    │
+│  │              │                                                                    │    │
+│  │      ┌───────┼───────┬───────────────┐                                            │    │
+│  │      ▼       ▼       ▼               ▼                                            │    │
+│  │  ┌───────┐┌───────┐┌───────┐    ┌───────┐   Lock-free SPSC queues                 │    │
+│  │  │Worker0││Worker1││Worker2│... │WorkerN│   (Concurrency Kit)                     │    │
+│  │  ├───────┤├───────┤├───────┤    ├───────┤                                         │    │
+│  │  │HTTP/1 ││HTTP/2 ││HTTP/1 │    │HTTP/2 │   Per-worker isolated state:            │    │
+│  │  │HTTP/2 ││HTTP/1 ││HTTP/2 │    │HTTP/1 │   • HPACK decompressor                  │    │
+│  │  │llhttp ││nghttp2││llhttp │    │nghttp2│   • ALPN cache                          │    │
+│  │  │nghttp2││llhttp ││nghttp2│    │llhttp │   • Pending body buffers                │    │
+│  │  └───┬───┘└───┬───┘└───┬───┘    └───┬───┘   • Stream tracking                     │    │
+│  │      │        │        │            │                                             │    │
+│  │      └────────┴────────┴─────┬──────┘                                             │    │
+│  │                              ▼                                                    │    │
+│  │              ┌───────────────────────────┐                                        │    │
+│  │              │      Output Thread        │  Serialized stdout/file                │    │
+│  │              │  • Body decompression     │  (no interleaving)                     │    │
+│  │              │  • File signature detect  │                                        │    │
+│  │              └───────────────────────────┘                                        │    │
+│  └───────────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                         │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                    KERNEL SPACE                                         │
+│                                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────────────┐    │
+│  │                           BPF Programs (CO-RE/BTF)                               │    │
+│  │                                                                                  │    │
+│  │  ┌─────────────────────────────────────────────────────────────────────────┐     │    │
+│  │  │                    XDP (eXpress Data Path)                              │     │    │
+│  │  │                                                                         │     │    │
+│  │  │   NIC ──► Packet ──► Flow State Machine ──► Protocol Classify ──►       │     │    │
+│  │  │           │         (SYN/DATA/FIN/RST)     (TLS/HTTP2/HTTP1)            │     │    │
+│  │  │           │                                       │                     │     │    │
+│  │  │           ▼                                       ▼                     │     │    │
+│  │  │      flow_states map                      xdp_events ring ──► userspace │     │    │
+│  │  │                                                                         │     │    │
+│  │  └──────────────────────────────────┬──────────────────────────────────────┘     │    │
+│  │                                     │                                            │    │
+│  │                          flow_cookie_map ◄──────────────────────┐                │    │
+│  │                        (5-tuple → socket cookie)                │                │    │
+│  │                          "Golden Thread" link                   │                │    │
+│  │                                     │                           │                │    │
+│  │  ┌──────────────────────────────────▼─────────────────────────────────────┐      │    │
+│  │  │                    sock_ops (Socket Events)                            │      │    │
+│  │  │                                                                        │      │    │
+│  │  │   TCP Connect ──► ACTIVE_ESTABLISHED_CB ──► Cache socket cookie        │      │    │
+│  │  │   TCP Accept  ──► PASSIVE_ESTABLISHED_CB ──► in flow_cookie_map        │      │    │
+│  │  │   TCP Close   ──► STATE_CB ──► Cleanup stale entries                   │      │    │
+│  │  │                                                                        │      │    │
+│  │  └────────────────────────────────────────────────────────────────────────┘      │    │
+│  │                                                                                  │    │
+│  │  ┌────────────────────────────────────────────────────────────────────────┐      │    │
+│  │  │                    Uprobes (SSL Library Hooks)                         │      │    │
+│  │  │                                                                        │      │    │
+│  │  │   SSL_read/write  ──► Capture decrypted data ──► ssl_events ring       │      │    │
+│  │  │   SSL_set_fd      ──► Map SSL* → fd → socket cookie                    │      │    │
+│  │  │   SSL_get_alpn    ──► Detect HTTP/1.1 vs HTTP/2                        │      │    │
+│  │  │   SSL_free        ──► Cleanup tracked sessions                         │      │    │
+│  │  │                                                                        │      │    │
+│  │  │   Supported: OpenSSL, GnuTLS, NSS, WolfSSL, BoringSSL (experimental)   │      │    │
+│  │  │                                                                        │      │    │
+│  │  └────────────────────────────────────────────────────────────────────────┘      │    │
+│  │                                                                                  │    │
+│  │  ┌────────────────────────────────────────────────────────────────────────┐      │    │
+│  │  │                    Tracepoints (Process Lifecycle)                     │      │    │
+│  │  │                                                                        │      │    │
+│  │  │   sched_process_exec ──► Detect new process ──► Dynamic probe attach   │      │    │
+│  │  │   sched_process_fork ──► Track child processes                         │      │    │
+│  │  │   sched_process_exit ──► Cleanup PID state ──► Free HTTP/2 sessions    │      │    │
+│  │  │                                                                        │      │    │
+│  │  └────────────────────────────────────────────────────────────────────────┘      │    │
+│  │                                                                                  │    │
+│  └──────────────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### The "Golden Thread" – How Correlation Works
+
+```
+    ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
+    │     XDP     │         │  sock_ops   │         │   Uprobes   │
+    │  (packets)  │         │  (sockets)  │         │ (TLS data)  │
+    └──────┬──────┘         └──────┬──────┘         └──────┬──────┘
+           │                       │                       │
+           │    flow_cookie_map    │    ssl_to_fd map      │
+           │   ┌───────────────┐   │   ┌───────────────┐   │
+           └──►│ 5-tuple:cookie│◄──┴──►│ SSL*:fd:cookie│◄──┘
+               └───────────────┘       └───────────────┘
+                       │                       │
+                       └───────────┬───────────┘
+                                   ▼
+                          Socket Cookie (u64)
+                      Unique per-connection identifier
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │   Unified Per-Flow View     │
+                    │  • Packet metadata (XDP)    │
+                    │  • TCP state (sock_ops)     │
+                    │  • Decrypted TLS (uprobes)  │
+                    │  • PID, process name        │
+                    └─────────────────────────────┘
 ```
 
 ### Data Flow
 
-1. **Packet arrives** → XDP classifies protocol, tracks flow, caches metadata
-2. **TCP connection established** → sock_ops caches socket cookie in `flow_cookie_map`
-3. **Application calls SSL_read/SSL_write** → Uprobe captures decrypted data
-4. **Correlation** → Socket cookie links XDP flow data with SSL session data
-5. **Processing** → Workers parse HTTP/1.1 or HTTP/2, decompress bodies
-6. **Output** → Serialized display with request/response correlation
+1. **Startup** → Scan `/proc/PID/maps` for SSL libraries, attach uprobes, seed `flow_cookie_map` via SOCK_DIAG
+2. **Packet arrives** → XDP classifies protocol (TLS/HTTP2/HTTP1), tracks flow state, emits metadata
+3. **TCP established** → sock_ops caches socket cookie in `flow_cookie_map` (5-tuple → cookie)
+4. **SSL call** → Uprobe captures decrypted data, links SSL* → fd → socket cookie
+5. **Correlation** → Socket cookie unifies XDP packets + sock_ops state + TLS plaintext
+6. **Processing** → Workers parse HTTP/1.1 (llhttp) or HTTP/2 (nghttp2), decompress bodies
+7. **Output** → Serialized display with request/response correlation, ALPN indicator
+8. **Process exit** → Tracepoint triggers cleanup of HTTP/2 sessions, ALPN cache, pending bodies
 
 ## Project Structure
 
@@ -338,30 +395,38 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 spliff/
 ├── CMakeLists.txt              # CMake build configuration
 ├── Makefile                    # Convenience wrapper for CMake
+├── Doxyfile                    # Doxygen documentation config
 ├── CHANGELOG.md                # Version history
 ├── LICENSE                     # GPL-3.0 license
 ├── README.md                   # This file
+├── docs/                       # Generated documentation (make docs)
+│   ├── html/                   # HTML API documentation
+│   └── man/                    # Man pages
 ├── src/
-│   ├── main.c                  # Entry point, CLI parsing, event handling
+│   ├── main.c                  # Entry point, CLI, event loop, dynamic probe management
 │   ├── include/
-│   │   └── spliff.h            # Public header, shared types
+│   │   └── spliff.h            # Public header, shared types, version info
 │   ├── bpf/
-│   │   ├── spliff.bpf.c        # eBPF program (kernel space)
-│   │   ├── bpf_loader.c        # BPF program loader
-│   │   ├── probe_handler.c     # Event filtering and processing
-│   │   └── vmlinux.h           # Kernel type definitions
+│   │   ├── spliff.bpf.c        # eBPF programs (XDP, sock_ops, uprobes, tracepoints)
+│   │   ├── bpf_loader.c        # BPF program loader, XDP attach, library discovery
+│   │   ├── bpf_loader.h        # BPF loader API
+│   │   ├── probe_handler.c     # Event filtering and callback dispatch
+│   │   ├── binary_scanner.c    # BoringSSL offset detection for stripped binaries
+│   │   ├── boringssl_offsets.h # Known BoringSSL function offsets by build ID
+│   │   └── vmlinux.h           # Kernel BTF type definitions
 │   ├── protocol/
 │   │   ├── http1.c             # HTTP/1.1 parser (llhttp)
-│   │   └── http2.c             # HTTP/2 parser (nghttp2)
+│   │   ├── http2.c             # HTTP/2 parser (nghttp2 + HPACK)
+│   │   └── websocket.c         # WebSocket frame parser (planned)
 │   ├── content/
-│   │   ├── decompressor.c      # gzip/brotli/zstd decompression
-│   │   └── signatures.c        # File magic detection
+│   │   ├── decompressor.c      # gzip/brotli/zstd/deflate decompression
+│   │   └── signatures.c        # File magic detection (50+ formats)
 │   ├── output/
-│   │   └── display.c           # Terminal output formatting
-│   ├── threading/              # Multi-threaded event processing (v0.6.0+)
-│   │   ├── threading.h         # Threading API and structures
-│   │   ├── dispatcher.c        # BPF ring → worker dispatch
-│   │   ├── worker.c            # Worker thread with adaptive wait
+│   │   └── display.c           # Terminal output formatting, colors
+│   ├── threading/              # Multi-threaded event processing
+│   │   ├── threading.h         # Threading API, structures, constants
+│   │   ├── dispatcher.c        # BPF ring consumer, worker routing
+│   │   ├── worker.c            # Worker thread with adaptive wait (spin/yield/sleep)
 │   │   ├── output.c            # Output serialization thread
 │   │   ├── state.c             # Per-worker state management
 │   │   ├── pool.c              # Lock-free object pool
