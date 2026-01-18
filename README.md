@@ -264,10 +264,10 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │  │  │   └──────┬───────┘  └──────┬───────┘  └───────┬───────┘                 │     │    │
 │  │  └──────────┼─────────────────┼──────────────────┼──────────────────────────┘     │    │
 │  │             │                 │                  │                                │    │
-│  │             │    ┌────────────┴──────────────────┘                                │    │
-│  │             │    │    "Golden Thread" Correlation                                 │    │
-│  │             │    │    (socket cookie links all three)                             │    │
-│  │             ▼    ▼                                                                │    │
+│  │             └────────────┬────┴──────────────────┘                                │    │
+│  │                          │    "Golden Thread" Correlation                         │    │
+│  │                          │    (socket cookie links all three)                     │    │
+│  │                          ▼                                                        │    │
 │  │  ┌─────────────────────────┐                                                      │    │
 │  │  │   Dispatcher Thread     │ ◄─── Connection affinity: hash(pid, ssl_ctx)         │    │
 │  │  │   • Event routing       │      Routes same connection to same worker           │    │
