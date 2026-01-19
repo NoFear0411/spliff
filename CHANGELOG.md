@@ -2,6 +2,44 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.1] - 2026-01-19
+
+### Fixed
+- **XDP-SSL Dispatcher Context Mismatch**: XDP events now properly correlate with SSL data
+  - Re-register XDP callback after threading_start() to use initialized flow_cache
+  - Socket cookie lookup now finds cached XDP flow metadata for HTTP output
+
+- **Flow Direction Normalization**: HTTP request/response pairs show correct IP direction
+  - Requests display: `client:port → server:port`
+  - Responses display: `server:port → client:port`
+  - Uses XDP flow_direction field instead of hardcoded port assumptions
+
+- **XDP Category Mapping**: Fixed incomplete category-to-string mapping
+  - Now uses enum constants (XDP_CAT_TLS_TCP, etc.) for type safety
+  - Handles all 6 categories: Unknown, TLS, QUIC, HTTP, H2, Other
+
+- **Removed BPF Debug Statements**: Cleaned up bpf_printk calls from production code
+  - Removed XDP cookie lookup debug output
+  - Removed sockops handler debug logging
+
+### Changed
+- **Runtime Debug Mode**: `-d` flag now controls debug output in both debug and release builds
+  - HTTP/2 frame logging gated by g_config.debug_mode
+  - XDP correlation debug output conditional on debug mode
+  - Unified behavior across build configurations
+
+- **Threading Statistics**: Improved user-friendly display format
+  - Simplified default output shows events captured/processed
+  - Per-worker breakdown and CPU efficiency only shown in debug mode
+  - Added interpretive labels (Excellent/Good/High load) for CPU efficiency
+
+### Known Issues
+- **First Request Timing**: Initial HTTP request from each process may lack XDP correlation
+  - Subsequent requests correlate correctly
+  - Under high traffic, some request/response pairs may miss correlation
+  - Root cause: race between SSL event and sockops flow_cookie_map population
+  - Investigation ongoing
+
 ## [0.9.0] - 2026-01-18
 
 ### Added
