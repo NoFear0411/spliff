@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <arpa/inet.h>  /* For inet_ntop, ntohs */
 
 /**
  * @brief Global color output setting
@@ -118,11 +119,128 @@ void display_get_timestamp(char *buf, size_t size) {
 }
 
 /**
+ * @brief Get XDP category name string for display output
+ *
+ * @param category XDP flow category from packet classification
+ * @return Short human-readable category name
+ */
+static const char *get_xdp_category_name(uint8_t category) {
+    switch (category) {
+        case XDP_CAT_UNKNOWN:     return "?";
+        case XDP_CAT_TLS_TCP:     return "TLS";
+        case XDP_CAT_QUIC:        return "QUIC";
+        case XDP_CAT_PLAIN_HTTP:  return "HTTP";
+        case XDP_CAT_H2_PREFACE:  return "H2";
+        case XDP_CAT_OTHER:       return "Other";
+        default:                  return "?";
+    }
+}
+
+/**
+ * @brief Display XDP flow correlation info
+ *
+ * Shows network-layer metadata from XDP packet capture, correlated with
+ * SSL data via the socket cookie ("Golden Thread").
+ *
+ * Output format:
+ * @code
+ *               ├─ 192.168.1.100:54321 → 93.184.216.34:443 [TLS] (eth0)
+ * @endcode
+ *
+ * @param msg HTTP message with flow info populated from XDP correlation
+ */
+void display_flow_info(const http_message_t *msg) {
+    if (!msg || !msg->has_flow_info) {
+        return;
+    }
+
+    char ip1[INET6_ADDRSTRLEN];
+    char ip2[INET6_ADDRSTRLEN];
+
+    if (msg->flow_ip_version == 4) {
+        inet_ntop(AF_INET, &msg->flow_src_ip, ip1, sizeof(ip1));
+        inet_ntop(AF_INET, &msg->flow_dst_ip, ip2, sizeof(ip2));
+    } else {
+        /* For IPv6, we only have 32-bit XOR hash, show as hex */
+        snprintf(ip1, sizeof(ip1), "%08x", ntohl(msg->flow_src_ip));
+        snprintf(ip2, sizeof(ip2), "%08x", ntohl(msg->flow_dst_ip));
+    }
+
+    uint16_t port1 = ntohs(msg->flow_src_port);
+    uint16_t port2 = ntohs(msg->flow_dst_port);
+
+    /**
+     * @par Flow Direction Normalization
+     *
+     * The XDP program captures packets on the local network interface and stores
+     * the 5-tuple as seen on the wire (saddr:sport → daddr:dport). The flow_direction
+     * field indicates the semantic direction:
+     *
+     * - @c 1 = Client → Server: saddr is the local client, daddr is the remote server
+     * - @c 2 = Server → Client: saddr is the remote server, daddr is the local client
+     *
+     * For consistent user experience, we normalize the display based on HTTP direction:
+     *
+     * @par Request Display
+     * Always show: @c local_client:port → remote_server:port
+     *
+     * @par Response Display
+     * Always show: @c remote_server:port → local_client:port
+     *
+     * This ensures the arrow direction matches the logical data flow regardless of
+     * which packet direction XDP happened to capture first.
+     */
+    const char *left_ip, *right_ip;
+    uint16_t left_port, right_port;
+
+    if (msg->flow_direction == 1) {
+        /* Packet captured was client→server: saddr=client, daddr=server */
+        if (msg->direction == DIR_REQUEST) {
+            /* Request: show client → server (use as-is) */
+            left_ip = ip1; left_port = port1;
+            right_ip = ip2; right_port = port2;
+        } else {
+            /* Response: show server → client (swap endpoints) */
+            left_ip = ip2; left_port = port2;
+            right_ip = ip1; right_port = port1;
+        }
+    } else {
+        /* Packet captured was server→client: saddr=server, daddr=client */
+        if (msg->direction == DIR_REQUEST) {
+            /* Request: show client → server (swap endpoints) */
+            left_ip = ip2; left_port = port2;
+            right_ip = ip1; right_port = port1;
+        } else {
+            /* Response: show server → client (use as-is) */
+            left_ip = ip1; left_port = port1;
+            right_ip = ip2; right_port = port2;
+        }
+    }
+
+    const char *category = get_xdp_category_name(msg->flow_category);
+
+    printf("              %s|-%s %s%s:%u → %s:%u%s %s[%s]%s",
+           display_color(C_DIM), display_color(C_RESET),
+           display_color(C_DIM),
+           left_ip, left_port,
+           right_ip, right_port,
+           display_color(C_RESET),
+           display_color(C_CYAN), category, display_color(C_RESET));
+
+    if (msg->flow_ifname[0]) {
+        printf(" %s(%s)%s", display_color(C_DIM), msg->flow_ifname, display_color(C_RESET));
+    }
+
+    printf("\n");
+}
+
+/**
  * @brief Display formatted HTTP request
  *
  * Output format:
  * @code
  * HH:MM:SS.mmm → METHOD https://host/path ALPN:proto process (pid) [latency] [stream N]
+ *               ├─ src:port -> dst:port [TLS] (ifname)
  * @endcode
  *
  * @param msg HTTP message containing request data
@@ -174,6 +292,9 @@ void display_http_request(const http_message_t *msg) {
     }
 
     printf("\n");
+
+    /* Show XDP flow correlation info if available */
+    display_flow_info(msg);
 }
 
 /**
@@ -251,6 +372,9 @@ void display_http_response(const http_message_t *msg) {
     }
 
     printf("\n");
+
+    /* Show XDP flow correlation info if available */
+    display_flow_info(msg);
 }
 
 /**

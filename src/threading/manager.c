@@ -348,71 +348,88 @@ void threading_cleanup(threading_mgr_t *mgr) {
 /**
  * @brief Print threading statistics to stderr
  *
- * Outputs comprehensive statistics including:
- * - Dispatcher events dispatched/dropped
- * - Per-worker events processed/dropped and wait cycle distribution
- * - Output thread messages/bytes written
+ * @par Output Format
+ * Displays user-friendly statistics about SSL/TLS event processing:
+ * - Events captured and processed
+ * - Output statistics
+ * - Detailed per-worker breakdown (debug mode only)
+ *
+ * @param[in] mgr Threading manager
  */
 void threading_print_stats(threading_mgr_t *mgr) {
     if (!mgr || !mgr->initialized) {
         return;
     }
 
-    fprintf(stderr, "\n=== Threading Statistics ===\n");
-    fprintf(stderr, "Workers: %d\n\n", mgr->num_workers);
-
-    /* Dispatcher stats */
+    /* Collect aggregate stats */
     uint64_t dispatched, dropped;
     dispatcher_get_stats(&mgr->dispatcher, &dispatched, &dropped);
-    fprintf(stderr, "Dispatcher:\n");
-    fprintf(stderr, "  Events dispatched: %lu\n", dispatched);
-    fprintf(stderr, "  Events dropped: %lu\n", dropped);
 
-    /* Worker stats */
     uint64_t total_processed = 0;
     uint64_t total_dropped = 0;
     uint64_t total_spin = 0;
     uint64_t total_yield = 0;
     uint64_t total_sleep = 0;
 
-    fprintf(stderr, "\nWorkers:\n");
     for (int i = 0; i < mgr->num_workers; i++) {
         worker_ctx_t *w = &mgr->workers[i];
-        uint64_t processed = atomic_load(&w->events_processed);
-        uint64_t w_dropped = atomic_load(&w->events_dropped);
-        uint64_t spin = atomic_load(&w->spin_cycles);
-        uint64_t yield = atomic_load(&w->yield_cycles);
-        uint64_t sleep = atomic_load(&w->sleep_cycles);
-
-        fprintf(stderr, "  Worker %d: processed=%lu dropped=%lu "
-                        "spin=%lu yield=%lu sleep=%lu\n",
-                i, processed, w_dropped, spin, yield, sleep);
-
-        total_processed += processed;
-        total_dropped += w_dropped;
-        total_spin += spin;
-        total_yield += yield;
-        total_sleep += sleep;
+        total_processed += atomic_load(&w->events_processed);
+        total_dropped += atomic_load(&w->events_dropped);
+        total_spin += atomic_load(&w->spin_cycles);
+        total_yield += atomic_load(&w->yield_cycles);
+        total_sleep += atomic_load(&w->sleep_cycles);
     }
 
-    fprintf(stderr, "\n  Total: processed=%lu dropped=%lu\n",
-            total_processed, total_dropped);
-
-    /* Calculate wait distribution */
-    uint64_t total_wait = total_spin + total_yield + total_sleep;
-    if (total_wait > 0) {
-        fprintf(stderr, "  Wait distribution: spin=%.1f%% yield=%.1f%% sleep=%.1f%%\n",
-                100.0 * total_spin / total_wait,
-                100.0 * total_yield / total_wait,
-                100.0 * total_sleep / total_wait);
-    }
-
-    /* Output stats */
     uint64_t messages, bytes;
     output_get_stats(&mgr->output, &messages, &bytes);
-    fprintf(stderr, "\nOutput:\n");
-    fprintf(stderr, "  Messages written: %lu\n", messages);
-    fprintf(stderr, "  Bytes written: %lu\n", bytes);
+
+    /* Print user-friendly summary */
+    fprintf(stderr, "\n=== Application Layer (SSL/TLS) ===\n");
+    fprintf(stderr, "Events captured: %lu", dispatched);
+    if (dropped > 0) {
+        fprintf(stderr, " (%lu dropped)", dropped);
+    }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Events processed: %lu\n", total_processed);
+    fprintf(stderr, "Output: %lu messages, %lu bytes\n", messages, bytes);
+
+    /* Detailed breakdown in debug mode */
+    if (g_config.debug_mode) {
+        fprintf(stderr, "\n--- Debug: Per-Worker Statistics ---\n");
+        fprintf(stderr, "Workers: %d (parallel SSL event processors)\n\n", mgr->num_workers);
+
+        for (int i = 0; i < mgr->num_workers; i++) {
+            worker_ctx_t *w = &mgr->workers[i];
+            uint64_t processed = atomic_load(&w->events_processed);
+            uint64_t w_dropped = atomic_load(&w->events_dropped);
+
+            /* Only show workers that processed events */
+            if (processed > 0 || w_dropped > 0) {
+                fprintf(stderr, "  Worker %2d: %lu events", i, processed);
+                if (w_dropped > 0) {
+                    fprintf(stderr, " (%lu dropped)", w_dropped);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+
+        /* Wait distribution shows CPU efficiency */
+        uint64_t total_wait = total_spin + total_yield + total_sleep;
+        if (total_wait > 0) {
+            double spin_pct = 100.0 * total_spin / total_wait;
+            double yield_pct = 100.0 * total_yield / total_wait;
+            double sleep_pct = 100.0 * total_sleep / total_wait;
+
+            fprintf(stderr, "\n  CPU efficiency: ");
+            if (sleep_pct > 90.0) {
+                fprintf(stderr, "Excellent (%.0f%% idle)\n", sleep_pct);
+            } else if (spin_pct > 50.0) {
+                fprintf(stderr, "High load (%.0f%% active polling)\n", spin_pct);
+            } else {
+                fprintf(stderr, "Good (%.0f%% yield, %.0f%% sleep)\n", yield_pct, sleep_pct);
+            }
+        }
+    }
 
     fprintf(stderr, "\n");
 }

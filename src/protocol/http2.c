@@ -191,9 +191,35 @@ typedef struct {
 
     /* ALPN negotiated protocol */
     char alpn_proto[16];
+
+    /**
+     * @name XDP Flow Correlation
+     * "Golden Thread" double-view: network-layer metadata from XDP packets
+     * correlated with application-layer HTTP/2 data via socket cookie.
+     * @{
+     */
+    bool has_flow_info;           /**< True if flow info available */
+    uint32_t flow_src_ip;         /**< Source IP (network byte order) */
+    uint32_t flow_dst_ip;         /**< Destination IP (network byte order) */
+    uint16_t flow_src_port;       /**< Source port (network byte order) */
+    uint16_t flow_dst_port;       /**< Destination port (network byte order) */
+    uint8_t flow_ip_version;      /**< IP version (4 or 6) */
+    uint8_t flow_direction;       /**< Flow direction (0=outbound, 1=inbound) */
+    uint8_t flow_category;        /**< Traffic category (1=TLS, 2=QUIC, etc.) */
+    char flow_ifname[16];         /**< Interface name (eth0, lo, etc.) */
+    /** @} */
 } h2_connection_t;
 
-/* Context passed to nghttp2 callbacks */
+/* Forward declarations for internal functions */
+static h2_connection_t *get_h2_connection(uint32_t pid, uint64_t ssl_ctx, bool create);
+static void h2_connection_cleanup(h2_connection_t *conn);
+
+/**
+ * @brief Context passed to nghttp2 callbacks
+ *
+ * Contains all state needed by nghttp2 callback functions to process
+ * HTTP/2 frames and associate them with the correct connection/stream.
+ */
 struct h2_callback_ctx {
     uint32_t pid;
     uint64_t ssl_ctx;
@@ -611,9 +637,6 @@ static int on_error_callback(nghttp2_session *session,
 
 /* Display functions */
 static void h2_display_request(h2_stream_t *stream) {
-    /* DEBUG: Always log request display */
-    fprintf(stderr, "[H2-REQ] displaying: stream=%d method='%s' authority='%s' path='%s'\n",
-            stream->stream_id, stream->method, stream->authority, stream->path);
     DEBUG_H2("h2_display_request: stream=%d method='%s' path='%s' authority='%s'",
              stream->stream_id, stream->method, stream->path, stream->authority);
 
@@ -638,6 +661,20 @@ static void h2_display_request(h2_stream_t *stream) {
     const char *alpn = http2_get_alpn(stream->pid, stream->ssl_ctx);
     if (alpn && alpn[0]) {
         safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
+    }
+
+    /* Get XDP flow correlation info from connection ("Golden Thread" double-view) */
+    h2_connection_t *conn = get_h2_connection(stream->pid, stream->ssl_ctx, false);
+    if (conn && conn->has_flow_info) {
+        msg.has_flow_info = true;
+        msg.flow_src_ip = conn->flow_src_ip;
+        msg.flow_dst_ip = conn->flow_dst_ip;
+        msg.flow_src_port = conn->flow_src_port;
+        msg.flow_dst_port = conn->flow_dst_port;
+        msg.flow_ip_version = conn->flow_ip_version;
+        msg.flow_direction = conn->flow_direction;
+        msg.flow_category = conn->flow_category;
+        memcpy(msg.flow_ifname, conn->flow_ifname, sizeof(msg.flow_ifname));
     }
 
     /* Copy headers */
@@ -723,6 +760,20 @@ static void h2_display_response(h2_stream_t *stream) {
     const char *alpn = http2_get_alpn(stream->pid, stream->ssl_ctx);
     if (alpn && alpn[0]) {
         safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
+    }
+
+    /* Get XDP flow correlation info from connection ("Golden Thread" double-view) */
+    h2_connection_t *conn = get_h2_connection(stream->pid, stream->ssl_ctx, false);
+    if (conn && conn->has_flow_info) {
+        msg.has_flow_info = true;
+        msg.flow_src_ip = conn->flow_src_ip;
+        msg.flow_dst_ip = conn->flow_dst_ip;
+        msg.flow_src_port = conn->flow_src_port;
+        msg.flow_dst_port = conn->flow_dst_port;
+        msg.flow_ip_version = conn->flow_ip_version;
+        msg.flow_direction = conn->flow_direction;
+        msg.flow_category = conn->flow_category;
+        memcpy(msg.flow_ifname, conn->flow_ifname, sizeof(msg.flow_ifname));
     }
 
     msg.header_count = stream->header_count;
@@ -1023,6 +1074,45 @@ void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
     h2_connection_t *conn = get_h2_connection(pid, ssl_ctx, true);
     if (conn && alpn) {
         safe_strcpy(conn->alpn_proto, sizeof(conn->alpn_proto), alpn);
+    }
+}
+
+/**
+ * @brief Set XDP flow correlation info for an HTTP/2 connection
+ *
+ * Stores network-layer metadata from XDP packet capture, enabling
+ * "Golden Thread" double-view correlation between network and
+ * application layers.
+ *
+ * @param pid       Process ID
+ * @param ssl_ctx   SSL context pointer
+ * @param src_ip    Source IP address (network byte order)
+ * @param dst_ip    Destination IP address (network byte order)
+ * @param src_port  Source port (network byte order)
+ * @param dst_port  Destination port (network byte order)
+ * @param ip_ver    IP version (4 or 6)
+ * @param direction Flow direction (0=outbound, 1=inbound)
+ * @param category  Traffic category (1=TLS, 2=QUIC, 3=HTTP, 4=H2)
+ * @param ifname    Interface name (may be NULL)
+ */
+void http2_set_flow_info(uint32_t pid, uint64_t ssl_ctx,
+                         uint32_t src_ip, uint32_t dst_ip,
+                         uint16_t src_port, uint16_t dst_port,
+                         uint8_t ip_ver, uint8_t direction,
+                         uint8_t category, const char *ifname) {
+    h2_connection_t *conn = get_h2_connection(pid, ssl_ctx, true);
+    if (!conn) return;
+
+    conn->has_flow_info = true;
+    conn->flow_src_ip = src_ip;
+    conn->flow_dst_ip = dst_ip;
+    conn->flow_src_port = src_port;
+    conn->flow_dst_port = dst_port;
+    conn->flow_ip_version = ip_ver;
+    conn->flow_direction = direction;
+    conn->flow_category = category;
+    if (ifname) {
+        safe_strcpy(conn->flow_ifname, sizeof(conn->flow_ifname), ifname);
     }
 }
 
@@ -1619,7 +1709,7 @@ void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *e
         uint8_t ftype = data[3];
         uint32_t sid = ((uint32_t)(data[5] & 0x7f) << 24) | ((uint32_t)data[6] << 16) |
                        ((uint32_t)data[7] << 8) | (uint32_t)data[8];
-        if (ftype <= 9 && flen <= 65536) {
+        if (g_config.debug_mode && ftype <= 9 && flen <= 65536) {
             fprintf(stderr, "[H2-FRAME] %s: type=%s stream=%u len=%u (total=%d)\n",
                     event->event_type == EVENT_SSL_WRITE ? "WRITE" : "READ",
                     http2_frame_name(ftype), sid, flen, len);
@@ -1784,6 +1874,23 @@ void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
     (void)pid;
     (void)ssl_ctx;
     (void)alpn;
+}
+
+void http2_set_flow_info(uint32_t pid, uint64_t ssl_ctx,
+                         uint32_t src_ip, uint32_t dst_ip,
+                         uint16_t src_port, uint16_t dst_port,
+                         uint8_t ip_ver, uint8_t direction,
+                         uint8_t category, const char *ifname) {
+    (void)pid;
+    (void)ssl_ctx;
+    (void)src_ip;
+    (void)dst_ip;
+    (void)src_port;
+    (void)dst_port;
+    (void)ip_ver;
+    (void)direction;
+    (void)category;
+    (void)ifname;
 }
 
 const char *http2_get_alpn(uint32_t pid, uint64_t ssl_ctx) {

@@ -102,6 +102,7 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
     event->timestamp_ns = bpf_event->timestamp_ns;
     event->delta_ns = bpf_event->delta_ns;
     event->ssl_ctx = bpf_event->ssl_ctx;
+    event->socket_cookie = bpf_event->socket_cookie;
     event->pid = bpf_event->pid;
     event->tid = bpf_event->tid;
     event->uid = bpf_event->uid;
@@ -112,6 +113,23 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
     /* Pre-compute routing info */
     event->worker_id = worker_id;
     event->flow_hash = flow_hash(bpf_event->pid, bpf_event->ssl_ctx);
+
+    /* Lookup XDP flow info for correlation ("Golden Thread") */
+    if (bpf_event->socket_cookie != 0) {
+        event->flow_info = flow_cache_lookup(&ctx->flow_cache,
+                                              bpf_event->socket_cookie);
+        if (g_config.debug_mode) {
+            fprintf(stderr, "[DEBUG] SSL event cookie=%llu flow_info=%s\n",
+                    (unsigned long long)bpf_event->socket_cookie,
+                    event->flow_info ? "FOUND" : "NOT_FOUND");
+        }
+    } else {
+        event->flow_info = NULL;
+        if (g_config.debug_mode) {
+            fprintf(stderr, "[DEBUG] SSL event has NO cookie (ssl_ctx=%llx)\n",
+                    (unsigned long long)bpf_event->ssl_ctx);
+        }
+    }
 
     /* Copy payload */
     event->data_len = (bpf_event->buf_filled > 0) ?
@@ -235,6 +253,11 @@ int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
     atomic_store(&ctx->events_dropped, 0);
     atomic_store(&ctx->running, false);
 
+    /* Initialize XDP flow cache for correlation */
+    if (flow_cache_init(&ctx->flow_cache, FLOW_CACHE_SIZE) != 0) {
+        return -1;
+    }
+
     /* Set global for BPF callback */
     g_dispatcher = ctx;
 
@@ -251,6 +274,9 @@ void dispatcher_cleanup(dispatcher_ctx_t *ctx) {
     if (!ctx) {
         return;
     }
+
+    /* Cleanup XDP flow cache */
+    flow_cache_cleanup(&ctx->flow_cache);
 
     g_dispatcher = NULL;
     ctx->handler = NULL;
@@ -555,6 +581,9 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
              */
             atomic_fetch_add(&dispatcher->xdp_flows_terminated, 1);
 
+            /* Remove from flow cache */
+            flow_cache_terminate(&dispatcher->flow_cache, packet_evt->socket_cookie);
+
             if (should_debug) {
                 char src_ip[16], dst_ip[16];
                 format_ipv4(packet_evt->flow.saddr, src_ip, sizeof(src_ip));
@@ -578,7 +607,18 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
              */
             atomic_fetch_add(&dispatcher->xdp_flows_discovered, 1);
 
+            /* Cache flow info for correlation with SSL events */
+            int upsert_result = flow_cache_upsert(&dispatcher->flow_cache,
+                                                   packet_evt->socket_cookie,
+                                                   packet_evt);
+
             if (should_debug) {
+                fprintf(stderr, "[DEBUG] XDP FLOW_NEW: cookie=%llu sport=%u dport=%u cat=%s upsert=%d\n",
+                        (unsigned long long)packet_evt->socket_cookie,
+                        ntohs(packet_evt->flow.sport),
+                        ntohs(packet_evt->flow.dport),
+                        xdp_category_name(packet_evt->category),
+                        upsert_result);
                 char src_ip[16], dst_ip[16];
                 format_ipv4(packet_evt->flow.saddr, src_ip, sizeof(src_ip));
                 format_ipv4(packet_evt->flow.daddr, dst_ip, sizeof(dst_ip));

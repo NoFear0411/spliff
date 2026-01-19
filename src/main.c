@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <arpa/inet.h>
 #include "include/spliff.h"
 #include "bpf/bpf_loader.h"
 #include "bpf/binary_scanner.h"
@@ -734,22 +735,35 @@ static void cleanup_all_resources(void) {
         }
     }
 
-    /* Print XDP statistics before cleanup */
-    if (g_xdp_initialized && g_debug_mode) {
+    /**
+     * @brief Print XDP statistics before cleanup
+     *
+     * XDP (eXpress Data Path) provides network-layer packet visibility.
+     * These statistics show how many packets were processed and correlated
+     * with application-layer SSL/TLS events.
+     */
+    if (g_xdp_initialized) {
         xdp_stats_t xdp_stats;
         if (bpf_loader_xdp_read_stats(&g_loader, &xdp_stats) == 0) {
-            printf("\n=== XDP Statistics ===\n");
-            printf("Packets:\n");
-            printf("  Total:     %lu\n", xdp_stats.packets_total);
-            printf("  TCP:       %lu\n", xdp_stats.packets_tcp);
-            printf("\nFlows:\n");
-            printf("  Created:   %lu\n", xdp_stats.flows_created);
-            printf("  Classified: %lu\n", xdp_stats.flows_classified);
-            printf("  Ambiguous: %lu\n", xdp_stats.flows_ambiguous);
-            printf("\nGatekeeper:\n");
-            printf("  Hits:      %lu\n", xdp_stats.gatekeeper_hits);
-            printf("  Cookie failures: %lu\n", xdp_stats.cookie_failures);
-            printf("  Ringbuf drops:   %lu\n", xdp_stats.ringbuf_drops);
+            printf("\n=== Network Layer (XDP) ===\n");
+            printf("Packets processed: %lu (TCP: %lu)\n",
+                   xdp_stats.packets_total, xdp_stats.packets_tcp);
+            printf("Connections tracked: %lu\n", xdp_stats.flows_created);
+
+            if (g_debug_mode) {
+                /* Detailed breakdown in debug mode */
+                printf("\n  Flows classified: %lu\n", xdp_stats.flows_classified);
+                printf("  Flows ambiguous:  %lu (need deeper inspection)\n",
+                       xdp_stats.flows_ambiguous);
+                printf("  Cache hits:       %lu (fast-path packets)\n",
+                       xdp_stats.gatekeeper_hits);
+                printf("  Cookie misses:    %lu (correlation gaps)\n",
+                       xdp_stats.cookie_failures);
+                if (xdp_stats.ringbuf_drops > 0) {
+                    printf("  Events dropped:   %lu (ring buffer full)\n",
+                           xdp_stats.ringbuf_drops);
+                }
+            }
             printf("\n");
         }
     }
@@ -1258,6 +1272,19 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
             safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
         }
 
+        /* Populate XDP flow correlation info ("Golden Thread" double-view) */
+        if (event->flow_info) {
+            msg.has_flow_info = true;
+            msg.flow_src_ip = event->flow_info->flow.saddr;
+            msg.flow_dst_ip = event->flow_info->flow.daddr;
+            msg.flow_src_port = event->flow_info->flow.sport;
+            msg.flow_dst_port = event->flow_info->flow.dport;
+            msg.flow_ip_version = event->flow_info->flow.ip_version;
+            msg.flow_direction = event->flow_info->direction;
+            msg.flow_category = event->flow_info->category;
+            memcpy(msg.flow_ifname, event->flow_info->ifname, sizeof(msg.flow_ifname));
+        }
+
         /* Format output through output thread - unified with display_http_* functions */
         char ts[32];
         display_get_timestamp(ts, sizeof(ts));
@@ -1304,6 +1331,51 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
                             display_color(C_YELLOW), lat, display_color(C_RESET));
             }
             output_write(worker, "\n");
+
+            /**
+             * @brief Show XDP flow correlation info ("Golden Thread" double-view)
+             *
+             * Normalizes display based on HTTP direction:
+             * - Request: local_client:port → remote_server:port
+             * - Response: remote_server:port → local_client:port
+             */
+            if (msg.has_flow_info) {
+                char ip1[INET6_ADDRSTRLEN], ip2[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET, &msg.flow_src_ip, ip1, sizeof(ip1));
+                inet_ntop(AF_INET, &msg.flow_dst_ip, ip2, sizeof(ip2));
+                uint16_t port1 = ntohs(msg.flow_src_port);
+                uint16_t port2 = ntohs(msg.flow_dst_port);
+
+                /* Normalize based on flow_direction and HTTP direction */
+                const char *left_ip, *right_ip;
+                uint16_t left_port, right_port;
+                if (msg.flow_direction == 1) {
+                    /* Packet was client→server: saddr=client, daddr=server */
+                    left_ip = ip1; left_port = port1;
+                    right_ip = ip2; right_port = port2;
+                } else {
+                    /* Packet was server→client: saddr=server, daddr=client */
+                    /* For request, swap to show client → server */
+                    left_ip = ip2; left_port = port2;
+                    right_ip = ip1; right_port = port1;
+                }
+
+                const char *cat_name = (msg.flow_category == XDP_CAT_TLS_TCP) ? "TLS" :
+                                       (msg.flow_category == XDP_CAT_QUIC) ? "QUIC" :
+                                       (msg.flow_category == XDP_CAT_PLAIN_HTTP) ? "HTTP" :
+                                       (msg.flow_category == XDP_CAT_H2_PREFACE) ? "H2" :
+                                       (msg.flow_category == XDP_CAT_OTHER) ? "Other" : "?";
+                output_write(worker, "              %s|-%s %s%s:%u → %s:%u%s %s[%s]%s",
+                            display_color(C_DIM), display_color(C_RESET),
+                            display_color(C_DIM), left_ip, left_port,
+                            right_ip, right_port, display_color(C_RESET),
+                            display_color(C_CYAN), cat_name, display_color(C_RESET));
+                if (msg.flow_ifname[0]) {
+                    output_write(worker, " %s(%s)%s", display_color(C_DIM),
+                                msg.flow_ifname, display_color(C_RESET));
+                }
+                output_write(worker, "\n");
+            }
         } else {
             /* Look up cached request for URL correlation */
             h1_request_entry_t *cached_req = worker_find_h1_request(state, event->pid, event->ssl_ctx);
@@ -1340,6 +1412,50 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
                             display_color(C_YELLOW), lat, display_color(C_RESET));
             }
             output_write(worker, "\n");
+
+            /**
+             * @brief Show XDP flow correlation info ("Golden Thread" double-view)
+             *
+             * Normalizes display based on HTTP direction:
+             * - Response: remote_server:port → local_client:port
+             */
+            if (msg.has_flow_info) {
+                char ip1[INET6_ADDRSTRLEN], ip2[INET6_ADDRSTRLEN];
+                inet_ntop(AF_INET, &msg.flow_src_ip, ip1, sizeof(ip1));
+                inet_ntop(AF_INET, &msg.flow_dst_ip, ip2, sizeof(ip2));
+                uint16_t port1 = ntohs(msg.flow_src_port);
+                uint16_t port2 = ntohs(msg.flow_dst_port);
+
+                /* Normalize: response shows server → client */
+                const char *left_ip, *right_ip;
+                uint16_t left_port, right_port;
+                if (msg.flow_direction == 2) {
+                    /* Packet was server→client: saddr=server, daddr=client */
+                    left_ip = ip1; left_port = port1;
+                    right_ip = ip2; right_port = port2;
+                } else {
+                    /* Packet was client→server: saddr=client, daddr=server */
+                    /* For response, swap to show server → client */
+                    left_ip = ip2; left_port = port2;
+                    right_ip = ip1; right_port = port1;
+                }
+
+                const char *cat_name = (msg.flow_category == XDP_CAT_TLS_TCP) ? "TLS" :
+                                       (msg.flow_category == XDP_CAT_QUIC) ? "QUIC" :
+                                       (msg.flow_category == XDP_CAT_PLAIN_HTTP) ? "HTTP" :
+                                       (msg.flow_category == XDP_CAT_H2_PREFACE) ? "H2" :
+                                       (msg.flow_category == XDP_CAT_OTHER) ? "Other" : "?";
+                output_write(worker, "              %s|-%s %s%s:%u → %s:%u%s %s[%s]%s",
+                            display_color(C_DIM), display_color(C_RESET),
+                            display_color(C_DIM), left_ip, left_port,
+                            right_ip, right_port, display_color(C_RESET),
+                            display_color(C_CYAN), cat_name, display_color(C_RESET));
+                if (msg.flow_ifname[0]) {
+                    output_write(worker, " %s(%s)%s", display_color(C_DIM),
+                                msg.flow_ifname, display_color(C_RESET));
+                }
+                output_write(worker, "\n");
+            }
         }
 
         /* Show headers unless compact mode */
@@ -1402,6 +1518,20 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
         /* Process HTTP/2 frame with per-worker session */
         /* TODO: Integrate with http2_process_frame using worker state */
         /* For now, fall back to global HTTP/2 processing */
+
+        /* Update XDP flow info if newly available */
+        if (event->flow_info) {
+            http2_set_flow_info(event->pid, event->ssl_ctx,
+                               event->flow_info->flow.saddr,
+                               event->flow_info->flow.daddr,
+                               event->flow_info->flow.sport,
+                               event->flow_info->flow.dport,
+                               event->flow_info->flow.ip_version,
+                               event->flow_info->direction,
+                               event->flow_info->category,
+                               event->flow_info->ifname);
+        }
+
         ssl_data_event_t bpf_event = {
             .timestamp_ns = event->timestamp_ns,
             .delta_ns = event->delta_ns,
@@ -1430,6 +1560,19 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
         if (h2_conn) {
             h2_conn->client_preface_seen = true;
             safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
+        }
+
+        /* Set XDP flow correlation info if available ("Golden Thread" double-view) */
+        if (event->flow_info) {
+            http2_set_flow_info(event->pid, event->ssl_ctx,
+                               event->flow_info->flow.saddr,
+                               event->flow_info->flow.daddr,
+                               event->flow_info->flow.sport,
+                               event->flow_info->flow.dport,
+                               event->flow_info->flow.ip_version,
+                               event->flow_info->direction,
+                               event->flow_info->category,
+                               event->flow_info->ifname);
         }
 
         /* Process frames after preface */
@@ -1477,6 +1620,19 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
                 h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
                 if (h2_conn) {
                     safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
+                }
+
+                /* Set XDP flow correlation info if available */
+                if (event->flow_info) {
+                    http2_set_flow_info(event->pid, event->ssl_ctx,
+                                       event->flow_info->flow.saddr,
+                                       event->flow_info->flow.daddr,
+                                       event->flow_info->flow.sport,
+                                       event->flow_info->flow.dport,
+                                       event->flow_info->flow.ip_version,
+                                       event->flow_info->direction,
+                                       event->flow_info->category,
+                                       event->flow_info->ifname);
                 }
 
                 ssl_data_event_t bpf_event = {
@@ -2452,6 +2608,20 @@ int main(int argc, char **argv) {
         /* Register callback for dynamic SSL library detection (process exec events) */
         dispatcher_set_lifecycle_callback(&g_threading.dispatcher,
                                           threading_process_exec_callback, NULL);
+
+        /* Re-register XDP callback with the threaded dispatcher's flow_cache.
+         * The initial registration (above) used g_xdp_dispatcher which has no
+         * flow_cache. Now that threading is started, use the real dispatcher
+         * so XDP events populate the same flow_cache that SSL events use. */
+        if (g_xdp_initialized) {
+            bpf_loader_xdp_set_event_callback(&g_loader,
+                                              dispatcher_xdp_event_handler,
+                                              &g_threading.dispatcher);
+            if (debug_mode) {
+                printf("  %s✓%s XDP callback re-registered with threaded dispatcher\n",
+                       display_color(C_GREEN), display_color(C_RESET));
+            }
+        }
 
         /* Main thread polls XDP ring buffer while workers handle uprobes */
         while (!g_exiting) {

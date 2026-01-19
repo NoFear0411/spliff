@@ -51,6 +51,7 @@ struct ssl_data_event {
     __u64 timestamp_ns;
     __u64 delta_ns;       // Latency (for handshake or request-response)
     __u64 ssl_ctx;        // SSL context pointer for connection tracking
+    __u64 socket_cookie;  // Socket cookie for XDP correlation ("Golden Thread")
     __u32 pid;
     __u32 tid;
     __u32 uid;
@@ -507,6 +508,7 @@ static __always_inline void fill_event_metadata(struct ssl_data_event *event) {
     event->tid = (__u32)pid_tgid;
     event->uid = (__u32)uid_gid;
     event->delta_ns = 0;
+    event->socket_cookie = 0;  // Default, will be set by caller if available
 
     // Zero out comm field first to ensure clean data
     #pragma unroll
@@ -574,6 +576,62 @@ static __always_inline __u16 get_socket_family_from_fd(__s32 fd) {
     bpf_core_read(&family, sizeof(family), &sk->__sk_common.skc_family);
 
     return family;
+}
+
+// =============================================================================
+// Get socket cookie from file descriptor (for XDP correlation)
+// The socket cookie is the "Golden Thread" that links XDP packets with SSL events
+// Uses BPF_CORE_READ for efficient CO-RE pointer walking
+// Returns: socket cookie (>0) or 0 on failure
+// =============================================================================
+static __always_inline __u64 get_socket_cookie_from_fd(__s32 fd) {
+    if (fd < 0) return 0;
+
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    if (!task) return 0;
+
+    // Walk task → files → fdt using CO-RE
+    struct files_struct *files = BPF_CORE_READ(task, files);
+    if (!files) return 0;
+
+    struct fdtable *fdt = BPF_CORE_READ(files, fdt);
+    if (!fdt) return 0;
+
+    // Read max_fds for dynamic bounds check (safer than hardcoded 8192)
+    unsigned int max_fds = BPF_CORE_READ(fdt, max_fds);
+
+    // Bounds check: both for safety and BPF verifier
+    // Use min of actual max_fds and a hard cap for verifier satisfaction
+    if ((__u32)fd >= max_fds || (__u32)fd >= 8192) return 0;
+
+    // Get fd array and read the specific file pointer
+    struct file **fd_array = BPF_CORE_READ(fdt, fd);
+    if (!fd_array) return 0;
+
+    struct file *file = NULL;
+    if (bpf_core_read(&file, sizeof(file), &fd_array[fd]) || !file)
+        return 0;
+
+    // file → private_data → socket → sk → cookie
+    // Note: private_data is socket* only for socket fds
+    struct socket *sock = (struct socket *)BPF_CORE_READ(file, private_data);
+    if (!sock) return 0;
+
+    struct sock *sk = BPF_CORE_READ(sock, sk);
+    if (!sk) return 0;
+
+    // skc_cookie is atomic64_t - read the raw value
+    __u64 cookie = 0;
+    bpf_core_read(&cookie, sizeof(cookie), &sk->__sk_common.skc_cookie);
+    return cookie;
+}
+
+// Get socket cookie for an SSL context (for XDP correlation)
+// Looks up fd from ssl_to_fd map, then gets cookie from sock
+static __always_inline __u64 get_ssl_socket_cookie(__u64 ssl_ctx) {
+    __s32 *fd_ptr = bpf_map_lookup_elem(&ssl_to_fd, &ssl_ctx);
+    if (!fd_ptr) return 0;
+    return get_socket_cookie_from_fd(*fd_ptr);
 }
 
 // Check if a session is tracked and get its info
@@ -930,6 +988,7 @@ int BPF_URETPROBE(probe_ssl_read_exit) {
     event->event_type = EVENT_SSL_READ;
     event->len = (__u32)ret;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -1005,6 +1064,7 @@ int BPF_URETPROBE(probe_ssl_write_exit) {
     event->event_type = EVENT_SSL_WRITE;
     event->len = (__u32)ret;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -1120,6 +1180,7 @@ int BPF_URETPROBE(probe_ssl_read_ex_exit) {
     event->event_type = EVENT_SSL_READ;
     event->len = (__u32)bytes_read;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -1207,6 +1268,7 @@ int BPF_URETPROBE(probe_ssl_write_ex_exit) {
     event->event_type = EVENT_SSL_WRITE;
     event->len = (__u32)bytes_written;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -1292,6 +1354,7 @@ int BPF_URETPROBE(probe_ssl_handshake_exit) {
     event->len = (__u32)ret;  // Store return value (1=success, 0/-1=fail)
     event->buf_filled = 0;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
     event->delta_ns = event->timestamp_ns - args->start_ns;
 
     // Track this PID for process exit cleanup
@@ -1431,6 +1494,7 @@ int BPF_URETPROBE(probe_gnutls_send_exit) {
     event->event_type = EVENT_SSL_WRITE;
     event->len = (__u32)ret;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -1521,6 +1585,7 @@ int BPF_URETPROBE(probe_gnutls_recv_exit) {
     event->event_type = EVENT_SSL_READ;
     event->len = (__u32)ret;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -1627,6 +1692,7 @@ int BPF_URETPROBE(probe_nss_write_exit) {
     event->event_type = EVENT_SSL_WRITE;
     event->len = (__u32)ret;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -1725,6 +1791,7 @@ int BPF_URETPROBE(probe_nss_read_exit) {
     event->event_type = EVENT_SSL_READ;
     event->len = (__u32)ret;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
 
     // Calculate latency
     __u64 *tsp = bpf_map_lookup_elem(&start_ns, &tid);
@@ -1831,6 +1898,7 @@ int BPF_URETPROBE(probe_openssl_alpn_exit) {
     event->event_type = EVENT_ALPN;
     event->len = alpn_len;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
     event->delta_ns = 0;
 
     // Read ALPN protocol string
@@ -1919,6 +1987,7 @@ int BPF_URETPROBE(probe_gnutls_alpn_exit) {
     event->event_type = EVENT_ALPN;
     event->len = datum.size;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
     event->delta_ns = 0;
 
     // Read ALPN protocol string
@@ -2006,6 +2075,7 @@ int BPF_URETPROBE(probe_nss_alpn_exit) {
     event->event_type = EVENT_ALPN;
     event->len = alpn_len;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
     event->delta_ns = 0;
 
     // Read ALPN protocol string from buf
@@ -2102,6 +2172,7 @@ int BPF_URETPROBE(probe_wolfssl_alpn_exit) {
     event->event_type = EVENT_ALPN;
     event->len = alpn_len;
     event->ssl_ctx = args->ssl_ctx;
+    event->socket_cookie = get_ssl_socket_cookie(args->ssl_ctx);
     event->delta_ns = 0;
 
     // Read ALPN protocol string
@@ -2163,6 +2234,7 @@ int BPF_URETPROBE(probe_ssl_import_fd_exit) {
     fill_event_metadata(event);
     event->event_type = EVENT_NSS_SSL_FD;
     event->ssl_ctx = ssl_fd;  // The SSL-wrapped PRFileDesc
+    event->socket_cookie = 0; // NSS uses different fd tracking
     event->len = 0;
     event->buf_filled = 0;
     event->delta_ns = 0;
@@ -2332,6 +2404,7 @@ int handle_process_exit(void *ctx) {
     event->buf_filled = 0;
     event->delta_ns = 0;
     event->ssl_ctx = 0;
+    event->socket_cookie = 0;
 
     // Get process name
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
@@ -2370,6 +2443,7 @@ int handle_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
     event->len = 0;
     event->delta_ns = 0;
     event->ssl_ctx = 0;
+    event->socket_cookie = 0;
 
     // Get process name - userspace uses this for quick filtering
     // (e.g., skip known non-SSL processes like "ls", "cat", etc.)
@@ -2878,19 +2952,23 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
     // -------------------------------------------------------------------------
 
     // Get socket cookie from sock_ops cache (the "Golden Thread")
-    // sock_ops program caches cookies when connections are established
-    // because bpf_get_socket_cookie() is NOT available in XDP context.
-    // Userspace warm-up seeds this map with existing connections at startup.
+    /**
+     * @brief Socket cookie lookup for XDP-SSL correlation
+     *
+     * The sock_ops program caches cookies when connections are established
+     * because bpf_get_socket_cookie() is NOT available in XDP context.
+     * Userspace warm-up seeds this map with existing connections at startup.
+     */
     __u64 cookie = 0;
 
     struct flow_cookie_entry *cookie_entry = bpf_map_lookup_elem(&flow_cookie_map, &fkey);
     if (cookie_entry) {
         cookie = cookie_entry->socket_cookie;
     } else {
-        // Cookie not cached yet - sock_ops may not have run for this flow
-        // This happens for: mid-connection captures, packets before socket setup,
-        // or connections established before program attachment.
-        // Classification still works, but correlation with uprobes limited.
+        /* Cookie not cached yet - sock_ops may not have run for this flow.
+         * This happens for: mid-connection captures, packets before socket setup,
+         * or connections established before program attachment.
+         * Classification still works, but correlation with uprobes limited. */
         if (stats)
             stats->cookie_failures++;
     }
@@ -2932,13 +3010,22 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
 
         is_new_classification = (category != CAT_UNKNOWN);
     } else {
-        // Existing classified/ambiguous flow - update stats only
+        // Existing classified/ambiguous flow - update stats
         fs->pkt_count++;
         fs->byte_count += payload_len;
         fs->last_seen_ns = now;
 
-        // Don't re-emit if already classified and not needing PCRE2
-        if (fs->state == FLOW_STATE_CLASSIFIED && !needs_pcre2)
+        // Check if we got a valid cookie for a flow that previously had none.
+        // This happens when sockops runs after FLOW_NEW was emitted with cookie=0.
+        // We need to notify userspace so it can update its flow_cache.
+        if (fs->socket_cookie == 0 && cookie != 0) {
+            fs->socket_cookie = cookie;
+            // Trigger event emission to update userspace cache
+            is_new_classification = true;
+        }
+
+        // Don't re-emit if already classified and not needing update
+        if (!is_new_classification && fs->state == FLOW_STATE_CLASSIFIED && !needs_pcre2)
             return XDP_PASS;
     }
 
@@ -3061,18 +3148,51 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
 
 SEC("sockops")
 int sockops_cache_cookie(struct bpf_sock_ops *skops) {
+    /**
+     * @brief Cache socket cookies for XDP-SSL correlation ("Golden Thread")
+     *
+     * CRITICAL: All context field reads MUST happen at the start before any
+     * branches. The BPF verifier rejects modified context pointer dereferences,
+     * which the compiler can generate when optimizing field accesses across branches.
+     * Reading everything upfront with barriers prevents this optimization.
+     */
+
+    // Read ALL context fields upfront to prevent compiler from creating
+    // modified context pointers (ctx+offset) which verifier rejects
+    __u32 op = skops->op;
+    __u32 family = skops->family;
+    __u32 args1 = skops->args[1];
+    __u32 remote_ip4 = skops->remote_ip4;
+    __u32 local_ip4 = skops->local_ip4;
+    __u32 remote_port = skops->remote_port;
+    __u32 local_port = skops->local_port;
+
+    // Memory barrier to ensure all reads complete before branching
+    asm volatile("" ::: "memory");
+
+    // Read IPv6 addresses (needed for IPv6 path)
+    __u32 rip6_0 = skops->remote_ip6[0];
+    __u32 rip6_1 = skops->remote_ip6[1];
+    __u32 rip6_2 = skops->remote_ip6[2];
+    __u32 rip6_3 = skops->remote_ip6[3];
+    __u32 lip6_0 = skops->local_ip6[0];
+    __u32 lip6_1 = skops->local_ip6[1];
+    __u32 lip6_2 = skops->local_ip6[2];
+    __u32 lip6_3 = skops->local_ip6[3];
+
+    // Memory barrier after all context reads
+    asm volatile("" ::: "memory");
+
     bool is_cleanup = false;
 
-    switch (skops->op) {
+    switch (op) {
     case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:  // Server side: accept() completed
     case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:   // Client side: connect() completed
         break;
     case BPF_SOCK_OPS_STATE_CB: {
         // Connection state change - clean up on close
-        // args[0] = old_state, args[1] = new_state
-        __u32 new_state = skops->args[1];
-        if (new_state != TCP_CLOSE && new_state != TCP_CLOSE_WAIT &&
-            new_state != TCP_TIME_WAIT) {
+        if (args1 != TCP_CLOSE && args1 != TCP_CLOSE_WAIT &&
+            args1 != TCP_TIME_WAIT) {
             return 0;  // Not a close event
         }
         is_cleanup = true;
@@ -3082,38 +3202,37 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
         return 0;  // Ignore other socket operations
     }
 
-    // Build flow key from sock_ops context
-    // sock_ops uses local/remote from the socket's perspective
+    // Build flow key using cached values (no more context access!)
     struct flow_key fkey = {};
 
-    if (skops->family == AF_INET) {
-        // IPv4: Use local/remote addresses
-        // For PASSIVE (server): local=server, remote=client
-        // For ACTIVE (client): local=client, remote=server
-        fkey.saddr = skops->remote_ip4;  // Remote IP
-        fkey.daddr = skops->local_ip4;   // Local IP
-        fkey.sport = bpf_ntohl(skops->remote_port) >> 16;  // Remote port (in high 16 bits)
-        fkey.dport = skops->local_port;  // Local port (already in host order)
+    /**
+     * @brief Port byte order handling for flow_key
+     *
+     * Per eBPF documentation:
+     * - remote_port: __u32 in network byte order
+     * - local_port: __u32 in host byte order (kernel API asymmetry)
+     *
+     * XDP stores ports in network byte order from TCP headers.
+     * Convert both to network order for consistent map lookups.
+     */
+    __u16 rport_host = (__u16)bpf_ntohl(remote_port);
+    __u16 lport_host = (__u16)local_port;
+    __u16 sport_net = bpf_htons(rport_host);
+    __u16 dport_net = bpf_htons(lport_host);
+
+    if (family == AF_INET) {
+        fkey.saddr = remote_ip4;
+        fkey.daddr = local_ip4;
+        fkey.sport = sport_net;
+        fkey.dport = dport_net;
         fkey.ip_version = 4;
-
-        // sock_ops ports need conversion: remote_port is in network order in high 16 bits
-        // local_port is in host order
-        // We need network byte order for the flow key to match XDP
-        fkey.sport = bpf_htons(fkey.sport);
-        fkey.dport = bpf_htons(fkey.dport);
-    } else if (skops->family == AF_INET6) {
-        // IPv6: XOR-hash the 128-bit addresses into 32 bits
-        // Same algorithm as XDP uses for IPv6 flows
-        fkey.saddr = skops->remote_ip6[0] ^ skops->remote_ip6[1] ^
-                     skops->remote_ip6[2] ^ skops->remote_ip6[3];
-        fkey.daddr = skops->local_ip6[0] ^ skops->local_ip6[1] ^
-                     skops->local_ip6[2] ^ skops->local_ip6[3];
-        fkey.sport = bpf_ntohl(skops->remote_port) >> 16;
-        fkey.dport = skops->local_port;
+    } else if (family == AF_INET6) {
+        // XOR-hash 128-bit addresses to 32-bit (matches XDP algorithm)
+        fkey.saddr = rip6_0 ^ rip6_1 ^ rip6_2 ^ rip6_3;
+        fkey.daddr = lip6_0 ^ lip6_1 ^ lip6_2 ^ lip6_3;
+        fkey.sport = sport_net;
+        fkey.dport = dport_net;
         fkey.ip_version = 6;
-
-        fkey.sport = bpf_htons(fkey.sport);
-        fkey.dport = bpf_htons(fkey.dport);
     } else {
         return 0;  // Unknown address family
     }
@@ -3131,7 +3250,6 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
     };
 
     if (is_cleanup) {
-        // Delete flow entries on connection close
         bpf_map_delete_elem(&flow_cookie_map, &fkey);
         bpf_map_delete_elem(&flow_cookie_map, &reverse_fkey);
         return 0;
@@ -3143,7 +3261,7 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
         return 0;
     }
 
-    // Cache the cookie for XDP to look up later
+    /* Cache the cookie for XDP to look up later */
     struct flow_cookie_entry entry = {
         .socket_cookie = socket_cookie,
         .timestamp_ns = bpf_ktime_get_ns()
@@ -3152,7 +3270,7 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
     bpf_map_update_elem(&flow_cookie_map, &fkey, &entry, BPF_ANY);
     bpf_map_update_elem(&flow_cookie_map, &reverse_fkey, &entry, BPF_ANY);
 
-    return 0;  // Success
+    return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

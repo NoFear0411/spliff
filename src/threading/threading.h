@@ -58,6 +58,7 @@
 #include "../include/spliff.h"
 #include "../bpf/probe_handler.h"
 #include "../protocol/http2.h"  /* For h2_stream_state_t, frame types */
+#include "../correlation/flow_cache.h"  /* For flow_info_t, flow_cache_t */
 
 /**
  * @defgroup threading_config Threading Configuration Constants
@@ -283,6 +284,7 @@ typedef struct worker_event {
     uint64_t timestamp_ns;      /**< Kernel timestamp (CLOCK_MONOTONIC) */
     uint64_t delta_ns;          /**< Time since previous event */
     uint64_t ssl_ctx;           /**< SSL context pointer (connection ID) */
+    uint64_t socket_cookie;     /**< Socket cookie for XDP correlation ("Golden Thread") */
     uint32_t pid;               /**< Process ID */
     uint32_t tid;               /**< Thread ID */
     uint32_t uid;               /**< User ID */
@@ -295,6 +297,11 @@ typedef struct worker_event {
     /** @{ */
     uint32_t worker_id;     /**< Target worker (pre-computed by dispatcher) */
     uint32_t flow_hash;     /**< FNV-1a hash of (pid, ssl_ctx) */
+    /** @} */
+
+    /** @name XDP Correlation */
+    /** @{ */
+    flow_info_t *flow_info; /**< Cached XDP flow data (may be NULL) */
     /** @} */
 
     /** @name Payload */
@@ -780,6 +787,11 @@ typedef struct dispatcher_ctx {
     _Atomic uint64_t xdp_ambiguous_events;  /**< Ambiguous protocol events */
     _Atomic uint64_t xdp_events_dropped;    /**< XDP events dropped */
     _Atomic uint64_t xdp_debug_samples;     /**< Debug sampling counter */
+    /** @} */
+
+    /** @name XDP Flow Cache (for correlation with SSL events) */
+    /** @{ */
+    flow_cache_t flow_cache;    /**< Socket cookie → flow info cache */
     /** @} */
 
     _Atomic bool running;       /**< false signals thread to exit */
