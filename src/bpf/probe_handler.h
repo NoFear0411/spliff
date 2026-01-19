@@ -49,6 +49,7 @@ typedef struct {
     uint64_t timestamp_ns;
     uint64_t delta_ns;       /* Latency (function execution time) */
     uint64_t ssl_ctx;        /* SSL context pointer for connection tracking */
+    uint64_t socket_cookie;  /* Socket cookie for XDP correlation ("Golden Thread") */
     uint32_t pid;
     uint32_t tid;
     uint32_t uid;

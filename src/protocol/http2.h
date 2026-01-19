@@ -305,6 +305,30 @@ bool http2_has_session(uint32_t pid, uint64_t ssl_ctx);
 void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn);
 
 /**
+ * @brief Set XDP flow correlation info for an HTTP/2 connection
+ *
+ * Stores network-layer metadata from XDP packet capture, enabling
+ * "Golden Thread" double-view correlation between network and
+ * application layers.
+ *
+ * @param[in] pid       Process ID
+ * @param[in] ssl_ctx   SSL context pointer
+ * @param[in] src_ip    Source IP address (network byte order)
+ * @param[in] dst_ip    Destination IP address (network byte order)
+ * @param[in] src_port  Source port (network byte order)
+ * @param[in] dst_port  Destination port (network byte order)
+ * @param[in] ip_ver    IP version (4 or 6)
+ * @param[in] direction Flow direction (0=outbound, 1=inbound)
+ * @param[in] category  Traffic category (1=TLS, 2=QUIC, 3=HTTP, 4=H2)
+ * @param[in] ifname    Interface name (may be NULL)
+ */
+void http2_set_flow_info(uint32_t pid, uint64_t ssl_ctx,
+                         uint32_t src_ip, uint32_t dst_ip,
+                         uint16_t src_port, uint16_t dst_port,
+                         uint8_t ip_ver, uint8_t direction,
+                         uint8_t category, const char *ifname);
+
+/**
  * @brief Get ALPN protocol for a connection
  *
  * @param[in] pid     Process ID

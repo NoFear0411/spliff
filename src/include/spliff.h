@@ -57,32 +57,29 @@
  * @{
  */
 
-#ifdef DEBUG
 /**
- * @brief General debug logging macro
+ * @brief General debug logging macro (runtime controlled via -d flag)
  * @param fmt Format string (printf-style)
  * @param ... Variable arguments for format string
  */
-#define DEBUG_LOG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#define DEBUG_LOG(fmt, ...) \
+    do { if (g_config.debug_mode) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__); } while(0)
 
 /**
- * @brief HTTP/2 specific debug logging macro
+ * @brief HTTP/2 specific debug logging macro (runtime controlled via -d flag)
  * @param fmt Format string (printf-style)
  * @param ... Variable arguments for format string
  */
-#define DEBUG_H2(fmt, ...) fprintf(stderr, "[H2 DEBUG] " fmt "\n", ##__VA_ARGS__)
+#define DEBUG_H2(fmt, ...) \
+    do { if (g_config.debug_mode) fprintf(stderr, "[H2 DEBUG] " fmt "\n", ##__VA_ARGS__); } while(0)
 
 /**
- * @brief Main module debug logging macro
+ * @brief Main module debug logging macro (runtime controlled via -d flag)
  * @param fmt Format string (printf-style)
  * @param ... Variable arguments for format string
  */
-#define DEBUG_MAIN(fmt, ...) fprintf(stderr, "[MAIN DEBUG] " fmt "\n", ##__VA_ARGS__)
-#else
-#define DEBUG_LOG(fmt, ...) ((void)0)
-#define DEBUG_H2(fmt, ...) ((void)0)
-#define DEBUG_MAIN(fmt, ...) ((void)0)
-#endif
+#define DEBUG_MAIN(fmt, ...) \
+    do { if (g_config.debug_mode) fprintf(stderr, "[MAIN DEBUG] " fmt "\n", ##__VA_ARGS__); } while(0)
 
 /** @} */ /* end of debug group */
 
@@ -346,6 +343,17 @@ typedef struct {
     char comm[TASK_COMM_LEN];   /**< Process command name */
     uint64_t timestamp_ns;      /**< Event timestamp (nanoseconds) */
     uint64_t delta_ns;          /**< SSL operation latency (nanoseconds) */
+
+    /* XDP Flow Correlation ("Golden Thread" double-view) */
+    bool has_flow_info;         /**< True if XDP flow info available */
+    uint32_t flow_src_ip;       /**< Source IP (network byte order) */
+    uint32_t flow_dst_ip;       /**< Destination IP (network byte order) */
+    uint16_t flow_src_port;     /**< Source port (network byte order) */
+    uint16_t flow_dst_port;     /**< Destination port (network byte order) */
+    uint8_t flow_ip_version;    /**< IP version (4 or 6) */
+    uint8_t flow_direction;     /**< Direction (1=ingress, 2=egress) */
+    uint8_t flow_category;      /**< XDP protocol category */
+    char flow_ifname[16];       /**< Network interface name */
 } http_message_t;
 
 /** @} */ /* end of http group */
