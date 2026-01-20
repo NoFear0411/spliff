@@ -352,6 +352,7 @@ void threading_cleanup(threading_mgr_t *mgr) {
  * Displays user-friendly statistics about SSL/TLS event processing:
  * - Events captured and processed
  * - Output statistics
+ * - Cookie retry statistics (deferred event queue)
  * - Detailed per-worker breakdown (debug mode only)
  *
  * @param[in] mgr Threading manager
@@ -367,17 +368,17 @@ void threading_print_stats(threading_mgr_t *mgr) {
 
     uint64_t total_processed = 0;
     uint64_t total_dropped = 0;
-    uint64_t total_spin = 0;
-    uint64_t total_yield = 0;
     uint64_t total_sleep = 0;
+    uint64_t total_deferred_successes = 0;
+    uint64_t total_deferred_failures = 0;
 
     for (int i = 0; i < mgr->num_workers; i++) {
         worker_ctx_t *w = &mgr->workers[i];
         total_processed += atomic_load(&w->events_processed);
         total_dropped += atomic_load(&w->events_dropped);
-        total_spin += atomic_load(&w->spin_cycles);
-        total_yield += atomic_load(&w->yield_cycles);
         total_sleep += atomic_load(&w->sleep_cycles);
+        total_deferred_successes += atomic_load(&w->deferred_successes);
+        total_deferred_failures += atomic_load(&w->deferred_failures);
     }
 
     uint64_t messages, bytes;
@@ -393,6 +394,17 @@ void threading_print_stats(threading_mgr_t *mgr) {
     fprintf(stderr, "Events processed: %lu\n", total_processed);
     fprintf(stderr, "Output: %lu messages, %lu bytes\n", messages, bytes);
 
+    /* Cookie retry statistics (Golden Thread correlation) */
+    uint64_t total_deferred = total_deferred_successes + total_deferred_failures;
+    if (total_deferred > 0) {
+        double success_rate = 100.0 * total_deferred_successes / total_deferred;
+        fprintf(stderr, "\nCookie Retry Statistics:\n");
+        fprintf(stderr, "  Retry successes: %lu (%.1f%%)\n",
+                total_deferred_successes, success_rate);
+        fprintf(stderr, "  Retry failures:  %lu (%.1f%%)\n",
+                total_deferred_failures, 100.0 - success_rate);
+    }
+
     /* Detailed breakdown in debug mode */
     if (g_config.debug_mode) {
         fprintf(stderr, "\n--- Debug: Per-Worker Statistics ---\n");
@@ -402,6 +414,8 @@ void threading_print_stats(threading_mgr_t *mgr) {
             worker_ctx_t *w = &mgr->workers[i];
             uint64_t processed = atomic_load(&w->events_processed);
             uint64_t w_dropped = atomic_load(&w->events_dropped);
+            uint64_t w_successes = atomic_load(&w->deferred_successes);
+            uint64_t w_failures = atomic_load(&w->deferred_failures);
 
             /* Only show workers that processed events */
             if (processed > 0 || w_dropped > 0) {
@@ -409,25 +423,21 @@ void threading_print_stats(threading_mgr_t *mgr) {
                 if (w_dropped > 0) {
                     fprintf(stderr, " (%lu dropped)", w_dropped);
                 }
+                if (w_successes > 0 || w_failures > 0) {
+                    fprintf(stderr, " [retry: %lu ok, %lu fail]",
+                            w_successes, w_failures);
+                }
                 fprintf(stderr, "\n");
             }
         }
 
-        /* Wait distribution shows CPU efficiency */
-        uint64_t total_wait = total_spin + total_yield + total_sleep;
-        if (total_wait > 0) {
-            double spin_pct = 100.0 * total_spin / total_wait;
-            double yield_pct = 100.0 * total_yield / total_wait;
-            double sleep_pct = 100.0 * total_sleep / total_wait;
-
+        /* CPU efficiency based on NAPI-style sleep cycles */
+        if (total_sleep > 0) {
             fprintf(stderr, "\n  CPU efficiency: ");
-            if (sleep_pct > 90.0) {
-                fprintf(stderr, "Excellent (%.0f%% idle)\n", sleep_pct);
-            } else if (spin_pct > 50.0) {
-                fprintf(stderr, "High load (%.0f%% active polling)\n", spin_pct);
-            } else {
-                fprintf(stderr, "Good (%.0f%% yield, %.0f%% sleep)\n", yield_pct, sleep_pct);
-            }
+            /* In NAPI mode, any sleep cycles means we're keeping up */
+            fprintf(stderr, "Good (NAPI-style, %lu sleep cycles)\n", total_sleep);
+        } else if (total_processed > 0) {
+            fprintf(stderr, "\n  CPU efficiency: High load (continuous processing)\n");
         }
     }
 

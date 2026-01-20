@@ -405,6 +405,10 @@ int http1_init(void) {
     return 0;
 }
 
+llhttp_settings_t *http1_get_settings(void) {
+    return g_initialized ? &g_settings : NULL;
+}
+
 /**
  * @brief Clean up parser resources
  *

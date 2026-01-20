@@ -56,6 +56,7 @@
 #include "../util/safe_str.h"
 #include "../output/display.h"
 #include "../content/decompressor.h"
+#include "../correlation/flow_context.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -226,6 +227,16 @@ struct h2_callback_ctx {
     h2_connection_t *conn;
     const ssl_data_event_t *event;
     h2_dir_t direction;
+
+    /*
+     * Flow-based storage (Phase 3.6 migration)
+     *
+     * When flow_ctx is non-NULL, callbacks should prefer using
+     * flow_h2_find_stream()/flow_h2_alloc_stream() over the global
+     * g_h2_streams pool. This enables gradual migration to the
+     * new Shared Pool Architecture.
+     */
+    flow_context_t *flow_ctx;
 };
 
 /* Global state */
@@ -317,6 +328,37 @@ void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id) {
 /* Forward declaration for cleanup */
 static void h2_connection_cleanup(h2_connection_t *conn);
 
+/*
+ * Flow-based stream helper (Phase 3.6 migration)
+ *
+ * Returns flow_transaction_t from flow_ctx if available, otherwise returns NULL.
+ * Callers should fall back to http2_get_stream() when this returns NULL.
+ */
+static flow_transaction_t *get_flow_stream(h2_callback_ctx_t *ctx,
+                                            int32_t stream_id,
+                                            bool create) {
+    if (!ctx || !ctx->flow_ctx) {
+        return NULL;
+    }
+
+    /* Check for HPACK corruption - don't create new streams */
+    if (ctx->flow_ctx->parser.h2.hpack_corrupted) {
+        return NULL;
+    }
+
+    flow_transaction_t *txn = flow_h2_find_stream(ctx->flow_ctx, stream_id);
+    if (txn) {
+        txn->last_active_ms = flow_get_monotonic_ms();
+        return txn;
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    return flow_h2_alloc_stream(ctx->flow_ctx, stream_id);
+}
+
 void http2_cleanup_pid(uint32_t pid) {
     /* Free all streams for this PID */
     for (int i = 0; i < MAX_H2_STREAMS; i++) {
@@ -354,6 +396,17 @@ static int on_begin_headers_callback(nghttp2_session *session,
     /* Only process on appropriate session */
     if (ctx->direction == H2_DIR_SERVER) {
         /* Server session sees requests - create/update stream state */
+
+        /* Try flow-based storage first (Phase 3.6) */
+        flow_transaction_t *ftxn = get_flow_stream(ctx, frame->hd.stream_id, true);
+        if (ftxn) {
+            ftxn->state = TXN_STATE_OPEN;
+            if (ctx->event) {
+                ftxn->start_time_ns = ctx->event->timestamp_ns;
+            }
+        }
+
+        /* Also use global pool for backward compatibility */
         h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, true);
         if (!stream) {
             return 0;
@@ -377,6 +430,12 @@ static int on_begin_headers_callback(nghttp2_session *session,
         }
     } else {
         /* Client session sees responses - update existing stream */
+
+        /* Try flow-based storage first (Phase 3.6) */
+        flow_transaction_t *ftxn = get_flow_stream(ctx, frame->hd.stream_id, false);
+        /* Response handling in flow_transaction_t will be added in Phase 3.6.6 */
+        (void)ftxn;
+
         h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
         if (!stream) {
             DEBUG_H2("Response for unknown stream %d", frame->hd.stream_id);
@@ -407,6 +466,9 @@ static int on_header_callback(nghttp2_session *session,
     DEBUG_H2("on_header: stream=%d '%.*s: %.*s'",
              frame->hd.stream_id, (int)namelen, name, (int)valuelen, value);
 
+    /* Try flow-based storage first (Phase 3.6) */
+    flow_transaction_t *ftxn = get_flow_stream(ctx, frame->hd.stream_id, false);
+
     h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
     if (!stream) {
         DEBUG_H2("on_header: stream %d not found!", frame->hd.stream_id);
@@ -419,23 +481,48 @@ static int on_header_callback(nghttp2_session *session,
             size_t copylen = valuelen < sizeof(stream->method) - 1 ? valuelen : sizeof(stream->method) - 1;
             memcpy(stream->method, value, copylen);
             stream->method[copylen] = '\0';
+
+            /* Also populate flow_transaction_t */
+            if (ftxn) {
+                copylen = valuelen < sizeof(ftxn->method) - 1 ? valuelen : sizeof(ftxn->method) - 1;
+                memcpy(ftxn->method, value, copylen);
+                ftxn->method[copylen] = '\0';
+            }
         } else if (namelen == 5 && memcmp(name, ":path", 5) == 0) {
             size_t copylen = valuelen < sizeof(stream->path) - 1 ? valuelen : sizeof(stream->path) - 1;
             memcpy(stream->path, value, copylen);
             stream->path[copylen] = '\0';
+
+            if (ftxn) {
+                copylen = valuelen < sizeof(ftxn->path) - 1 ? valuelen : sizeof(ftxn->path) - 1;
+                memcpy(ftxn->path, value, copylen);
+                ftxn->path[copylen] = '\0';
+            }
         } else if (namelen == 10 && memcmp(name, ":authority", 10) == 0) {
             size_t copylen = valuelen < sizeof(stream->authority) - 1 ? valuelen : sizeof(stream->authority) - 1;
             memcpy(stream->authority, value, copylen);
             stream->authority[copylen] = '\0';
+
+            /* :authority maps to host in flow_transaction_t */
+            if (ftxn) {
+                copylen = valuelen < sizeof(ftxn->host) - 1 ? valuelen : sizeof(ftxn->host) - 1;
+                memcpy(ftxn->host, value, copylen);
+                ftxn->host[copylen] = '\0';
+            }
         } else if (namelen == 7 && memcmp(name, ":scheme", 7) == 0) {
             size_t copylen = valuelen < sizeof(stream->scheme) - 1 ? valuelen : sizeof(stream->scheme) - 1;
             memcpy(stream->scheme, value, copylen);
             stream->scheme[copylen] = '\0';
+            /* flow_transaction_t doesn't store scheme separately */
         } else if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
             char status_str[8] = {0};
             size_t copylen = valuelen < 7 ? valuelen : 7;
             memcpy(status_str, value, copylen);
             stream->status_code = atoi(status_str);
+
+            if (ftxn) {
+                ftxn->status_code = stream->status_code;
+            }
         }
         return 0;
     }
@@ -456,10 +543,25 @@ static int on_header_callback(nghttp2_session *session,
         /* Extract special headers */
         if (strcasecmp(hdr->name, "content-type") == 0) {
             safe_strcpy(stream->content_type, sizeof(stream->content_type), hdr->value);
+            if (ftxn) {
+                safe_strcpy(ftxn->content_type, sizeof(ftxn->content_type), hdr->value);
+            }
         } else if (strcasecmp(hdr->name, "content-encoding") == 0) {
             safe_strcpy(stream->content_encoding, sizeof(stream->content_encoding), hdr->value);
+            /* flow_transaction_t uses TXN_FLAG_COMPRESSED instead */
+            if (ftxn && hdr->value[0]) {
+                ftxn->flags |= TXN_FLAG_COMPRESSED;
+            }
         } else if (strcasecmp(hdr->name, "content-length") == 0) {
             stream->content_length = strtoull(hdr->value, NULL, 10);
+            if (ftxn) {
+                ftxn->content_length = stream->content_length;
+            }
+        } else if (strcasecmp(hdr->name, "transfer-encoding") == 0 &&
+                   strcasestr(hdr->value, "chunked")) {
+            if (ftxn) {
+                ftxn->flags |= TXN_FLAG_CHUNKED;
+            }
         }
     }
 
@@ -475,6 +577,9 @@ static int on_frame_recv_callback(nghttp2_session *session,
     DEBUG_H2("on_frame_recv: type=%s(%d) stream=%d flags=0x%02x",
              http2_frame_name(frame->hd.type), frame->hd.type,
              frame->hd.stream_id, frame->hd.flags);
+
+    /* Get flow-based transaction if available (Phase 3.6) */
+    flow_transaction_t *ftxn = get_flow_stream(ctx, frame->hd.stream_id, false);
 
     switch (frame->hd.type) {
     case NGHTTP2_HEADERS:
@@ -492,6 +597,12 @@ static int on_frame_recv_callback(nghttp2_session *session,
                     /* If END_STREAM also set, request is complete (no body) */
                     if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
                         stream->request_complete = true;
+
+                        /* Update flow_transaction_t state */
+                        if (ftxn) {
+                            ftxn->flags |= TXN_FLAG_REQ_END_STREAM;
+                            ftxn->state = TXN_STATE_HALF_CLOSED_REMOTE;
+                        }
                     }
                 } else {
                     /* Response headers complete - only display once */
@@ -503,6 +614,17 @@ static int on_frame_recv_callback(nghttp2_session *session,
                         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
                             stream->response_complete = true;
                             printf("\n");
+
+                            /* Update flow_transaction_t state */
+                            if (ftxn) {
+                                ftxn->flags |= TXN_FLAG_RSP_END_STREAM;
+                                /* If both ends closed, stream is done */
+                                if (ftxn->flags & TXN_FLAG_REQ_END_STREAM) {
+                                    ftxn->state = TXN_STATE_CLOSED;
+                                } else {
+                                    ftxn->state = TXN_STATE_HALF_CLOSED_LOCAL;
+                                }
+                            }
                         }
                     }
                 }
@@ -519,10 +641,24 @@ static int on_frame_recv_callback(nghttp2_session *session,
                     /* Request body complete */
                     stream->request_complete = true;
                     h2_display_body(stream, DIR_REQUEST);
+
+                    if (ftxn) {
+                        ftxn->flags |= TXN_FLAG_REQ_END_STREAM;
+                        ftxn->state = TXN_STATE_HALF_CLOSED_REMOTE;
+                    }
                 } else {
                     /* Response body complete */
                     stream->response_complete = true;
                     h2_display_body(stream, DIR_RESPONSE);
+
+                    if (ftxn) {
+                        ftxn->flags |= TXN_FLAG_RSP_END_STREAM;
+                        if (ftxn->flags & TXN_FLAG_REQ_END_STREAM) {
+                            ftxn->state = TXN_STATE_CLOSED;
+                        } else {
+                            ftxn->state = TXN_STATE_HALF_CLOSED_LOCAL;
+                        }
+                    }
                 }
             }
         }
@@ -539,7 +675,10 @@ static int on_frame_recv_callback(nghttp2_session *session,
         break;
 
     case NGHTTP2_GOAWAY:
-        /* Connection closing - could cleanup sessions here */
+        /* Connection closing - mark HPACK as corrupted to stop processing */
+        if (ctx->flow_ctx) {
+            ctx->flow_ctx->parser.h2.hpack_corrupted = true;
+        }
         break;
 
     case NGHTTP2_RST_STREAM:
@@ -548,6 +687,11 @@ static int on_frame_recv_callback(nghttp2_session *session,
             h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
             if (stream) {
                 stream->state = H2_STREAM_CLOSED;
+            }
+
+            /* Update flow_transaction_t state */
+            if (ftxn) {
+                ftxn->state = TXN_STATE_RESET;
             }
         }
         break;
@@ -569,6 +713,12 @@ static int on_data_chunk_recv_callback(nghttp2_session *session,
     (void)flags;
     h2_callback_ctx_t *ctx = (h2_callback_ctx_t *)user_data;
 
+    /* Also append to flow_transaction_t body buffer if configured */
+    flow_transaction_t *ftxn = get_flow_stream(ctx, stream_id, false);
+    if (ftxn && g_config.show_body) {
+        flow_txn_append_body(ftxn, data, len);
+    }
+
     h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, stream_id, false);
     if (!stream || !stream->body_buf) return 0;
 
@@ -589,8 +739,18 @@ static int on_stream_close_callback(nghttp2_session *session,
                                     uint32_t error_code,
                                     void *user_data) {
     (void)session;
-    (void)error_code;
     h2_callback_ctx_t *ctx = (h2_callback_ctx_t *)user_data;
+
+    /* Update flow_transaction_t state */
+    flow_transaction_t *ftxn = get_flow_stream(ctx, stream_id, false);
+    if (ftxn) {
+        if (error_code != 0) {
+            ftxn->state = TXN_STATE_RESET;
+        } else {
+            ftxn->state = TXN_STATE_CLOSED;
+        }
+        ftxn->flags |= TXN_FLAG_DISPLAYED;  /* Mark as ready for cleanup */
+    }
 
     h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, stream_id, false);
     if (stream) {
@@ -610,17 +770,18 @@ static int on_invalid_frame_recv_callback(nghttp2_session *session,
                                           int lib_error_code,
                                           void *user_data) {
     (void)session;
-#ifdef DEBUG
     h2_callback_ctx_t *ctx = (h2_callback_ctx_t *)user_data;
+
     DEBUG_H2("INVALID FRAME: type=%s stream=%d error=%d (%s) dir=%s",
              http2_frame_name(frame->hd.type), frame->hd.stream_id,
              lib_error_code, nghttp2_strerror(lib_error_code),
              ctx->direction == H2_DIR_SERVER ? "server" : "client");
-#else
-    (void)frame;
-    (void)lib_error_code;
-    (void)user_data;
-#endif
+
+    /* HPACK errors are connection-fatal (RFC 7540 Section 4.3) */
+    if (lib_error_code == NGHTTP2_ERR_HEADER_COMP && ctx->flow_ctx) {
+        ctx->flow_ctx->parser.h2.hpack_corrupted = true;
+    }
+
     return 0;
 }
 
@@ -630,8 +791,15 @@ static int on_error_callback(nghttp2_session *session,
                              size_t len,
                              void *user_data) {
     (void)session;
-    (void)user_data;
+    h2_callback_ctx_t *ctx = (h2_callback_ctx_t *)user_data;
+
     DEBUG_H2("ERROR: code=%d msg=%.*s", lib_error_code, (int)len, msg);
+
+    /* Mark HPACK as corrupted for compression errors */
+    if (lib_error_code == NGHTTP2_ERR_HEADER_COMP && ctx && ctx->flow_ctx) {
+        ctx->flow_ctx->parser.h2.hpack_corrupted = true;
+    }
+
     return 0;
 }
 
@@ -1020,6 +1188,10 @@ int http2_init(void) {
 
     g_h2_initialized = true;
     return 0;
+}
+
+nghttp2_session_callbacks *http2_get_callbacks(void) {
+    return g_h2_initialized ? g_h2_callbacks : NULL;
 }
 
 void http2_cleanup(void) {
@@ -1594,6 +1766,11 @@ bool http2_is_valid_frame_header(const uint8_t *data) {
 
 /* Try to find a valid frame start in corrupted buffer by scanning for recognizable patterns */
 static size_t h2_find_frame_start(const uint8_t *buf, size_t len) {
+    /* Need at least 9 bytes for a valid frame header */
+    if (len < 9) {
+        return len;  /* No valid frame possible */
+    }
+
     /* Look for patterns that indicate frame boundaries:
      * - SETTINGS frame on stream 0: type=4, stream_id=0
      * - HEADERS frame with small stream ID: type=1, stream_id < 1000
@@ -1627,6 +1804,13 @@ static size_t h2_find_frame_start(const uint8_t *buf, size_t len) {
 /* Process response frames with reassembly for fragmented data */
 static void h2_process_response_frame(h2_connection_t *conn, const uint8_t *data, int len,
                                        const ssl_data_event_t *event) {
+    /* Sanity check: guard against corrupted buffer length (race condition defense) */
+    if (conn->response_buf_len > H2_REASSEMBLY_BUF_SIZE) {
+        DEBUG_H2("WARNING: response_buf_len=%zu exceeds buffer size, resetting",
+                 conn->response_buf_len);
+        conn->response_buf_len = 0;
+    }
+
     /* Append incoming data to reassembly buffer */
     size_t space_available = H2_REASSEMBLY_BUF_SIZE - conn->response_buf_len;
     size_t to_copy = ((size_t)len < space_available) ? (size_t)len : space_available;
@@ -1657,9 +1841,15 @@ static void h2_process_response_frame(h2_connection_t *conn, const uint8_t *data
                      frame_len, frame_start[3]);
 
             /* Try to find next valid frame in remaining buffer */
-            size_t skip = h2_find_frame_start(conn->response_buf + pos + 1,
-                                               conn->response_buf_len - pos - 1);
-            if (skip > 0 && skip < conn->response_buf_len - pos - 1) {
+            /* Safety: ensure we have at least 1 byte to skip past */
+            if (conn->response_buf_len <= pos + 1) {
+                DEBUG_H2("No bytes to scan for recovery, discarding buffer");
+                conn->response_buf_len = 0;
+                return;
+            }
+            size_t remaining = conn->response_buf_len - pos - 1;
+            size_t skip = h2_find_frame_start(conn->response_buf + pos + 1, remaining);
+            if (skip > 0 && skip < remaining) {
                 DEBUG_H2("Recovered: skipping %zu bytes to next valid frame", skip + 1);
                 pos += skip + 1;
                 continue;
@@ -1837,6 +2027,46 @@ void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *e
     }
 }
 
+void http2_process_frame_flow(const uint8_t *data, int len,
+                              const ssl_data_event_t *event,
+                              flow_context_t *flow_ctx) {
+    if (!g_h2_initialized) {
+        if (http2_init() != 0) {
+            DEBUG_H2("http2_init() failed");
+            return;
+        }
+    }
+
+    /* Get or create connection for this (PID, ssl_ctx) */
+    h2_connection_t *conn = get_h2_connection(event->pid, event->ssl_ctx, true);
+    if (!conn) {
+        DEBUG_H2("get_h2_connection failed for PID %u ssl_ctx=0x%llx",
+                 event->pid, (unsigned long long)event->ssl_ctx);
+        return;
+    }
+
+    /* Set flow_ctx in callback context for flow-based stream storage
+     * Note: Only server_ctx exists - response parsing uses h2_process_response_frame
+     * which doesn't use nghttp2 callbacks, so flow_ctx needs separate handling there
+     */
+    if (conn->server_ctx) {
+        conn->server_ctx->flow_ctx = flow_ctx;
+        conn->server_ctx->event = event;
+    }
+
+    /* Check for HPACK corruption - stop processing if connection is dead */
+    if (flow_ctx && flow_ctx->parser.h2.hpack_corrupted) {
+        DEBUG_H2("HPACK corrupted, skipping frame processing");
+        return;
+    }
+
+    /* Delegate to the main processing function */
+    http2_process_frame(data, len, event);
+
+    /* Clear flow_ctx to avoid stale pointer issues */
+    if (conn->server_ctx) conn->server_ctx->flow_ctx = NULL;
+}
+
 #else /* !HAVE_NGHTTP2 */
 
 /* Stub implementation when nghttp2 is not available */
@@ -1904,6 +2134,16 @@ void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *e
     (void)len;
     (void)event;
     /* No-op without nghttp2 - HTTP/2 detection will just show connection message */
+}
+
+void http2_process_frame_flow(const uint8_t *data, int len,
+                              const ssl_data_event_t *event,
+                              flow_context_t *flow_ctx) {
+    (void)data;
+    (void)len;
+    (void)event;
+    (void)flow_ctx;
+    /* No-op without nghttp2 */
 }
 
 h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id, bool create) {

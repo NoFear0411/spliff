@@ -456,6 +456,9 @@ struct xdp_stats {
     __u64 gatekeeper_hits;    // Silenced flows (fast-pass)
     __u64 cookie_failures;    // Socket cookie lookup failures (IPv6, etc.)
     __u64 ringbuf_drops;      // Ring buffer full (bpf_ringbuf_output failures)
+    __u64 sockops_active;     // Sockops ACTIVE_ESTABLISHED events
+    __u64 sockops_passive;    // Sockops PASSIVE_ESTABLISHED events
+    __u64 sockops_state;      // Sockops STATE_CB events (cleanup)
 };
 
 struct {
@@ -3185,9 +3188,16 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
 
     bool is_cleanup = false;
 
+    // Get stats counter for tracking sockops invocations
+    __u32 zero = 0;
+    struct xdp_stats *stats = bpf_map_lookup_elem(&xdp_stats_map, &zero);
+
     switch (op) {
     case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:  // Server side: accept() completed
+        if (stats) stats->sockops_passive++;
+        break;
     case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB:   // Client side: connect() completed
+        if (stats) stats->sockops_active++;
         break;
     case BPF_SOCK_OPS_STATE_CB: {
         // Connection state change - clean up on close
@@ -3195,6 +3205,7 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
             args1 != TCP_TIME_WAIT) {
             return 0;  // Not a close event
         }
+        if (stats) stats->sockops_state++;
         is_cleanup = true;
         break;
     }
