@@ -101,21 +101,25 @@ int flow_cache_upsert(flow_cache_t *cache, uint64_t socket_cookie,
     size_t start = get_slot(cache, socket_cookie);
     size_t max_probe = cache->capacity / 4;  // Limit probing to 25%
 
-    // Linear probing to find existing or empty slot
+    /* Linear probing to find existing or empty slot */
     for (size_t i = 0; i < max_probe; i++) {
         size_t slot = (start + i) % cache->capacity;
         flow_info_t *entry = &cache->entries[slot];
 
-        // Found existing entry - update it
-        if (entry->active && entry->socket_cookie == socket_cookie) {
+        /* Use acquire to see any prior writes */
+        bool is_active = atomic_load_explicit(&entry->active, memory_order_acquire);
+
+        /* Found existing entry - update it */
+        if (is_active && entry->socket_cookie == socket_cookie) {
             entry->last_seen_ns = evt->timestamp_ns;
             entry->pkt_count++;
             entry->byte_count += evt->pkt_len;
             return 0;
         }
 
-        // Found empty slot - create new entry
-        if (!entry->active) {
+        /* Found empty slot - create new entry */
+        if (!is_active) {
+            /* Populate all fields BEFORE setting active */
             entry->socket_cookie = socket_cookie;
             memcpy(&entry->flow, &evt->flow, sizeof(flow_key_t));
             entry->first_seen_ns = evt->timestamp_ns;
@@ -126,7 +130,7 @@ int flow_cache_upsert(flow_cache_t *cache, uint64_t socket_cookie,
             entry->category = evt->category;
             entry->direction = evt->direction;
 
-            // Resolve interface name from ifindex
+            /* Resolve interface name from ifindex */
             if (evt->ifindex > 0) {
                 if (if_indextoname(evt->ifindex, entry->ifname) == NULL) {
                     snprintf(entry->ifname, sizeof(entry->ifname), "if%u", evt->ifindex);
@@ -135,28 +139,33 @@ int flow_cache_upsert(flow_cache_t *cache, uint64_t socket_cookie,
                 entry->ifname[0] = '\0';
             }
 
-            entry->active = true;
+            /* Release ensures all prior writes are visible to readers */
+            atomic_store_explicit(&entry->active, true, memory_order_release);
             atomic_fetch_add(&cache->inserts, 1);
             atomic_fetch_add(&cache->count, 1);
             return 0;
         }
     }
 
-    // Cache is congested in this region - evict oldest entry
+    /* Cache is congested in this region - evict oldest entry */
     size_t oldest_slot = start;
     uint64_t oldest_time = UINT64_MAX;
 
     for (size_t i = 0; i < max_probe; i++) {
         size_t slot = (start + i) % cache->capacity;
         flow_info_t *entry = &cache->entries[slot];
-        if (entry->active && entry->last_seen_ns < oldest_time) {
+        bool is_active = atomic_load_explicit(&entry->active, memory_order_acquire);
+        if (is_active && entry->last_seen_ns < oldest_time) {
             oldest_time = entry->last_seen_ns;
             oldest_slot = slot;
         }
     }
 
-    // Evict and reuse
+    /* Evict and reuse - mark inactive first, then repopulate */
     flow_info_t *entry = &cache->entries[oldest_slot];
+    atomic_store_explicit(&entry->active, false, memory_order_release);
+
+    /* Populate all fields BEFORE setting active */
     entry->socket_cookie = socket_cookie;
     memcpy(&entry->flow, &evt->flow, sizeof(flow_key_t));
     entry->first_seen_ns = evt->timestamp_ns;
@@ -175,12 +184,24 @@ int flow_cache_upsert(flow_cache_t *cache, uint64_t socket_cookie,
         entry->ifname[0] = '\0';
     }
 
+    /* Release ensures all prior writes are visible to readers */
+    atomic_store_explicit(&entry->active, true, memory_order_release);
     atomic_fetch_add(&cache->evictions, 1);
     atomic_fetch_add(&cache->inserts, 1);
 
     return 0;
 }
 
+/**
+ * @brief Lookup flow info by socket_cookie (thread-safe with acquire semantics)
+ *
+ * Uses atomic_load_explicit with memory_order_acquire to ensure all
+ * writes by the dispatcher thread are visible when active==true.
+ *
+ * @param cache         Flow cache
+ * @param socket_cookie Socket cookie to lookup
+ * @return Pointer to flow_info if found, NULL otherwise
+ */
 flow_info_t *flow_cache_lookup(flow_cache_t *cache, uint64_t socket_cookie) {
     if (!cache || !cache->entries || socket_cookie == 0) {
         return NULL;
@@ -193,13 +214,16 @@ flow_info_t *flow_cache_lookup(flow_cache_t *cache, uint64_t socket_cookie) {
         size_t slot = (start + i) % cache->capacity;
         flow_info_t *entry = &cache->entries[slot];
 
-        if (entry->active && entry->socket_cookie == socket_cookie) {
+        /* Acquire ensures we see all writes made before active was set */
+        bool is_active = atomic_load_explicit(&entry->active, memory_order_acquire);
+
+        if (is_active && entry->socket_cookie == socket_cookie) {
             atomic_fetch_add(&cache->hits, 1);
-            return entry;
+            return entry;  /* All fields guaranteed visible due to acquire */
         }
 
-        // Empty slot means cookie not in cache
-        if (!entry->active) {
+        /* Empty slot means cookie not in cache */
+        if (!is_active) {
             break;
         }
     }
@@ -208,6 +232,15 @@ flow_info_t *flow_cache_lookup(flow_cache_t *cache, uint64_t socket_cookie) {
     return NULL;
 }
 
+/**
+ * @brief Mark flow as terminated (FIN/RST received)
+ *
+ * Uses atomic_store_explicit with memory_order_release to ensure
+ * visibility to worker threads.
+ *
+ * @param cache         Flow cache
+ * @param socket_cookie Socket cookie of terminated flow
+ */
 void flow_cache_terminate(flow_cache_t *cache, uint64_t socket_cookie) {
     if (!cache || !cache->entries || socket_cookie == 0) {
         return;
@@ -220,18 +253,29 @@ void flow_cache_terminate(flow_cache_t *cache, uint64_t socket_cookie) {
         size_t slot = (start + i) % cache->capacity;
         flow_info_t *entry = &cache->entries[slot];
 
-        if (entry->active && entry->socket_cookie == socket_cookie) {
-            entry->active = false;
+        bool is_active = atomic_load_explicit(&entry->active, memory_order_acquire);
+        if (is_active && entry->socket_cookie == socket_cookie) {
+            atomic_store_explicit(&entry->active, false, memory_order_release);
             atomic_fetch_sub(&cache->count, 1);
             return;
         }
 
-        if (!entry->active) {
+        if (!is_active) {
             break;
         }
     }
 }
 
+/**
+ * @brief Evict stale entries (older than timeout)
+ *
+ * Call periodically to reclaim slots from long-idle connections.
+ * Uses atomic operations for thread safety.
+ *
+ * @param cache      Flow cache
+ * @param current_ns Current timestamp (nanoseconds)
+ * @return Number of entries evicted
+ */
 int flow_cache_evict_stale(flow_cache_t *cache, uint64_t current_ns) {
     if (!cache || !cache->entries) {
         return 0;
@@ -242,8 +286,9 @@ int flow_cache_evict_stale(flow_cache_t *cache, uint64_t current_ns) {
 
     for (size_t i = 0; i < cache->capacity; i++) {
         flow_info_t *entry = &cache->entries[i];
-        if (entry->active && entry->last_seen_ns < timeout_threshold) {
-            entry->active = false;
+        bool is_active = atomic_load_explicit(&entry->active, memory_order_acquire);
+        if (is_active && entry->last_seen_ns < timeout_threshold) {
+            atomic_store_explicit(&entry->active, false, memory_order_release);
             atomic_fetch_sub(&cache->count, 1);
             atomic_fetch_add(&cache->evictions, 1);
             evicted++;

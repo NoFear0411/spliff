@@ -2,6 +2,54 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.2] - 2026-01-20
+
+### Added
+- **Unified Transaction Architecture (Phase 3.6)**: Per-flow HTTP/2 stream storage
+  - `flow_transaction_t` structure with RFC 7540-aligned state machine
+  - States: IDLE, OPEN, HALF_CLOSED_LOCAL, HALF_CLOSED_REMOTE, CLOSED, RESET, ERROR
+  - Transaction flags for END_STREAM tracking, body allocation, display state
+  - O(1) stream slot allocation via free-list in fixed 64-stream array
+  - Per-stream `last_active_ms` timestamp for ghost stream detection
+  - `http2_process_frame_flow()` bridge function for flow-aware processing
+
+- **HTTP/2 Stream Pool Management**: Thread-safe stream lifecycle
+  - `flow_h2_init_stream_pool()`: Initialize free-list linked array
+  - `flow_h2_alloc_stream()`: O(1) allocation from free list
+  - `flow_h2_find_stream()`: Lookup by stream ID with activity tracking
+  - `flow_h2_free_stream()`: Return slot to free list with body cleanup
+  - `flow_h2_reap_ghosts()`: Timeout-based cleanup (10s default)
+  - `flow_txn_alloc_body()` / `flow_txn_append_body()` / `flow_txn_free_body()`
+
+- **HPACK Corruption Detection**: Connection-fatal error handling
+  - `hpack_corrupted` flag in `h2_parser_ctx_t` per RFC 7540 Section 4.3
+  - nghttp2 error callbacks set flag on inflate failures
+  - `http2_process_frame_flow()` early-exits when HPACK is corrupted
+  - Prevents cascading decode failures and resource waste
+
+### Changed
+- **HTTP/2 Callbacks**: Dual population of global pools AND flow_transaction_t
+  - `on_begin_headers_callback`: Creates flow stream, sets TXN_STATE_OPEN
+  - `on_header_callback`: Populates method, path, host, status, content-type
+  - `on_frame_recv_callback`: Handles END_STREAM, state transitions
+  - `on_data_chunk_recv_callback`: Appends body data to flow stream
+  - `on_stream_close_callback`: Sets CLOSED/RESET state
+  - Backward compatible - legacy global pools still populated
+
+- **h2_parser_ctx_t**: Extended with stream pool fields
+  - `streams[64]`: Fixed array of flow_transaction_t
+  - `free_head`: Head of free-list for O(1) allocation
+  - `active_count`: Number of active streams
+  - `hpack_corrupted`: Connection-fatal HPACK error flag
+
+- **h1_parser_ctx_t**: Added embedded `txn` field for HTTP/1.1 transaction
+
+### Technical Details
+- Worker affinity via `hash(pid, ssl_ctx) % num_workers` unchanged
+- `home_worker_id` atomic CAS ensures single-writer guarantee per flow
+- Stream timeout: 10 seconds (FLOW_STREAM_TIMEOUT_MS)
+- Maximum streams per flow: 64 (FLOW_MAX_H2_STREAMS)
+
 ## [0.9.1] - 2026-01-19
 
 ### Fixed

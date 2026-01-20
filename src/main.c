@@ -763,6 +763,21 @@ static void cleanup_all_resources(void) {
                     printf("  Events dropped:   %lu (ring buffer full)\n",
                            xdp_stats.ringbuf_drops);
                 }
+
+                /* Sockops statistics (cookie caching for XDP correlation) */
+                uint64_t sockops_total = xdp_stats.sockops_active +
+                                         xdp_stats.sockops_passive;
+                if (sockops_total > 0 || xdp_stats.sockops_state > 0) {
+                    printf("\n  Sockops events:   %lu (active: %lu, passive: %lu)\n",
+                           sockops_total,
+                           xdp_stats.sockops_active,
+                           xdp_stats.sockops_passive);
+                    printf("  Sockops cleanup:  %lu\n", xdp_stats.sockops_state);
+                } else {
+                    printf("\n  %sWARNING%s: No sockops events - cookie caching inactive!\n",
+                           display_color(C_YELLOW), display_color(C_RESET));
+                    printf("  (Check cgroup2 mount and sockops attachment)\n");
+                }
             }
             printf("\n");
         }
@@ -1224,7 +1239,15 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
         if (event->data_len > 0 && event->data_len <= 255) {
             char alpn_proto[256] = {0};
             memcpy(alpn_proto, event->data, event->data_len);
+
+            /* Store in per-worker cache (legacy) */
             worker_set_alpn(state, event->pid, event->ssl_ctx, alpn_proto);
+
+            /* Also store in Shared Pool flow_context and initialize parser */
+            if (event->flow_ctx) {
+                flow_init_parser(event->flow_ctx, alpn_proto);
+                event->flow_ctx->flags |= FLOW_FLAG_HAS_SSL;
+            }
         }
         return;
     }
@@ -1266,9 +1289,14 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
         safe_strcpy(msg.comm, sizeof(msg.comm),
                    proc_name[0] ? proc_name : event->comm);
 
-        /* Get ALPN from per-worker cache */
-        const char *alpn = worker_get_alpn(state, event->pid, event->ssl_ctx);
-        if (alpn) {
+        /* Get ALPN - prefer Shared Pool, fall back to per-worker cache */
+        const char *alpn = NULL;
+        if (event->flow_ctx && event->flow_ctx->alpn[0]) {
+            alpn = event->flow_ctx->alpn;
+        } else {
+            alpn = worker_get_alpn(state, event->pid, event->ssl_ctx);
+        }
+        if (alpn && alpn[0]) {
             safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
         }
 
@@ -1545,7 +1573,8 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
         memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
         memcpy(bpf_event.data, event->data, event->data_len);
 
-        http2_process_frame(data, len, &bpf_event);
+        /* Use flow-aware processing when flow_ctx available (Phase 3.6) */
+        http2_process_frame_flow(data, len, &bpf_event, event->flow_ctx);
         return;
     }
 
@@ -1589,7 +1618,8 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
             };
             memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
             memcpy(bpf_event.data, data + 24, len - 24);
-            http2_process_frame(data + 24, len - 24, &bpf_event);
+            /* Use flow-aware processing when flow_ctx available (Phase 3.6) */
+            http2_process_frame_flow(data + 24, len - 24, &bpf_event, event->flow_ctx);
         }
         return;
     }
@@ -1647,7 +1677,8 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
                 };
                 memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
                 memcpy(bpf_event.data, data, len);
-                http2_process_frame(data, len, &bpf_event);
+                /* Use flow-aware processing when flow_ctx available (Phase 3.6) */
+                http2_process_frame_flow(data, len, &bpf_event, event->flow_ctx);
                 return;
             }
         }

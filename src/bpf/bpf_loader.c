@@ -1402,6 +1402,9 @@ struct xdp_stats_kernel {
     uint64_t gatekeeper_hits;
     uint64_t cookie_failures;
     uint64_t ringbuf_drops;
+    uint64_t sockops_active;
+    uint64_t sockops_passive;
+    uint64_t sockops_state;
 };
 
 /* Read XDP statistics (aggregates per-CPU counters) */
@@ -1443,6 +1446,9 @@ int bpf_loader_xdp_read_stats(bpf_loader_t *loader, xdp_stats_t *stats) {
         stats->gatekeeper_hits   += values[i].gatekeeper_hits;
         stats->cookie_failures   += values[i].cookie_failures;
         stats->ringbuf_drops     += values[i].ringbuf_drops;
+        stats->sockops_active    += values[i].sockops_active;
+        stats->sockops_passive   += values[i].sockops_passive;
+        stats->sockops_state     += values[i].sockops_state;
     }
 
     free(values);
@@ -1488,14 +1494,23 @@ const xdp_error_t *bpf_loader_xdp_get_last_error(bpf_loader_t *loader) {
 #include <netinet/tcp.h>
 #include <time.h>
 
-/* Flow key structure matching BPF (must match spliff.bpf.c struct flow_key) */
+/**
+ * @brief Flow key structure matching BPF (must match spliff.bpf.c struct flow_key)
+ *
+ * Layout must exactly match the BPF flow_key for map lookups to work:
+ * - saddr, daddr: IP addresses in network byte order
+ * - sport, dport: ports in network byte order
+ * - protocol: IPPROTO_TCP (6) for TCP connections
+ * - ip_version: 4 or 6
+ */
 struct warmup_flow_key {
-    __u32 saddr;      /* Network byte order */
-    __u32 daddr;      /* Network byte order */
-    __u16 sport;      /* Network byte order */
-    __u16 dport;      /* Network byte order */
-    __u8  ip_version;
-    __u8  _pad[3];
+    __u32 saddr;      /* [4] Network byte order */
+    __u32 daddr;      /* [4] Network byte order */
+    __u16 sport;      /* [2] Network byte order */
+    __u16 dport;      /* [2] Network byte order */
+    __u8  protocol;   /* [1] IPPROTO_TCP = 6 */
+    __u8  ip_version; /* [1] 4 or 6 */
+    __u8  _pad[2];    /* [2] Align to 16 bytes */
 } __attribute__((packed));
 
 /* Cookie entry structure matching BPF (must match struct flow_cookie_entry) */
@@ -1592,6 +1607,7 @@ int bpf_loader_xdp_warmup_cookies(bpf_loader_t *loader, bool debug) {
                 .daddr = diag->id.idiag_dst[0],  /* Network order - DO NOT convert */
                 .sport = diag->id.idiag_sport,   /* Network order - DO NOT convert */
                 .dport = diag->id.idiag_dport,   /* Network order - DO NOT convert */
+                .protocol = IPPROTO_TCP,         /* TCP = 6 */
                 .ip_version = 4,
             };
 
@@ -1620,6 +1636,7 @@ int bpf_loader_xdp_warmup_cookies(bpf_loader_t *loader, bool debug) {
                     .daddr = fkey.saddr,
                     .sport = fkey.dport,
                     .dport = fkey.sport,
+                    .protocol = IPPROTO_TCP,
                     .ip_version = 4,
                 };
                 bpf_map_update_elem(loader->xdp.flow_cookie_map_fd,
