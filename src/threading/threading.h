@@ -58,7 +58,8 @@
 #include "../include/spliff.h"
 #include "../bpf/probe_handler.h"
 #include "../protocol/http2.h"  /* For h2_stream_state_t, frame types */
-#include "../correlation/flow_cache.h"  /* For flow_info_t, flow_cache_t */
+#include "../correlation/flow_cache.h"  /* For flow_info_t, flow_cache_t (legacy) */
+#include "../correlation/flow_context.h"  /* For flow_manager_t (Shared Pool) */
 
 /**
  * @defgroup threading_config Threading Configuration Constants
@@ -85,20 +86,32 @@
 /** @} */
 
 /**
- * @name Adaptive Wait Parameters
- * Three-tier wait strategy: spin -> yield -> sleep.
+ * @name NAPI-Style Adaptive Polling
+ * Budget-based loop: process events up to budget, then sleep if caught up.
+ * Zero CPU when idle (epoll blocks), zero syscall overhead under heavy load.
  * @{
  */
-#define SPIN_ITERATIONS         1000    /**< Busy-spin iterations (~1-2 us) */
-#define YIELD_ITERATIONS        10      /**< sched_yield iterations (~10-100 us) */
-#define POLL_TIMEOUT_MS         10      /**< epoll/poll timeout (ms) */
+#define NAPI_BUDGET             64      /**< Max events per loop iteration */
+#define EPOLL_TIMEOUT_MS        100     /**< Sleep timeout when caught up */
+#define EPOLL_RETRY_TIMEOUT_MS  1       /**< Short timeout when retries pending */
 /** @} */
 
 /**
- * @name Batch Processing
+ * @name Cookie Retry Queue
+ * Handles SSL-sockops timing race where SSL events arrive before XDP events
+ * populate the flow_cache. Uses bitmask for O(1) slot operations.
  * @{
  */
-#define BATCH_SIZE              32      /**< Events processed per batch */
+#define MAX_COOKIE_RETRIES      3       /**< Retry attempts before giving up */
+#define MAX_DEFERRED_EVENTS     64      /**< Fits in uint64_t bitmask */
+#define RETRY_TICK_INTERVAL     4       /**< Process retries every N iterations */
+/** @} */
+
+/**
+ * @name Output Batching
+ * @{
+ */
+#define BATCH_SIZE              32      /**< Output messages collected per iteration */
 /** @} */
 
 /**
@@ -299,9 +312,16 @@ typedef struct worker_event {
     uint32_t flow_hash;     /**< FNV-1a hash of (pid, ssl_ctx) */
     /** @} */
 
-    /** @name XDP Correlation */
+    /** @name XDP Correlation (Legacy) */
     /** @{ */
-    flow_info_t *flow_info; /**< Cached XDP flow data (may be NULL) */
+    flow_info_t *flow_info; /**< Legacy: Cached XDP flow data (may be NULL) */
+    bool needs_cookie_retry; /**< True if cookie lookup missed but retry possible */
+    /** @} */
+
+    /** @name Shared Pool Correlation (New Architecture) */
+    /** @{ */
+    flow_id_t flow_id;          /**< Flow ID in shared pool (FLOW_ID_INVALID if none) */
+    flow_context_t *flow_ctx;   /**< Resolved flow context (NULL until resolved) */
     /** @} */
 
     /** @name Payload */
@@ -333,6 +353,19 @@ typedef struct output_msg {
     size_t len;             /**< Length of formatted data */
     char data[OUTPUT_MSG_MAX_SIZE]; /**< Formatted output string */
 } output_msg_t;
+
+/**
+ * @brief Deferred event slot for cookie retry
+ *
+ * Uses flow identity (cookie + timestamp) to detect cache thrashing
+ * where a slot gets reused by a different flow before retry completes.
+ */
+typedef struct deferred_event {
+    worker_event_t *event;          /**< Deferred event pointer */
+    uint64_t original_cookie;       /**< Expected cookie for identity check */
+    uint64_t defer_time_ns;         /**< When event was deferred */
+    uint8_t retry_count;            /**< Number of retry attempts */
+} deferred_event_t;
 
 /** @} */ /* end threading_event group */
 
@@ -631,11 +664,17 @@ void worker_state_cleanup(worker_state_t *state);
  * - in_ring: Dispatcher enqueues events here (SPSC: single producer)
  * - out_ring: Worker enqueues formatted output (SPSC: single producer)
  *
- * @par Adaptive Wait Strategy:
- * Workers use a three-tier wait when input queue is empty:
- * 1. Spin: SPIN_ITERATIONS busy-loop (~1-2 us latency)
- * 2. Yield: YIELD_ITERATIONS sched_yield() (~10-100 us)
- * 3. Sleep: epoll_wait on wakeup_fd (~1-10 ms)
+ * @par NAPI-Style Adaptive Polling:
+ * Workers use a budget-based loop similar to Linux NAPI:
+ * - Process up to NAPI_BUDGET events per iteration
+ * - If work_done < budget: caught up, sleep via epoll_wait
+ * - If work_done == budget: heavy traffic, loop immediately
+ * This provides zero CPU when idle, zero syscall overhead under load.
+ *
+ * @par Cookie Retry Queue:
+ * Handles SSL-sockops timing race with bitmask-based deferred event queue.
+ * Events with valid socket_cookie but missing flow_info are deferred
+ * and retried after flow_cache is populated by XDP events.
  *
  * @par Memory Management:
  * - event_pool: Pre-allocated event objects (returned to pool after processing)
@@ -657,10 +696,21 @@ typedef struct worker_ctx {
     ck_ring_buffer_t *out_buffer;   /**< Ring buffer storage */
     /** @} */
 
-    /** @name Wake-up Signaling */
+    /** @name Wake-up Signaling (NAPI-style epoll) */
     /** @{ */
     int wakeup_fd;              /**< eventfd for sleep/wake coordination */
+    int epoll_fd;               /**< epoll fd for efficient blocking */
     _Atomic bool has_work;      /**< Fast-path check before sleeping */
+    /** @} */
+
+    /** @name Cookie Retry Queue (bitmask-based) */
+    /** @{ */
+    uint64_t deferred_busy_mask;    /**< Bit N = slot N is occupied */
+    deferred_event_t deferred_slots[MAX_DEFERRED_EVENTS]; /**< Fixed array */
+    uint64_t retry_tick;            /**< Global tick counter for batch retry */
+    _Atomic uint64_t deferred_count;     /**< Current deferred events */
+    _Atomic uint64_t deferred_successes; /**< Retry successes */
+    _Atomic uint64_t deferred_failures;  /**< Retry failures (gave up) */
     /** @} */
 
     /** Per-worker protocol state (HTTP/2, caches, buffers) */
@@ -676,6 +726,7 @@ typedef struct worker_ctx {
     /** @{ */
     _Atomic uint64_t events_processed;  /**< Total events handled */
     _Atomic uint64_t events_dropped;    /**< Events dropped (queue full) */
+    _Atomic uint64_t events_misrouted;  /**< Events for flows owned by another worker */
     _Atomic uint64_t spin_cycles;       /**< Time spent in spin wait */
     _Atomic uint64_t yield_cycles;      /**< Time spent in yield wait */
     _Atomic uint64_t sleep_cycles;      /**< Time spent sleeping */
@@ -789,9 +840,14 @@ typedef struct dispatcher_ctx {
     _Atomic uint64_t xdp_debug_samples;     /**< Debug sampling counter */
     /** @} */
 
-    /** @name XDP Flow Cache (for correlation with SSL events) */
+    /** @name XDP Flow Cache (legacy - for backward compatibility) */
     /** @{ */
-    flow_cache_t flow_cache;    /**< Socket cookie → flow info cache */
+    flow_cache_t flow_cache;    /**< Socket cookie → flow info cache (legacy) */
+    /** @} */
+
+    /** @name Shared Pool Flow Manager (new architecture) */
+    /** @{ */
+    flow_manager_t flow_mgr;    /**< Unified pool with dual indexes */
     /** @} */
 
     _Atomic bool running;       /**< false signals thread to exit */
@@ -1110,15 +1166,42 @@ static inline uint32_t flow_hash(uint32_t pid, uint64_t ssl_ctx) {
 }
 
 /**
- * @brief Get worker ID for a connection
+ * @brief Get worker ID for a connection using socket_cookie-first strategy
  *
- * Maps a (pid, ssl_ctx) pair to a worker index using flow affinity hash.
+ * Uses socket_cookie for sharding when available (preferred). This ensures
+ * XDP packets and SSL uprobe events for the same connection land on the
+ * same worker, enabling correlation without cross-thread synchronization.
  *
- * @param[in] pid         Process ID
- * @param[in] ssl_ctx     SSL context pointer
- * @param[in] num_workers Total number of workers
+ * Falls back to flow_hash(pid, ssl_ctx) when socket_cookie is unavailable
+ * (e.g., before sockops has cached the cookie, or for non-socket events).
+ *
+ * @par Research Reference:
+ * "Using (pid, ssl_ctx) for sharding is problematic because XDP packets
+ * have no knowledge of ssl_ctx address. By sharding on socket_cookie,
+ * you ensure all data for a flow—regardless of whether it's from XDP
+ * or a Uprobe—lands in the same worker's queue."
+ *
+ * @param[in] socket_cookie Socket cookie (0 if unavailable)
+ * @param[in] pid           Process ID (fallback)
+ * @param[in] ssl_ctx       SSL context pointer (fallback)
+ * @param[in] num_workers   Total number of workers
  *
  * @return Worker index (0 to num_workers-1)
+ */
+static inline int get_worker_id_ex(uint64_t socket_cookie, uint32_t pid,
+                                    uint64_t ssl_ctx, int num_workers) {
+    if (socket_cookie != 0) {
+        /* Preferred: use socket_cookie for XDP-SSL correlation */
+        return (int)(socket_cookie % (uint64_t)num_workers);
+    }
+    /* Fallback: use pid+ssl_ctx hash when cookie unavailable */
+    return flow_hash(pid, ssl_ctx) % num_workers;
+}
+
+/**
+ * @brief Legacy get_worker_id for backward compatibility
+ *
+ * @deprecated Use get_worker_id_ex() with socket_cookie for XDP correlation
  */
 static inline int get_worker_id(uint32_t pid, uint64_t ssl_ctx, int num_workers) {
     return flow_hash(pid, ssl_ctx) % num_workers;

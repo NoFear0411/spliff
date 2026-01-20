@@ -1,30 +1,46 @@
 /**
  * @file worker.c
- * @brief Worker thread implementation
+ * @brief Worker thread implementation with NAPI-style adaptive polling
  *
  * @details Each worker thread operates independently with isolated state:
  * - Receives events from dispatcher via lock-free CK ring
  * - Processes events (HTTP/1, HTTP/2 parsing) using per-worker state
  * - Sends formatted output to output thread via another CK ring
- * - Uses adaptive wait strategy for efficient CPU utilization
+ * - Uses NAPI-style budget-based polling for efficient CPU utilization
  *
- * @par Adaptive Wait Strategy:
+ * @par NAPI-Style Adaptive Polling:
  * @code
- *   ┌─────────┐    not found     ┌─────────┐    not found     ┌─────────┐
- *   │  Spin   │────────────────► │  Yield  │────────────────► │  Sleep  │
- *   │ ~1-2 μs │                  │ ~10-100 │                  │ ~1-10 ms│
- *   └────┬────┘                  │    μs   │                  └────┬────┘
- *        │ found                 └────┬────┘                       │ timeout
- *        ▼                            │ found                      │ or wake
- *   ┌─────────┐                       ▼                            ▼
- *   │ Process │◄──────────────────────┴────────────────────────────┘
- *   │  Event  │
- *   └─────────┘
+ *   while (running) {
+ *       work_done = 0;
+ *
+ *       // Process events up to budget
+ *       while (work_done < NAPI_BUDGET && can_dequeue()) {
+ *           process_event();
+ *           work_done++;
+ *       }
+ *
+ *       // Process deferred cookie retries
+ *       work_done += process_deferred_batch();
+ *
+ *       if (work_done < NAPI_BUDGET) {
+ *           // Caught up with traffic - sleep efficiently
+ *           epoll_wait(epoll_fd, events, 4, timeout);
+ *       }
+ *       // else: heavy traffic - loop immediately without sleeping
+ *   }
  * @endcode
  *
- * @par Thread-Local State:
- * Workers use get_current_worker_state() to access per-worker state
- * without function parameter passing throughout the protocol parsers.
+ * @par Benefits:
+ * - Zero CPU when idle (epoll blocks)
+ * - Zero syscall overhead under heavy load (never reaches epoll_wait)
+ * - Naturally adapts to traffic patterns
+ *
+ * @par Cookie Retry Queue:
+ * Handles SSL-sockops timing race where SSL events arrive before XDP events
+ * populate the flow_cache. Uses bitmask for O(1) slot operations:
+ * - __builtin_ctzll() finds first set/free bit in one CPU cycle
+ * - __builtin_popcountll() counts pending in one cycle
+ * - Fixed array with no pointer chasing, excellent cache locality
  *
  * @author spliff authors
  * @copyright 2025-2026 spliff authors
@@ -34,13 +50,15 @@
  */
 
 #include "threading.h"
+#include "../protocol/http1.h"
+#include "../protocol/http2.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sched.h>
-#include <poll.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <errno.h>
 
@@ -48,108 +66,200 @@
 extern void process_worker_event(worker_ctx_t *ctx, worker_event_t *event);
 
 /**
- * @defgroup worker_wait Adaptive Wait Strategy
- * @brief Three-phase wait with increasing latency and decreasing CPU usage
+ * @defgroup worker_epoll Epoll Setup
+ * @brief NAPI-style efficient blocking with epoll
  * @{
  */
 
 /**
- * @brief Phase 1: Spin-wait (lowest latency, highest CPU)
+ * @brief Initialize epoll for efficient blocking
  *
- * Spins for SPIN_ITERATIONS checking the queue. Uses architecture-specific
- * pause instructions to reduce power consumption and improve hyperthreading
- * efficiency on shared cores.
+ * Creates epoll instance and registers the wakeup eventfd.
+ * Workers block on epoll_wait when caught up with traffic.
  *
- * @param[in]  ctx   Worker context
- * @param[out] event Dequeued event if successful
+ * @param[in] ctx Worker context with wakeup_fd already initialized
  *
- * @return true if event dequeued, false if spin iterations exhausted
+ * @return 0 on success, -1 on failure
  */
-static inline bool try_spin_dequeue(worker_ctx_t *ctx, worker_event_t **event) {
-    for (int i = 0; i < SPIN_ITERATIONS; i++) {
-        if (ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, event)) {
-            return true;
-        }
-        /* CPU hint to reduce power and help hyperthreading */
-#if defined(__x86_64__) || defined(__i386__)
-        __builtin_ia32_pause();
-#elif defined(__aarch64__)
-        __asm__ volatile("yield" ::: "memory");
-#endif
+static int worker_init_epoll(worker_ctx_t *ctx) {
+    ctx->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (ctx->epoll_fd < 0) {
+        fprintf(stderr, "Worker %d: failed to create epoll: %s\n",
+                ctx->worker_id, strerror(errno));
+        return -1;
     }
-    atomic_fetch_add(&ctx->spin_cycles, SPIN_ITERATIONS);
-    return false;
-}
 
-/**
- * @brief Phase 2: Yield to other threads
- *
- * Gives up CPU time slice via sched_yield() for YIELD_ITERATIONS,
- * checking the queue after each yield. More efficient than spinning
- * when queue is likely empty for a longer period.
- *
- * @param[in]  ctx   Worker context
- * @param[out] event Dequeued event if successful
- *
- * @return true if event dequeued, false if yield iterations exhausted
- */
-static inline bool try_yield_dequeue(worker_ctx_t *ctx, worker_event_t **event) {
-    for (int i = 0; i < YIELD_ITERATIONS; i++) {
-        sched_yield();
-        if (ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, event)) {
-            return true;
-        }
-    }
-    atomic_fetch_add(&ctx->yield_cycles, YIELD_ITERATIONS);
-    return false;
-}
-
-/**
- * @brief Phase 3: Sleep on eventfd (minimal CPU)
- *
- * Blocks on poll() until dispatcher signals new work via eventfd write,
- * or POLL_TIMEOUT_MS expires. This is the most CPU-efficient wait but
- * has highest latency (~1-10ms depending on kernel scheduling).
- *
- * @par Race Condition Prevention:
- * Clears has_work flag before final queue check to ensure:
- * 1. If dispatcher enqueues after our check but before sleep, it will
- *    write to eventfd (because has_work is false)
- * 2. We wake up and find the event
- *
- * @param[in]  ctx   Worker context
- * @param[out] event Dequeued event if successful
- *
- * @return true if event dequeued, false if timeout with empty queue
- */
-static inline bool try_sleep_dequeue(worker_ctx_t *ctx, worker_event_t **event) {
-    struct pollfd pfd = {
-        .fd = ctx->wakeup_fd,
-        .events = POLLIN
+    struct epoll_event ev = {
+        .events = EPOLLIN,
+        .data.fd = ctx->wakeup_fd
     };
 
-    /* Clear has_work flag before final check and sleep */
-    atomic_store(&ctx->has_work, false);
-
-    /* Final check before sleeping (avoid race) */
-    if (ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, event)) {
-        return true;
+    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->wakeup_fd, &ev) < 0) {
+        fprintf(stderr, "Worker %d: failed to add eventfd to epoll: %s\n",
+                ctx->worker_id, strerror(errno));
+        close(ctx->epoll_fd);
+        ctx->epoll_fd = -1;
+        return -1;
     }
 
-    /* Sleep until woken or timeout */
-    int ret = poll(&pfd, 1, POLL_TIMEOUT_MS);
-    if (ret > 0) {
-        /* Drain eventfd */
-        uint64_t val;
-        ssize_t n = read(ctx->wakeup_fd, &val, sizeof(val));
-        (void)n;  /* Ignore read result */
-    }
-
-    atomic_fetch_add(&ctx->sleep_cycles, 1);
-    return ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, event);
+    return 0;
 }
 
-/** @} */ /* end worker_wait */
+/**
+ * @brief Cleanup epoll resources
+ *
+ * @param[in] ctx Worker context
+ */
+static void worker_cleanup_epoll(worker_ctx_t *ctx) {
+    if (ctx->epoll_fd >= 0) {
+        close(ctx->epoll_fd);
+        ctx->epoll_fd = -1;
+    }
+}
+
+/**
+ * @brief Drain eventfd to clear pending wakeup
+ *
+ * @param[in] fd eventfd file descriptor
+ */
+static inline void drain_eventfd(int fd) {
+    uint64_t val;
+    ssize_t n = read(fd, &val, sizeof(val));
+    (void)n;  /* Ignore read result */
+}
+
+/** @} */ /* end worker_epoll */
+
+/**
+ * @defgroup worker_retry Cookie Retry Queue
+ * @brief Bitmask-based deferred event queue for timing race handling
+ * @{
+ */
+
+/**
+ * @brief Defer event for cookie retry
+ *
+ * When an SSL event has a valid socket_cookie but flow_cache_lookup returns
+ * NULL (XDP event not yet processed), defer the event for later retry.
+ *
+ * Uses bitmask for O(1) slot allocation:
+ * - __builtin_ctzll() finds first zero bit (free slot) in one cycle
+ *
+ * @param[in] ctx   Worker context
+ * @param[in] event Event to defer (ownership transferred to queue)
+ *
+ * @return 0 on success, -1 if all 64 slots are full
+ */
+static int defer_event_for_retry(worker_ctx_t *ctx, worker_event_t *event) {
+    uint64_t free_mask = ~ctx->deferred_busy_mask;
+    if (free_mask == 0) {
+        /* All 64 slots full - process without flow_info */
+        atomic_fetch_add(&ctx->deferred_failures, 1);
+        return -1;
+    }
+
+    /* Find first free slot - O(1) with compiler intrinsic */
+    int slot = __builtin_ctzll(free_mask);
+    ctx->deferred_busy_mask |= (1ULL << slot);
+
+    /* Store event with identity for cache thrashing detection */
+    ctx->deferred_slots[slot].event = event;
+    ctx->deferred_slots[slot].original_cookie = event->socket_cookie;
+    ctx->deferred_slots[slot].defer_time_ns = get_time_ns();
+    ctx->deferred_slots[slot].retry_count = 0;
+
+    atomic_fetch_add(&ctx->deferred_count, 1);
+    return 0;
+}
+
+/**
+ * @brief Process all pending retries in one batch
+ *
+ * Called once per NAPI loop iteration. Better cache locality than
+ * individual timers per event. Processes events with tick-based interval
+ * to allow flow_cache to be populated by XDP events.
+ *
+ * @par Identity Check:
+ * Before correlating, verifies the flow_cache entry still belongs to
+ * the same socket_cookie. This detects cache thrashing where a slot
+ * was evicted and reused by a different flow.
+ *
+ * @param[in] ctx Worker context
+ *
+ * @return Number of events processed (completed or gave up)
+ */
+static int process_deferred_batch(worker_ctx_t *ctx) {
+    ctx->retry_tick++;
+
+    /* Only retry every N ticks (controls retry interval ~500μs under load) */
+    if ((ctx->retry_tick % RETRY_TICK_INTERVAL) != 0) {
+        return 0;
+    }
+
+    int processed = 0;
+    uint64_t mask = ctx->deferred_busy_mask;
+
+    while (mask) {
+        /* Find first set bit (occupied slot) - O(1) */
+        int slot = __builtin_ctzll(mask);
+        mask &= ~(1ULL << slot);  /* Clear bit for iteration */
+
+        deferred_event_t *def = &ctx->deferred_slots[slot];
+        worker_event_t *event = def->event;
+
+        /* Retry lookup in both legacy cache and Shared Pool */
+        threading_mgr_t *mgr = threading_get_manager();
+        if (mgr && event->socket_cookie != 0) {
+            /* Legacy: lookup in flow_cache */
+            flow_info_t *info = flow_cache_lookup(
+                &mgr->dispatcher.flow_cache, event->socket_cookie);
+
+            /* Identity check: verify same flow, not reused cache slot */
+            if (info && info->socket_cookie == def->original_cookie) {
+                event->flow_info = info;
+            }
+
+            /* Shared Pool: lookup by cookie or (pid, ssl_ctx) */
+            flow_context_t *flow_ctx = flow_lookup(&mgr->dispatcher.flow_mgr,
+                                                    event->socket_cookie,
+                                                    event->pid,
+                                                    event->ssl_ctx);
+            if (flow_ctx) {
+                event->flow_id = flow_ctx->self_id;
+                event->flow_ctx = flow_ctx;
+            }
+        }
+
+        def->retry_count++;
+
+        /* Success if either legacy flow_info OR new flow_ctx found */
+        bool correlation_success = (event->flow_info != NULL) ||
+                                    (event->flow_ctx != NULL);
+
+        if (correlation_success) {
+            /* Success! Clear slot and process */
+            ctx->deferred_busy_mask &= ~(1ULL << slot);
+            atomic_fetch_sub(&ctx->deferred_count, 1);
+            atomic_fetch_add(&ctx->deferred_successes, 1);
+            process_worker_event(ctx, event);
+            pool_free(&ctx->event_pool, event);
+            processed++;
+        } else if (def->retry_count >= MAX_COOKIE_RETRIES) {
+            /* Give up - clear slot and process without flow_info */
+            ctx->deferred_busy_mask &= ~(1ULL << slot);
+            atomic_fetch_sub(&ctx->deferred_count, 1);
+            atomic_fetch_add(&ctx->deferred_failures, 1);
+            process_worker_event(ctx, event);  /* Process without network metadata */
+            pool_free(&ctx->event_pool, event);
+            processed++;
+        }
+        /* else: stays in queue for next batch */
+    }
+
+    return processed;
+}
+
+/** @} */ /* end worker_retry */
 
 /**
  * @defgroup worker_init Worker Initialization
@@ -162,11 +272,13 @@ static inline bool try_sleep_dequeue(worker_ctx_t *ctx, worker_event_t **event) 
  *
  * Allocates and initializes all resources for a worker thread:
  * - eventfd for wakeup signaling
+ * - epoll for efficient blocking
  * - Input ring buffer (dispatcher -> worker)
  * - Output ring buffer (worker -> output thread)
  * - Event object pool
  * - Output message object pool
  * - Per-worker protocol state
+ * - Deferred event queue (cookie retry)
  *
  * @par Memory Alignment:
  * Ring buffers are 64-byte aligned for cache efficiency.
@@ -183,12 +295,19 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->worker_id = worker_id;
+    ctx->epoll_fd = -1;
 
     /* Create eventfd for wakeup signaling */
     ctx->wakeup_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (ctx->wakeup_fd < 0) {
         fprintf(stderr, "Worker %d: failed to create eventfd: %s\n",
                 worker_id, strerror(errno));
+        return -1;
+    }
+
+    /* Initialize epoll for NAPI-style blocking */
+    if (worker_init_epoll(ctx) != 0) {
+        close(ctx->wakeup_fd);
         return -1;
     }
 
@@ -199,6 +318,7 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
     ctx->in_buffer = aligned_alloc(64, in_buf_size);
     if (!ctx->in_buffer) {
         fprintf(stderr, "Worker %d: failed to allocate input ring\n", worker_id);
+        worker_cleanup_epoll(ctx);
         close(ctx->wakeup_fd);
         return -1;
     }
@@ -211,6 +331,7 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
     if (!ctx->out_buffer) {
         fprintf(stderr, "Worker %d: failed to allocate output ring\n", worker_id);
         free(ctx->in_buffer);
+        worker_cleanup_epoll(ctx);
         close(ctx->wakeup_fd);
         return -1;
     }
@@ -221,6 +342,7 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
         fprintf(stderr, "Worker %d: failed to init event pool\n", worker_id);
         free(ctx->out_buffer);
         free(ctx->in_buffer);
+        worker_cleanup_epoll(ctx);
         close(ctx->wakeup_fd);
         return -1;
     }
@@ -231,6 +353,7 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
         pool_destroy(&ctx->event_pool);
         free(ctx->out_buffer);
         free(ctx->in_buffer);
+        worker_cleanup_epoll(ctx);
         close(ctx->wakeup_fd);
         return -1;
     }
@@ -242,18 +365,27 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
         pool_destroy(&ctx->event_pool);
         free(ctx->out_buffer);
         free(ctx->in_buffer);
+        worker_cleanup_epoll(ctx);
         close(ctx->wakeup_fd);
         return -1;
     }
 
+    /* Initialize deferred event queue (cookie retry) */
+    ctx->deferred_busy_mask = 0;
+    ctx->retry_tick = 0;
+    memset(ctx->deferred_slots, 0, sizeof(ctx->deferred_slots));
+
     /* Initialize atomics */
     atomic_store(&ctx->events_processed, 0);
     atomic_store(&ctx->events_dropped, 0);
-    atomic_store(&ctx->spin_cycles, 0);
-    atomic_store(&ctx->yield_cycles, 0);
+    atomic_store(&ctx->spin_cycles, 0);    /* Unused in NAPI mode, kept for stats compat */
+    atomic_store(&ctx->yield_cycles, 0);   /* Unused in NAPI mode, kept for stats compat */
     atomic_store(&ctx->sleep_cycles, 0);
     atomic_store(&ctx->has_work, false);
     atomic_store(&ctx->running, false);
+    atomic_store(&ctx->deferred_count, 0);
+    atomic_store(&ctx->deferred_successes, 0);
+    atomic_store(&ctx->deferred_failures, 0);
 
     return 0;
 }
@@ -261,7 +393,7 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
 /**
  * @brief Cleanup worker context and free all resources
  *
- * Frees per-worker state, pools, ring buffers, and eventfd.
+ * Frees per-worker state, pools, ring buffers, epoll, and eventfd.
  * Should only be called after worker thread has exited.
  */
 void worker_cleanup(worker_ctx_t *ctx) {
@@ -286,6 +418,9 @@ void worker_cleanup(worker_ctx_t *ctx) {
         ctx->in_buffer = NULL;
     }
 
+    /* Cleanup epoll */
+    worker_cleanup_epoll(ctx);
+
     /* Close eventfd */
     if (ctx->wakeup_fd >= 0) {
         close(ctx->wakeup_fd);
@@ -297,7 +432,7 @@ void worker_cleanup(worker_ctx_t *ctx) {
 
 /**
  * @defgroup worker_loop Worker Main Loop
- * @brief Event processing loop implementation
+ * @brief NAPI-style event processing loop implementation
  * @{
  */
 
@@ -306,6 +441,8 @@ void worker_cleanup(worker_ctx_t *ctx) {
  *
  * Called during shutdown to process any events queued after the
  * running flag was cleared. Ensures no events are lost.
+ *
+ * @param[in] ctx Worker context
  */
 static void worker_drain_queues(worker_ctx_t *ctx) {
     worker_event_t *event;
@@ -318,44 +455,186 @@ static void worker_drain_queues(worker_ctx_t *ctx) {
         atomic_fetch_add(&ctx->events_processed, 1);
     }
 
+    /* Also drain deferred events */
+    uint64_t mask = ctx->deferred_busy_mask;
+    while (mask) {
+        int slot = __builtin_ctzll(mask);
+        mask &= ~(1ULL << slot);
+        ctx->deferred_busy_mask &= ~(1ULL << slot);
+
+        deferred_event_t *def = &ctx->deferred_slots[slot];
+        process_worker_event(ctx, def->event);
+        pool_free(&ctx->event_pool, def->event);
+        drained++;
+        atomic_fetch_add(&ctx->events_processed, 1);
+    }
+
     if (drained > 0) {
         fprintf(stderr, "  Worker %d drained %d events\n", ctx->worker_id, drained);
     }
 }
 
 /**
- * @brief Main worker processing loop
+ * @brief NAPI-style main worker processing loop
  *
- * Continuously dequeues and processes events until running flag is cleared.
- * Uses adaptive wait strategy and batch processing for efficiency.
+ * Uses budget-based polling similar to Linux NAPI:
+ * - Process up to NAPI_BUDGET events per iteration
+ * - If work_done < budget: caught up, sleep via epoll_wait
+ * - If work_done == budget: heavy traffic, loop immediately
  *
- * @par Batch Processing:
- * After successfully dequeuing one event (potentially after wait), attempts
- * to dequeue up to BATCH_SIZE additional events without waiting. This
- * amortizes wait overhead when events arrive in bursts.
+ * @par CPU Efficiency:
+ * - Zero CPU when idle (epoll_wait blocks)
+ * - Zero syscall overhead under heavy load (never reaches epoll_wait)
+ *
+ * @par Cookie Retry Integration:
+ * Events with valid socket_cookie but NULL flow_info are deferred
+ * to the retry queue. The queue is processed on each iteration.
+ *
+ * @param[in] ctx Worker context
  */
 static void worker_loop(worker_ctx_t *ctx) {
-    while (atomic_load(&ctx->running)) {
-        worker_event_t *event = NULL;
+    struct epoll_event events[4];
 
-        /* Adaptive wait: spin -> yield -> sleep */
-        if (!try_spin_dequeue(ctx, &event)) {
-            if (!try_yield_dequeue(ctx, &event)) {
-                if (!try_sleep_dequeue(ctx, &event)) {
+    while (atomic_load(&ctx->running)) {
+        int work_done = 0;
+        worker_event_t *event;
+
+        /* Process events up to NAPI budget */
+        while (work_done < NAPI_BUDGET &&
+               ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, &event)) {
+
+            /* Check if cookie retry needed */
+            if (event->needs_cookie_retry && event->flow_info == NULL) {
+                if (defer_event_for_retry(ctx, event) == 0) {
+                    /* Successfully deferred - don't count against budget */
                     continue;
                 }
+                /* Queue full - fall through to process immediately */
             }
-        }
 
-        /* Process event and batch more if available */
-        int processed = 0;
-        do {
+            /*
+             * === Worker Affinity: Claim or Route ===
+             *
+             * Implements "Hybrid Sticky" architecture for thread-safe
+             * HTTP/2 state without locking. First worker to process
+             * an event claims ownership via atomic CAS.
+             */
+            if (event->flow_ctx) {
+                uint32_t expected = WORKER_ID_NONE;
+                uint32_t my_id = ctx->worker_id;
+
+                /* Try to claim ownership */
+                if (atomic_compare_exchange_strong(&event->flow_ctx->home_worker_id,
+                                                    &expected, my_id)) {
+                    /*
+                     * Successfully claimed - we are the home worker.
+                     * Initialize protocol-specific state that requires
+                     * single-writer ownership (e.g., HTTP/2 nghttp2 session).
+                     */
+                    if (g_config.debug_mode) {
+                        fprintf(stderr, "[Worker %u] Claimed flow_id=%u proto=%d\n",
+                                my_id, event->flow_ctx->self_id,
+                                event->flow_ctx->proto);
+                    }
+
+                    /*
+                     * Protocol Parser Initialization
+                     *
+                     * Initialize protocol-specific parser state when home worker
+                     * first claims the flow. This ensures single-writer ownership
+                     * of parser state.
+                     */
+                    switch (event->flow_ctx->proto) {
+                    case FLOW_PROTO_HTTP2:
+                        /*
+                         * HTTP/2: Create nghttp2 session
+                         *
+                         * Note: Currently passing NULL for user_data since the existing
+                         * callbacks expect h2_callback_ctx_t with global pool references.
+                         * This will be updated when callbacks are migrated to flow-based
+                         * processing (see SHARED_POOL_ARCHITECTURE.md Phase 3.3).
+                         */
+                        if (event->flow_ctx->parser.h2.session == NULL) {
+                            nghttp2_session_callbacks *cbs = http2_get_callbacks();
+                            if (cbs) {
+                                int rv = flow_h2_session_init(event->flow_ctx, cbs, NULL);
+                                if (rv == 0 && g_config.debug_mode) {
+                                    fprintf(stderr, "[Worker %u] Initialized H2 session for flow_id=%u\n",
+                                            my_id, event->flow_ctx->self_id);
+                                }
+                            }
+                        }
+                        break;
+
+                    case FLOW_PROTO_HTTP1:
+                        /*
+                         * HTTP/1: Initialize llhttp parser with global callbacks
+                         *
+                         * Note: Currently the callbacks use parse_context_t which is
+                         * created fresh per http1_parse() call. The flow-based parser
+                         * will be used when parsing migration is complete.
+                         */
+                        if (!event->flow_ctx->parser.h1.initialized) {
+                            llhttp_settings_t *settings = http1_get_settings();
+                            int rv = flow_h1_parser_init(event->flow_ctx, settings);
+                            if (rv == 0 && g_config.debug_mode) {
+                                fprintf(stderr, "[Worker %u] Initialized H1 parser for flow_id=%u\n",
+                                        my_id, event->flow_ctx->self_id);
+                            }
+                        }
+                        break;
+
+                    default:
+                        /* FLOW_PROTO_UNKNOWN or FLOW_PROTO_OTHER - no parser to init */
+                        break;
+                    }
+                } else {
+                    /* Flow already owned - check if we are the owner */
+                    uint32_t home = atomic_load(&event->flow_ctx->home_worker_id);
+                    if (home != my_id && home != WORKER_ID_NONE) {
+                        /*
+                         * Misrouted event: we are not the home worker.
+                         * TODO: Implement forwarding to worker 'home'.
+                         * For now, process locally but log the mismatch.
+                         */
+                        atomic_fetch_add(&ctx->events_misrouted, 1);
+                        if (g_config.debug_mode) {
+                            fprintf(stderr, "[Worker %u] Misrouted event for flow_id=%u "
+                                    "(home=%u) - processing locally\n",
+                                    my_id, event->flow_ctx->self_id, home);
+                        }
+                    }
+                }
+            }
+
             process_worker_event(ctx, event);
             pool_free(&ctx->event_pool, event);
-            processed++;
-            atomic_fetch_add(&ctx->events_processed, 1);
-        } while (processed < BATCH_SIZE &&
-                 ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, &event));
+            work_done++;
+        }
+
+        /* Process deferred events ready for retry */
+        work_done += process_deferred_batch(ctx);
+
+        /* Update events processed counter */
+        if (work_done > 0) {
+            atomic_fetch_add(&ctx->events_processed, work_done);
+        }
+
+        /* NAPI decision: sleep only if caught up with traffic */
+        if (work_done < NAPI_BUDGET) {
+            /* Select timeout based on queue state */
+            int timeout = (atomic_load(&ctx->deferred_count) > 0)
+                         ? EPOLL_RETRY_TIMEOUT_MS   /* Short timeout for fast retry */
+                         : EPOLL_TIMEOUT_MS;        /* Normal timeout when idle */
+
+            int n = epoll_wait(ctx->epoll_fd, events, 4, timeout);
+            if (n > 0) {
+                drain_eventfd(ctx->wakeup_fd);
+                atomic_store(&ctx->has_work, false);
+            }
+            atomic_fetch_add(&ctx->sleep_cycles, 1);
+        }
+        /* else: heavy traffic - loop immediately without sleeping */
     }
 }
 

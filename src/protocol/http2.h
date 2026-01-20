@@ -232,6 +232,19 @@ typedef struct {
 int http2_init(void);
 
 /**
+ * @brief Get the global nghttp2 session callbacks
+ *
+ * Returns a pointer to the shared nghttp2 callbacks structure,
+ * allowing flow-based HTTP/2 sessions to use the same callback
+ * functions as the global session pool.
+ *
+ * @note http2_init() must be called first
+ *
+ * @return Pointer to callbacks, or NULL if not initialized
+ */
+struct nghttp2_session_callbacks *http2_get_callbacks(void);
+
+/**
  * @brief Clean up HTTP/2 parser resources
  *
  * Frees all sessions, streams, and nghttp2 resources.
@@ -279,6 +292,27 @@ bool http2_is_preface(const uint8_t *data, size_t len);
  * @note Creates session if needed; handles mid-stream joins
  */
 void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *event);
+
+/* Forward declaration for flow_context_t */
+struct flow_context;
+
+/**
+ * @brief Process HTTP/2 data with flow context (Phase 3.6)
+ *
+ * Flow-aware version that uses flow_context_t for stream storage.
+ * Populates both the legacy global pools AND flow_transaction_t
+ * for gradual migration.
+ *
+ * @param[in] data     Raw HTTP/2 frame data
+ * @param[in] len      Length of frame data
+ * @param[in] event    BPF event with connection context
+ * @param[in] flow_ctx Flow context with embedded stream storage (may be NULL)
+ *
+ * @note When flow_ctx is NULL, behaves identically to http2_process_frame()
+ */
+void http2_process_frame_flow(const uint8_t *data, int len,
+                              const ssl_data_event_t *event,
+                              struct flow_context *flow_ctx);
 
 /**
  * @brief Check if connection has active HTTP/2 session

@@ -58,6 +58,19 @@
 int http1_init(void);
 
 /**
+ * @brief Get the global llhttp settings with callbacks
+ *
+ * Returns a pointer to the shared llhttp_settings_t structure
+ * that contains all configured callbacks. This allows flow-based
+ * HTTP/1 parsers to use the same callback functions.
+ *
+ * @note http1_init() must be called first
+ *
+ * @return Pointer to settings, or NULL if not initialized
+ */
+struct llhttp_settings_s *http1_get_settings(void);
+
+/**
  * @brief Clean up HTTP/1.1 parser resources
  *
  * Releases any resources allocated by the parser system.

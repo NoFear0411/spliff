@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(spliff
-    VERSION 0.9.1
+    VERSION 0.9.2
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C
@@ -365,8 +365,9 @@ set(SPLIFF_SOURCES
     src/bpf/binary_scanner.c
     src/bpf/probe_handler.c
     src/output/display.c
-    # Correlation (XDP flow cache)
+    # Correlation (XDP flow cache and unified flow context)
     src/correlation/flow_cache.c
+    src/correlation/flow_context.c
     # Threading sources (required)
     src/threading/pool.c
     src/threading/state.c

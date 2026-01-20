@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.9.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.2-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -20,10 +20,18 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **WolfSSL**: `wolfSSL_read`, `wolfSSL_write`
 
 ### HTTP Protocol Support
-| Protocol | Parser | Features |
-|----------|--------|----------|
-| HTTP/1.1 | llhttp | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
-| HTTP/2 | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
+| Protocol | Parser  | Features |
+|----------|---------|----------|
+| HTTP/1.1 | llhttp  | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
+| HTTP/2   | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
+
+### Shared Pool Architecture (v0.9.2+)
+- **Unified Flow Context**: Pre-allocated pool of 8192 flow slots with dual-index lookup
+- **Zero-Copy Correlation**: Socket cookie index + shadow index (pid, ssl_ctx) for O(1) lookup
+- **Per-Flow HTTP/2 Streams**: 64-stream pool per flow with O(1) free-list allocation
+- **Worker Affinity**: Atomic CAS claim ensures single-writer guarantee per flow
+- **HPACK Corruption Detection**: Connection-fatal flag per RFC 7540 Section 4.3
+- **Ghost Stream Reaping**: 10-second timeout for idle stream cleanup
 
 ### Dynamic Process Monitoring (v0.9.0+)
 - **EDR-Style Process Scanning**: Discovers SSL libraries in running processes via `/proc/PID/maps`
@@ -79,19 +87,25 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | llhttp | HTTP/1.1 parsing | llhttp-devel | libllhttp-dev |
 | nghttp2 | HTTP/2 parsing | nghttp2-devel | libnghttp2-dev |
 | ck | Lock-free data structures | ck-devel | libck-dev |
-| zstd | zstd decompression (optional) | libzstd-devel | libzstd-dev |
-| brotli | brotli decompression (optional) | brotli-devel | libbrotli-dev |
+| libxdp | XDP program loading | libxdp-devel | libxdp-dev |
+| liburcu | Read-Copy-Update | userspace-rcu-devel | liburcu-dev |
+| jemalloc | Memory allocator | jemalloc-devel | libjemalloc-dev |
+| pcre2 | Pattern matching | pcre2-devel | libpcre2-dev |
+| zstd | zstd decompression | libzstd-devel | libzstd-dev |
+| brotli | brotli decompression | brotli-devel | libbrotli-dev |
 
 ### Quick Install (Fedora)
 ```bash
 sudo dnf install libbpf-devel elfutils-libelf-devel zlib-devel \
-    llhttp-devel nghttp2-devel ck-devel libzstd-devel brotli-devel clang
+    llhttp-devel nghttp2-devel ck-devel libxdp-devel userspace-rcu-devel \
+    jemalloc-devel pcre2-devel libzstd-devel brotli-devel clang
 ```
 
 ### Quick Install (Debian/Ubuntu)
 ```bash
 sudo apt install libbpf-dev libelf-dev zlib1g-dev \
-    libllhttp-dev libnghttp2-dev libck-dev libzstd-dev libbrotli-dev clang
+    libllhttp-dev libnghttp2-dev libck-dev libxdp-dev liburcu-dev \
+    libjemalloc-dev libpcre2-dev libzstd-dev libbrotli-dev clang
 ```
 
 ## Installation
@@ -268,24 +282,32 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │  │                          │    "Golden Thread" Correlation                         │    │
 │  │                          │    (socket cookie links all three)                     │    │
 │  │                          ▼                                                        │    │
-│  │  ┌─────────────────────────┐                                                      │    │
-│  │  │   Dispatcher Thread     │ ◄─── Connection affinity: hash(pid, ssl_ctx)         │    │
-│  │  │   • Event routing       │      Routes same connection to same worker           │    │
-│  │  │   • Dynamic probe mgmt  │                                                      │    │
-│  │  └───────────┬─────────────┘                                                      │    │
-│  │              │                                                                    │    │
+│  │  ┌───────────────────────────────────────────────────────────────────────────┐    │    │
+│  │  │   Dispatcher Thread                                                       │    │    │
+│  │  │   ┌─────────────────────────────────────────────────────────────────────┐ │    │    │
+│  │  │   │  flow_pool (8192 slots)     cookie_index     shadow_index           │ │    │    │
+│  │  │   │  [ctx][ctx][ctx]...         cookie → id      (pid,ssl) → id         │ │    │    │
+│  │  │   └─────────────────────────────────────────────────────────────────────┘ │    │    │
+│  │  │   • Dual-index lookup: cookie_index (fast) or shadow_index (fallback)     │    │    │
+│  │  │   • flow_get_or_create() allocates slot, flow_promote_cookie() on link    │    │    │
+│  │  │   • Connection affinity: hash(pid, ssl_ctx) routes to consistent worker   │    │    │
+│  │  └───────────┬───────────────────────────────────────────────────────────────┘    │    │
+│  │              │ event + flow_context_t*                                            │    │
 │  │      ┌───────┼───────┬───────────────┐                                            │    │
 │  │      ▼       ▼       ▼               ▼                                            │    │
 │  │  ┌───────┐┌───────┐┌───────┐    ┌───────┐   Lock-free SPSC queues                 │    │
 │  │  │Worker0││Worker1││Worker2│... │WorkerN│   (Concurrency Kit)                     │    │
 │  │  ├───────┤├───────┤├───────┤    ├───────┤                                         │    │
-│  │  │HTTP/1 ││HTTP/2 ││HTTP/1 │    │HTTP/2 │   Per-worker isolated state:            │    │
-│  │  │HTTP/2 ││HTTP/1 ││HTTP/2 │    │HTTP/1 │   • HPACK decompressor                  │    │
-│  │  │llhttp ││nghttp2││llhttp │    │nghttp2│   • ALPN cache                          │    │
-│  │  │nghttp2││llhttp ││nghttp2│    │llhttp │   • Pending body buffers                │    │
-│  │  └───┬───┘└───┬───┘└───┬───┘    └───┬───┘   • Stream tracking                     │    │
+│  │  │ Claim ││ Claim ││ Claim │    │ Claim │   Worker claims flow via atomic CAS     │    │
+│  │  │ flow  ││ flow  ││ flow  │    │ flow  │   on home_worker_id (single-writer)     │    │
+│  │  └───┬───┘└───┬───┘└───┬───┘    └───┬───┘                                         │    │
 │  │      │        │        │            │                                             │    │
 │  │      └────────┴────────┴─────┬──────┘                                             │    │
+│  │                              │        Per-FLOW state (flow_context_t):            │    │
+│  │                              │        • nghttp2 session + HPACK inflater          │    │
+│  │                              │        • streams[64] with O(1) free-list           │    │
+│  │                              │        • llhttp parser + current transaction       │    │
+│  │                              │        • ALPN, body buffers, hpack_corrupted       │    │
 │  │                              ▼                                                    │    │
 │  │              ┌───────────────────────────┐                                        │    │
 │  │              │      Output Thread        │  Serialized stdout/file                │    │
@@ -377,22 +399,57 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │ • Protocol ID │   │ • Cookie gen  │   │ • ALPN proto  │
 └───────┬───────┘   └───────┬───────┘   └───────┬───────┘
         │                   │                   │
-        │  flow_cookie_map  │                   │  ssl_to_fd map
-        │  (5-tuple→cookie) │                   │  (SSL*→fd→cookie)
         │                   │                   │
-        └───────────────────┴───────────────────┘
-                            │
-                            ▼
-              ┌─────────────────────────────┐
-              │   UNIFIED PER-FLOW VIEW     │
-              │                             │
-              │  Packet  +  Socket  +  TLS  │
-              │  metadata   state    data   │
-              │                             │
-              │  → Complete L7 visibility   │
-              │  → PID + process name       │
-              │  → Request/response corr.   │
-              └─────────────────────────────┘
+════════╪═══════════════════╪═══════════════════╪════════════════
+        │    KERNEL SPACE   │                   │
+────────┼───────────────────┼───────────────────┼────────────────
+        │    USER SPACE     │                   │
+        │                   │                   │
+        │  ┌────────────────┴───────────────────┴──────────┐
+        │  │           BPF RING BUFFERS                    │
+        │  │  ssl_events    xdp_events    process_events   │
+        │  └────────────────────┬──────────────────────────┘
+        │                       │
+        │                       ▼
+        │  ┌────────────────────────────────────────────────────┐
+        │  │              DISPATCHER THREAD                     │
+        │  │                                                    │
+        │  │  ┌──────────────────────────────────────────────┐  │
+        │  │  │              DUAL-INDEX LOOKUP               │  │
+        │  │  │                                              │  │
+        │  │  │  1. cookie_index: cookie → flow_id (fast)    │  │
+        │  │  │  2. shadow_index: (pid,ssl_ctx) → flow_id    │  │
+        │  │  │                                              │  │
+        └──┼──┼──► flow_promote_cookie() links cookie later  │  │
+           │  └──────────────────────────────────────────────┘  │
+           │                       │                            │
+           │                       ▼                            │
+           │  ┌──────────────────────────────────────────────┐  │
+           │  │           flow_pool (8192 slots)             │  │
+           │  │  ┌────────────────────────────────────────┐  │  │
+           │  │  │           flow_context_t               │  │  │
+           │  │  │  • socket_cookie, pid, ssl_ctx         │  │  │
+           │  │  │  • home_worker_id (atomic ownership)   │  │  │
+           │  │  │  • parser.h2 (nghttp2 + streams[64])   │  │  │
+           │  │  │  • parser.h1 (llhttp + transaction)    │  │  │
+           │  │  │  • alpn, last_activity_ms              │  │  │
+           │  │  └────────────────────────────────────────┘  │  │
+           │  └──────────────────────────────────────────────┘  │
+           └────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                    ┌─────────────────────────────┐
+                    │   UNIFIED PER-FLOW VIEW     │
+                    │                             │
+                    │  Packet  +  Socket  +  TLS  │
+                    │  metadata   state    data   │
+                    │                             │
+                    │  → Complete L7 visibility   │
+                    │  → PID + process name       │
+                    │  → Request/response corr.   │
+                    │  → Per-flow HTTP/2 streams  │
+                    │  → Single-writer guarantee  │
+                    └─────────────────────────────┘
 ```
 
 **Why this matters:** Commercial EDRs typically only see packets OR decrypted TLS, not both
@@ -400,16 +457,74 @@ correlated to the same flow. The socket cookie is the "golden thread" that ties 
 data sources together, giving spliff complete visibility into what data went over which
 connection from which process.
 
+### Shared Pool Architecture (v0.9.2+)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    SHARED POOL ARCHITECTURE                          │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │           flow_pool (8192 pre-allocated slots)                 │  │
+│  │  ┌──────────┬──────────┬──────────┬──────────┬──────────┐      │  │
+│  │  │ slot[0]  │ slot[1]  │ slot[2]  │ slot[3]  │   ...    │      │  │
+│  │  │ active=1 │ active=1 │ active=0 │ active=1 │          │      │  │
+│  │  │ cookie=A │ cookie=B │ (free)   │ cookie=0 │          │      │  │
+│  │  │ pid=100  │ pid=200  │          │ pid=300  │          │      │  │
+│  │  │ worker=2 │ worker=0 │          │ worker=1 │          │      │  │
+│  │  └──────────┴──────────┴──────────┴──────────┴──────────┘      │  │
+│  │       ▲           ▲                     ▲                      │  │
+│  │   id=0        id=1                  id=3                       │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│              ▲                                   ▲                   │
+│              │                                   │                   │
+│  ┌───────────┴────────────┐        ┌─────────────┴───────────┐       │
+│  │     cookie_index       │        │      shadow_index       │       │
+│  │  key: socket_cookie    │        │  key: (pid, ssl_ctx)    │       │
+│  │  value: flow_id (u32)  │        │  value: flow_id (u32)   │       │
+│  │                        │        │                         │       │
+│  │  cookie_A → 0          │        │  (100, ctx1) → 0        │       │
+│  │  cookie_B → 1          │        │  (200, ctx2) → 1        │       │
+│  │                        │        │  (300, ctx3) → 3        │       │
+│  └────────────────────────┘        └─────────────────────────┘       │
+│                                                                      │
+│  Per-Flow State (flow_context_t):                                    │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │ • socket_cookie, pid, ssl_ctx      │ • alpn[16]                │  │
+│  │ • home_worker_id (atomic CAS)      │ • last_activity_ms        │  │
+│  │ • parser.h2.session (nghttp2)      │ • parser.h2.streams[64]   │  │
+│  │ • parser.h2.hpack_corrupted        │ • parser.h2.free_head     │  │
+│  │ • parser.h1.llhttp + current_txn   │ • parser.h1.settings      │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+│                                                                      │
+│  flow_transaction_t (per HTTP/2 stream):                             │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │ stream_id │ state (RFC 7540) │ method, path, host, status      │  │
+│  │ flags     │ last_active_ms   │ content_type, content_length    │  │
+│  │ next_free │ body_buf, len    │ start_time_ns                   │  │
+│  └────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Key design properties:**
+- **Zero-copy**: Data never moves, only index entries change
+- **Atomic handover**: 4-byte flow_id writes instead of struct copies
+- **Predictable performance**: Pre-allocated pool, no malloc in hot path
+- **Single-writer guarantee**: Atomic CAS on `home_worker_id` prevents races
+- **O(1) stream allocation**: Free-list based pool for HTTP/2 streams
+
 ### Data Flow
 
-1. **Startup** → Scan `/proc/PID/maps` for SSL libraries, attach uprobes, seed `flow_cookie_map` via SOCK_DIAG
+1. **Startup** → Scan `/proc/PID/maps` for SSL libraries, attach uprobes, seed `flow_cookie_map` via SOCK_DIAG, init flow pool (8192 slots)
 2. **Packet arrives** → XDP classifies protocol (TLS/HTTP2/HTTP1), tracks flow state, emits metadata
 3. **TCP established** → sock_ops caches socket cookie in `flow_cookie_map` (5-tuple → cookie)
 4. **SSL call** → Uprobe captures decrypted data, links SSL* → fd → socket cookie
-5. **Correlation** → Socket cookie unifies XDP packets + sock_ops state + TLS plaintext
-6. **Processing** → Workers parse HTTP/1.1 (llhttp) or HTTP/2 (nghttp2), decompress bodies
-7. **Output** → Serialized display with request/response correlation, ALPN indicator
-8. **Process exit** → Tracepoint triggers cleanup of HTTP/2 sessions, ALPN cache, pending bodies
+5. **Flow lookup** → Dual-index lookup: cookie_index (fast) or shadow_index (pid, ssl_ctx)
+6. **Worker claim** → Atomic CAS on `home_worker_id` ensures single-writer per flow, init parsers
+7. **Processing** → Workers use per-flow `flow_context_t` with embedded HTTP/2 stream pool (64 streams)
+8. **HTTP/2 streams** → O(1) allocation from free-list, per-stream body buffers, ghost stream timeout
+9. **Output** → Serialized display with request/response correlation, ALPN indicator
+10. **Cleanup** → Process exit triggers flow eviction, stream body buffer free, slot return to pool
 
 ## Project Structure
 
@@ -445,6 +560,11 @@ spliff/
 │   │   └── signatures.c        # File magic detection (50+ formats)
 │   ├── output/
 │   │   └── display.c           # Terminal output formatting, colors
+│   ├── correlation/            # XDP-SSL correlation (v0.8.0+)
+│   │   ├── flow_cache.c        # XDP flow cache, socket cookie lookup
+│   │   ├── flow_cache.h        # Flow cache API
+│   │   ├── flow_context.c      # Per-flow context management, stream pools
+│   │   └── flow_context.h      # flow_context_t, flow_transaction_t types
 │   ├── threading/              # Multi-threaded event processing
 │   │   ├── threading.h         # Threading API, structures, constants
 │   │   ├── dispatcher.c        # BPF ring consumer, worker routing
@@ -459,6 +579,7 @@ spliff/
 │   ├── test_http1.c            # HTTP/1.1 parser tests
 │   └── test_http2.c            # HTTP/2 parser tests
 └── docs/
+    ├── SHARED_POOL_ARCHITECTURE.md         # Shared Pool implementation plan
     ├── HTTP3_QUIC_IMPLEMENTATION_PLAN.md   # HTTP/3 planning
     ├── XDP_INTEGRATION_PLAN.md             # XDP planning
     └── EDR_XDR_ROADMAP.md                  # EDR/XDR roadmap
@@ -472,7 +593,7 @@ spliff/
 | v0.6.x | Multi-threaded event processing | ✅ Complete |
 | v0.7.x | BPF-level IPC filtering + Unified display | ✅ Complete |
 | v0.8.x | XDP packet-level flow tracking + sock_ops | ✅ Complete |
-| v0.9.x | Dynamic process monitoring + Doxygen docs + BoringSSL detection | ✅ **Current** |
+| v0.9.x | Dynamic process monitoring + Shared Pool Architecture + Unified Transaction | ✅ **Current** |
 | v0.10.0 | PCRE2-JIT pattern matching for plain HTTP | 🔄 Next |
 | v0.11.0 | HTTP/3 + QUIC protocol support | Planned |
 | v1.0.0 | WebSocket support + Enhanced display | Planned |
@@ -503,7 +624,9 @@ See [docs/](docs/) for detailed implementation plans.
   - Recommended: Use Firefox (NSS) for reliable browser traffic capture
   - If Chrome capture is needed, expect occasional missed traffic or instability
 
-- **HTTP/2 Mid-Stream Capture**: Joining existing HTTP/2 connections may cause HPACK decode errors for first few responses (dynamic table not synchronized). Recovery is automatic.
+- **First Request Timing**: Initial HTTP request from each process may lack XDP correlation data. Subsequent requests correlate correctly. Under high traffic, some request/response pairs may miss correlation due to race between SSL event and sockops `flow_cookie_map` population.
+- **HTTP/2 Mid-Stream Capture**: Joining existing HTTP/2 connections may cause HPACK decode errors for first few responses (dynamic table not synchronized). Recovery is automatic; corrupted connections set `hpack_corrupted` flag per RFC 7540.
+- **HTTP/2 Stream Limits**: Each flow supports up to 64 concurrent HTTP/2 streams. Streams exceeding this limit are dropped. Ghost streams (inactive >10s) are automatically reaped.
 - **Multiple TLS Handshakes**: Some clients (e.g., curl) perform multiple TLS connections (initial + session resumption). Both handshakes are displayed when using `-H`.
 - **NSS Library Detection**: Firefox and other NSS applications may use multiple NSPR layers. BPF-level filtering ensures only SSL traffic is captured.
 - **Plain HTTP Capture**: Currently only captures TLS-encrypted traffic. Plain HTTP via XDP requires PCRE2-JIT classification (planned for v0.10.0).

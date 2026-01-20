@@ -4,7 +4,7 @@ This document tracks known issues, bugs, and limitations in spliff. For feature 
 
 ## Open Issues
 
-### 1. SSL-sockops Timing Race (High Priority)
+### 1. SSL-sockops Timing Race (High Priority) ✅ FIXED
 
 **Symptoms:**
 - First HTTP request from each process lacks XDP correlation
@@ -18,12 +18,14 @@ Race condition between SSL uprobe events and sockops `flow_cookie_map` populatio
 - `src/bpf/spliff.bpf.c` - sockops handler timing
 - `src/threading/dispatcher.c` - cookie lookup in SSL event handler
 
-**Potential Fixes:**
-- Implement retry with backoff for cookie lookup
-- Queue SSL events and process after cookie is available
-- Add synchronization barrier between sockops and uprobe
+**Resolution (v0.9.2):**
+Implemented cookie retry queue with bitmask-based slot management:
+- Events with valid `socket_cookie` but missing `flow_info` are deferred
+- Up to 3 retry attempts with batch processing every 4 NAPI iterations
+- Acquire/release memory ordering ensures cross-thread visibility
+- Statistics tracked: `deferred_successes` and `deferred_failures`
 
-**Workaround:** None currently. Subsequent requests typically correlate correctly.
+**Status:** Fixed in `src/threading/worker.c` and `src/threading/dispatcher.c`
 
 ---
 
@@ -31,28 +33,43 @@ Race condition between SSL uprobe events and sockops `flow_cookie_map` populatio
 
 **Symptoms:**
 - XDP correlation stops working when VPN is connected
-- Traffic through wg0 interface not correlated
-- Works again after VPN disconnect
+- Traffic through wg0/tunnel interface shows `flow_info=NOT_FOUND` even with cookie retry
+- SSL events have cookies, but flow_cache never gets populated for VPN traffic
+- Cookie retry statistics show high failure rate (~76%) for VPN sessions
+- Works perfectly when VPN disconnected
 
 **Root Cause:**
-Two-part issue:
-1. **Static attachment**: XDP programs attached only at startup. If wg0 interface appears after spliff starts, no XDP attached to it.
-2. **Tunnel IP mismatch**: sockops sees tunnel IPs (10.x.x.x), but XDP on physical NIC sees encrypted wireguard UDP packets with different 5-tuple.
+**XDP doesn't see tunnel-decapsulated packets.** Even when XDP is attached to the WireGuard interface in SKB mode, packets that are "injected" into the network stack after decapsulation bypass the XDP hook.
+
+Packet flow with WireGuard:
+1. Encrypted UDP arrives on physical interface → XDP sees encrypted blob (ignored)
+2. WireGuard decrypts packet
+3. Decrypted TCP packet is "injected" into stack → **bypasses XDP hook on wg0**
+4. sock_ops fires correctly → cookie stored in `flow_cookie_map`
+5. SSL uprobes fire → cookie obtained from socket
+6. But XDP never saw the packet → `flow_cache` never populated → correlation fails
+
+This is a **fundamental limitation of XDP on virtual/tunnel interfaces**, not a bug in spliff.
+
+**Evidence:**
+- `Cookie misses: 0` - XDP finds cookies when it DOES see packets
+- `Retry failures: 76%` - flow_cache never populated for VPN traffic
+- XDP IS attached to wg interface (confirmed in debug output)
 
 **Affected Components:**
-- `src/bpf/bpf_loader.c` - static interface discovery
-- `src/bpf/spliff.bpf.c` - XDP flow tracking
+- `src/bpf/spliff.bpf.c` - XDP program (cannot see injected packets)
+- Linux kernel XDP architecture
 
 **Potential Fixes:**
-- Implement dynamic NIC monitoring via netlink (RTM_NEWLINK/RTM_DELLINK)
-- Attach XDP to tunnel interfaces (wg0) not just physical NICs
-- Handle tunnel IP to socket cookie mapping
+1. **TC-BPF fallback (recommended)**: Use Traffic Control BPF for virtual interfaces instead of XDP. TC hooks fire for all packets including tunnel-injected ones.
+2. **Process-based correlation**: Fall back to PID+timing correlation when XDP fails
+3. **Accept as limitation**: Document that VPN traffic correlation requires TC-BPF
 
-**Workaround:** Start spliff after VPN is connected so wg0 is discovered at startup.
+**Workaround:** Disconnect VPN for full correlation. SSL interception still works with VPN, only the network metadata (IP:port) is missing.
 
 ---
 
-### 3. High CPU Usage (99% Active Polling) (Medium Priority)
+### 3. High CPU Usage (99% Active Polling) (Medium Priority) ✅ FIXED
 
 **Symptoms:**
 - CPU efficiency always shows "High load (99% active polling)"
@@ -66,12 +83,19 @@ Worker threads use spin-wait polling loop instead of event-driven blocking. Work
 - `src/threading/worker.c` - worker main loop
 - `src/threading/dispatcher.c` - event dispatch loop
 
-**Potential Fixes:**
-- Replace spin-wait with `epoll_wait()` on eventfd
-- Use ring buffer poll mechanism for BPF events
-- Implement proper condition variable signaling
+**Resolution (v0.9.2):**
+Implemented NAPI-style adaptive polling:
+- Workers use `epoll_wait()` when caught up with traffic (zero CPU when idle)
+- Under heavy load, workers loop continuously without syscall overhead
+- Budget-based processing: max 64 events per iteration before checking epoll
+- Sleep cycles tracked for efficiency reporting
 
-**Workaround:** None. Impact is higher power consumption and CPU contention.
+**Expected Results:**
+- CPU (idle): ~0% (vs 99% before)
+- CPU (heavy load): 80-95% (actual work vs busy-wait)
+- Statistics now show "Good (NAPI-style, N sleep cycles)" when efficient
+
+**Status:** Fixed in `src/threading/worker.c` and `src/threading/threading.h`
 
 ---
 

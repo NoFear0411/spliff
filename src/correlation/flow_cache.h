@@ -23,6 +23,16 @@
  *
  * This structure captures network-layer metadata from XDP packets
  * that can be correlated with SSL events via socket_cookie.
+ *
+ * @par Thread Safety (Acquire/Release Semantics):
+ * The `active` field uses C11 atomic operations with memory ordering:
+ * - Dispatcher thread: Uses atomic_store_explicit(..., memory_order_release)
+ *   after populating all fields to ensure writes are visible.
+ * - Worker threads: Uses atomic_load_explicit(..., memory_order_acquire)
+ *   to ensure all prior writes by dispatcher are visible before reading.
+ *
+ * This is more efficient than memory fences because it only synchronizes
+ * around this specific variable, not all memory operations.
  */
 typedef struct flow_info {
     uint64_t socket_cookie;      /**< Key: socket cookie ("Golden Thread") */
@@ -35,7 +45,14 @@ typedef struct flow_info {
     uint8_t category;            /**< XDP protocol category */
     uint8_t direction;           /**< Direction: 1=ingress, 2=egress */
     char ifname[16];             /**< Interface name (resolved from ifindex) */
-    bool active;                 /**< True if slot is in use */
+    /**
+     * @brief Atomic active flag for thread-safe visibility
+     *
+     * Store with memory_order_release ensures all prior field writes
+     * are visible. Load with memory_order_acquire ensures seeing all
+     * prior writes when this returns true.
+     */
+    _Atomic bool active;
 } flow_info_t;
 
 /**

@@ -318,6 +318,9 @@ typedef struct {
     uint64_t gatekeeper_hits;    /* Fast-path: silenced sessions skipped */
     uint64_t cookie_failures;    /* Socket cookie lookup failed (IPv6, etc.) */
     uint64_t ringbuf_drops;      /* Events dropped due to ringbuf full */
+    uint64_t sockops_active;     /* Sockops ACTIVE_ESTABLISHED events */
+    uint64_t sockops_passive;    /* Sockops PASSIVE_ESTABLISHED events */
+    uint64_t sockops_state;      /* Sockops STATE_CB events (cleanup) */
 } xdp_stats_t;
 
 /**
