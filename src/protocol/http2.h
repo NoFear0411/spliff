@@ -44,6 +44,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Forward declaration for flow-based processing */
+struct flow_context;
+
 /**
  * @defgroup http2 HTTP/2 Parser
  * @brief nghttp2-based HTTP/2 protocol parsing
@@ -245,6 +248,40 @@ int http2_init(void);
 struct nghttp2_session_callbacks *http2_get_callbacks(void);
 
 /**
+ * @brief Create callback context for flow-based HTTP/2 processing
+ *
+ * Allocates and initializes an h2_callback_ctx_t for use with flow_ctx's
+ * nghttp2 session. The context is set up for server-side (request) parsing.
+ *
+ * @param[in] flow_ctx Flow context that will own this callback context
+ *
+ * @return Opaque callback context pointer, or NULL on allocation failure
+ *
+ * @note Store returned pointer in flow_ctx->parser.h2.callback_ctx
+ * @note Pass returned pointer to flow_h2_session_init() as user_data
+ * @note Free with http2_free_callback_ctx() when flow is released
+ */
+void *http2_create_callback_ctx(struct flow_context *flow_ctx);
+
+/**
+ * @brief Free callback context created by http2_create_callback_ctx()
+ *
+ * @param[in] callback_ctx Opaque callback context to free (NULL is safe)
+ */
+void http2_free_callback_ctx(void *callback_ctx);
+
+/**
+ * @brief Set event in callback context for current processing call
+ *
+ * Updates the event pointer in a flow-based callback context.
+ * Must be called before feeding data to the nghttp2 session.
+ *
+ * @param[in] callback_ctx Opaque callback context
+ * @param[in] event        Current BPF event (NULL to clear)
+ */
+void http2_set_callback_event(void *callback_ctx, const ssl_data_event_t *event);
+
+/**
  * @brief Clean up HTTP/2 parser resources
  *
  * Frees all sessions, streams, and nghttp2 resources.
@@ -416,15 +453,17 @@ void http2_cleanup_pid(uint32_t pid);
  * invalid or corrupted data. Used for mid-stream join recovery.
  *
  * @par Validation Checks:
+ * - Buffer has at least 9 bytes (H2 frame header size)
  * - Frame length <= H2_MAX_SANE_FRAME_LEN
  * - Frame type <= H2_MAX_VALID_FRAME_TYPE
  * - Stream ID <= H2_MAX_SANE_STREAM_ID
  *
- * @param[in] data At least 9 bytes of frame header data
+ * @param[in] data Buffer containing frame header data
+ * @param[in] len  Length of data buffer (must be >= 9)
  *
- * @return true if frame header appears valid
+ * @return true if frame header appears valid, false if invalid or buffer too small
  */
-bool http2_is_valid_frame_header(const uint8_t *data);
+bool http2_is_valid_frame_header(const uint8_t *data, size_t len);
 
 /** @} */ /* End of http2 group */
 

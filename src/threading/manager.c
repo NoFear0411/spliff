@@ -441,6 +441,9 @@ void threading_print_stats(threading_mgr_t *mgr) {
         }
     }
 
+    /* Flow pool statistics (Shared Pool Architecture) */
+    flow_manager_print_stats(&mgr->dispatcher.flow_mgr, g_config.debug_mode);
+
     fprintf(stderr, "\n");
 }
 

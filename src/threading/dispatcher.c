@@ -42,6 +42,7 @@
  */
 
 #include "threading.h"
+#include "../util/safe_str.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -160,10 +161,12 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
      *
      * Cookie promotion happens when we learn the cookie for an existing flow.
      */
-    flow_context_t *flow_ctx = flow_lookup(&ctx->flow_mgr,
-                                            bpf_event->socket_cookie,
-                                            bpf_event->pid,
-                                            bpf_event->ssl_ctx);
+    flow_lookup_path_t lookup_path = FLOW_PATH_NONE;
+    flow_context_t *flow_ctx = flow_lookup_ex(&ctx->flow_mgr,
+                                               bpf_event->socket_cookie,
+                                               bpf_event->pid,
+                                               bpf_event->ssl_ctx,
+                                               &lookup_path);
 
     if (!flow_ctx) {
         /* First SSL event for this flow - create with shadow_index */
@@ -171,11 +174,21 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
                                        bpf_event->socket_cookie,
                                        bpf_event->pid,
                                        bpf_event->ssl_ctx);
+        lookup_path = FLOW_PATH_CREATED;
         if (flow_ctx && g_config.debug_mode) {
-            fprintf(stderr, "[DEBUG] SSL event created new flow_context id=%u\n",
-                    flow_ctx->self_id);
+            fprintf(stderr, "[DEBUG] SSL: CREATED flow_id=%u (pid=%u ssl_ctx=%llx cookie=%llu)\n",
+                    flow_ctx->self_id, bpf_event->pid,
+                    (unsigned long long)bpf_event->ssl_ctx,
+                    (unsigned long long)bpf_event->socket_cookie);
         }
     } else {
+        /* Show correlation path in debug mode */
+        if (g_config.debug_mode) {
+            const char *path_name = (lookup_path == FLOW_PATH_COOKIE) ? "COOKIE" : "SHADOW";
+            fprintf(stderr, "[DEBUG] SSL: %s lookup → flow_id=%u\n",
+                    path_name, flow_ctx->self_id);
+        }
+
         /*
          * Flow exists. If this event has a cookie but the flow doesn't,
          * this is a cookie promotion opportunity.
@@ -187,7 +200,7 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
                                                    bpf_event->ssl_ctx,
                                                    bpf_event->socket_cookie);
             if (prom_result == 0 && g_config.debug_mode) {
-                fprintf(stderr, "[DEBUG] Cookie promotion: flow_id=%u now has cookie=%llu\n",
+                fprintf(stderr, "[DEBUG] SSL: PROMOTED flow_id=%u to cookie=%llu\n",
                         flow_ctx->self_id,
                         (unsigned long long)bpf_event->socket_cookie);
             }
@@ -204,7 +217,7 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
             flow_ctx->ssl_ctx = bpf_event->ssl_ctx;
         }
         if (bpf_event->comm[0] != '\0') {
-            strncpy(flow_ctx->comm, bpf_event->comm, sizeof(flow_ctx->comm) - 1);
+            safe_strcpy(flow_ctx->comm, sizeof(flow_ctx->comm), bpf_event->comm);
         }
         flow_ctx->uid = bpf_event->uid;
         flow_ctx->last_seen_ns = bpf_event->timestamp_ns;

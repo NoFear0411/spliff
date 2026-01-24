@@ -15,6 +15,7 @@
  */
 
 #include "flow_context.h"
+#include "../protocol/http2.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -531,8 +532,13 @@ void flow_manager_cleanup(flow_manager_t *mgr) {
     flow_pool_cleanup(&mgr->pool);
 }
 
-flow_context_t *flow_lookup(flow_manager_t *mgr, uint64_t cookie,
-                            uint32_t pid, uint64_t ssl_ctx) {
+flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
+                               uint32_t pid, uint64_t ssl_ctx,
+                               flow_lookup_path_t *path_out) {
+    if (path_out) {
+        *path_out = FLOW_PATH_NONE;
+    }
+
     if (!mgr) {
         return NULL;
     }
@@ -545,6 +551,9 @@ flow_context_t *flow_lookup(flow_manager_t *mgr, uint64_t cookie,
         if (id != FLOW_ID_INVALID) {
             flow_context_t *ctx = flow_pool_get(&mgr->pool, id);
             if (ctx && atomic_load_explicit(&ctx->active, memory_order_acquire)) {
+                if (path_out) {
+                    *path_out = FLOW_PATH_COOKIE;
+                }
                 return ctx;
             }
         }
@@ -556,12 +565,20 @@ flow_context_t *flow_lookup(flow_manager_t *mgr, uint64_t cookie,
         if (id != FLOW_ID_INVALID) {
             flow_context_t *ctx = flow_pool_get(&mgr->pool, id);
             if (ctx && atomic_load_explicit(&ctx->active, memory_order_acquire)) {
+                if (path_out) {
+                    *path_out = FLOW_PATH_SHADOW;
+                }
                 return ctx;
             }
         }
     }
 
     return NULL;
+}
+
+flow_context_t *flow_lookup(flow_manager_t *mgr, uint64_t cookie,
+                            uint32_t pid, uint64_t ssl_ctx) {
+    return flow_lookup_ex(mgr, cookie, pid, ssl_ctx, NULL);
 }
 
 flow_context_t *flow_get_or_create(flow_manager_t *mgr, uint64_t cookie,
@@ -924,6 +941,11 @@ void flow_free_resources(flow_context_t *ctx) {
             free(ctx->parser.h2.reassembly_buf);
             ctx->parser.h2.reassembly_buf = NULL;
         }
+        /* Free callback context (Phase 3.6 migration) */
+        if (ctx->parser.h2.callback_ctx) {
+            http2_free_callback_ctx(ctx->parser.h2.callback_ctx);
+            ctx->parser.h2.callback_ctx = NULL;
+        }
     } else if (ctx->proto == FLOW_PROTO_HTTP1) {
         /* Free HTTP/1 transaction body buffer */
         flow_txn_free_body(&ctx->parser.h1.txn);
@@ -1193,4 +1215,85 @@ void flow_txn_free_body(flow_transaction_t *txn) {
     txn->body_len = 0;
     txn->body_capacity = 0;
     txn->flags &= ~(TXN_FLAG_BODY_ALLOCATED | TXN_FLAG_HAS_BODY);
+}
+
+/*============================================================================
+ * Pool Statistics
+ *============================================================================*/
+
+void flow_manager_get_stats(flow_manager_t *mgr, flow_pool_stats_t *stats) {
+    if (!mgr || !stats) {
+        return;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+
+    /* Pool statistics */
+    stats->pool_capacity = mgr->pool.capacity;
+    stats->pool_allocated = atomic_load(&mgr->pool.allocated);
+    stats->pool_peak = atomic_load(&mgr->pool.peak);
+    stats->pool_total_allocs = atomic_load(&mgr->pool.total_allocs);
+    stats->pool_total_frees = atomic_load(&mgr->pool.total_frees);
+
+    /* Cookie index statistics */
+    stats->cookie_count = atomic_load(&mgr->cookie_idx.count);
+    stats->cookie_hits = atomic_load(&mgr->cookie_idx.hits);
+    stats->cookie_misses = atomic_load(&mgr->cookie_idx.misses);
+
+    /* Shadow index statistics */
+    stats->shadow_count = atomic_load(&mgr->shadow_idx.count);
+    stats->shadow_hits = atomic_load(&mgr->shadow_idx.hits);
+    stats->shadow_promotions = atomic_load(&mgr->shadow_idx.promotions);
+}
+
+void flow_manager_print_stats(flow_manager_t *mgr, bool debug_mode) {
+    if (!mgr) {
+        return;
+    }
+
+    flow_pool_stats_t stats;
+    flow_manager_get_stats(mgr, &stats);
+
+    fprintf(stderr, "\n=== Flow Pool Statistics ===\n");
+
+    /* Pool utilization */
+    double util_pct = stats.pool_capacity > 0
+        ? 100.0 * stats.pool_allocated / stats.pool_capacity
+        : 0.0;
+    double peak_pct = stats.pool_capacity > 0
+        ? 100.0 * stats.pool_peak / stats.pool_capacity
+        : 0.0;
+
+    fprintf(stderr, "Pool: %lu/%lu active (%.1f%%), peak %lu (%.1f%%)\n",
+            stats.pool_allocated, stats.pool_capacity, util_pct,
+            stats.pool_peak, peak_pct);
+
+    /* Lifetime stats */
+    fprintf(stderr, "Lifetime: %lu allocs, %lu frees\n",
+            stats.pool_total_allocs, stats.pool_total_frees);
+
+    /* Index statistics (debug mode) */
+    if (debug_mode) {
+        fprintf(stderr, "\n--- Index Statistics ---\n");
+
+        /* Cookie index */
+        uint64_t cookie_total = stats.cookie_hits + stats.cookie_misses;
+        double cookie_hit_rate = cookie_total > 0
+            ? 100.0 * stats.cookie_hits / cookie_total
+            : 0.0;
+        fprintf(stderr, "Cookie index: %lu entries, %lu hits (%.1f%%), %lu misses\n",
+                stats.cookie_count, stats.cookie_hits, cookie_hit_rate,
+                stats.cookie_misses);
+
+        /* Shadow index */
+        fprintf(stderr, "Shadow index: %lu entries, %lu hits, %lu promotions\n",
+                stats.shadow_count, stats.shadow_hits, stats.shadow_promotions);
+
+        /* Promotion rate - how often we go from shadow to cookie */
+        if (stats.pool_total_allocs > 0) {
+            double promo_rate = 100.0 * stats.shadow_promotions / stats.pool_total_allocs;
+            fprintf(stderr, "XDP correlation: %.1f%% of flows got socket_cookie\n",
+                    promo_rate);
+        }
+    }
 }

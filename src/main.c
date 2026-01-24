@@ -55,7 +55,6 @@ static bool g_debug_mode = false;
 #ifdef HAVE_THREADING
 static threading_mgr_t g_threading;
 static bool g_threading_initialized = false;
-static bool g_threading_enabled = false;  /* Set by CLI or auto-detect */
 static dispatcher_ctx_t g_xdp_dispatcher;  /* XDP event dispatcher context */
 #endif
 
@@ -66,7 +65,6 @@ config_t g_config = {
 };
 
 /* Forward declarations for cleanup */
-static void cleanup_pending_bodies(void);
 static void cleanup_all_resources(void);
 
 /* Get real process name from /proc/PID/comm (not thread name) */
@@ -87,254 +85,13 @@ static void get_process_name(uint32_t pid, char *buf, size_t bufsize) {
     }
 }
 
-/* ALPN cache - tracks negotiated ALPN protocols per connection
- * Used by single-threaded event processing (process_event)
- * Note: In multi-threaded mode, per-worker ALPN cache is used instead
+/*
+ * NOTE: Single-threaded mode has been retired (Phase 3.6 migration).
+ * All event processing now uses multi-threaded flow-based architecture.
+ * - ALPN tracking: per-worker cache in worker_state_t
+ * - Request-response correlation: flow_transaction_t
+ * - Body tracking: flow_ctx->body and pending_body_entry_t in worker_state_t
  */
-#define ST_MAX_ALPN_CACHE 128
-
-/* Use a different name to avoid conflict with threading.h's alpn_cache_entry_t */
-typedef struct st_alpn_cache_entry {
-    uint32_t pid;
-    uint64_t ssl_ctx;
-    char alpn_proto[16];
-    bool active;
-} st_alpn_cache_entry_t;
-
-static st_alpn_cache_entry_t g_alpn_cache[ST_MAX_ALPN_CACHE];
-
-static const char *get_alpn_proto(uint32_t pid, uint64_t ssl_ctx) {
-    /* First check H2 sessions (they store ALPN internally) */
-    const char *h2_alpn = http2_get_alpn(pid, ssl_ctx);
-    if (h2_alpn && h2_alpn[0]) {
-        return h2_alpn;
-    }
-    /* Then check our cache (for HTTP/1.1 connections) */
-    for (int i = 0; i < ST_MAX_ALPN_CACHE; i++) {
-        if (g_alpn_cache[i].active &&
-            g_alpn_cache[i].pid == pid &&
-            g_alpn_cache[i].ssl_ctx == ssl_ctx) {
-            return g_alpn_cache[i].alpn_proto;
-        }
-    }
-    return NULL;
-}
-
-static void set_alpn_proto(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
-    /* Find existing or empty slot */
-    st_alpn_cache_entry_t *slot = NULL;
-    int oldest_idx = 0;
-
-    for (int i = 0; i < ST_MAX_ALPN_CACHE; i++) {
-        if (g_alpn_cache[i].active &&
-            g_alpn_cache[i].pid == pid &&
-            g_alpn_cache[i].ssl_ctx == ssl_ctx) {
-            slot = &g_alpn_cache[i];
-            break;
-        }
-        if (!g_alpn_cache[i].active) {
-            slot = &g_alpn_cache[i];
-            break;
-        }
-    }
-    /* If no slot found, evict oldest (first one) */
-    if (!slot) {
-        slot = &g_alpn_cache[oldest_idx];
-    }
-
-    slot->pid = pid;
-    slot->ssl_ctx = ssl_ctx;
-    slot->active = true;
-    safe_strcpy(slot->alpn_proto, sizeof(slot->alpn_proto), alpn ? alpn : "");
-
-    /* Also store in H2 session if it exists */
-    http2_set_alpn(pid, ssl_ctx, alpn);
-}
-
-/* HTTP/1.1 request tracking - for request/response correlation
- * Stores the last request URL per connection for display on responses
- */
-#define MAX_H1_REQUEST_CACHE 32
-
-typedef struct {
-    uint32_t pid;
-    uint64_t ssl_ctx;
-    char method[16];
-    char path[512];
-    char host[256];      /* From Host header */
-    bool active;
-} h1_request_cache_t;
-
-static h1_request_cache_t g_h1_request_cache[MAX_H1_REQUEST_CACHE];
-
-static h1_request_cache_t *find_h1_request(uint32_t pid, uint64_t ssl_ctx) {
-    for (int i = 0; i < MAX_H1_REQUEST_CACHE; i++) {
-        if (g_h1_request_cache[i].active &&
-            g_h1_request_cache[i].pid == pid &&
-            g_h1_request_cache[i].ssl_ctx == ssl_ctx) {
-            return &g_h1_request_cache[i];
-        }
-    }
-    return NULL;
-}
-
-static void set_h1_request(uint32_t pid, uint64_t ssl_ctx, const char *method,
-                           const char *path, const char *host) {
-    h1_request_cache_t *slot = find_h1_request(pid, ssl_ctx);
-    if (!slot) {
-        for (int i = 0; i < MAX_H1_REQUEST_CACHE; i++) {
-            if (!g_h1_request_cache[i].active) {
-                slot = &g_h1_request_cache[i];
-                break;
-            }
-        }
-    }
-    /* Evict first slot if full */
-    if (!slot) {
-        slot = &g_h1_request_cache[0];
-    }
-
-    slot->pid = pid;
-    slot->ssl_ctx = ssl_ctx;
-    slot->active = true;
-    safe_strcpy(slot->method, sizeof(slot->method), method ? method : "");
-    safe_strcpy(slot->path, sizeof(slot->path), path ? path : "");
-    safe_strcpy(slot->host, sizeof(slot->host), host ? host : "");
-}
-
-/* Pending body state - tracks responses expecting body data */
-#define BODY_ACCUM_SIZE (256 * 1024)  /* 256KB accumulation buffer */
-
-typedef struct {
-    uint32_t pid;
-    uint64_t ssl_ctx;     /* SSL context pointer for connection tracking */
-    size_t expected_len;
-    size_t received_len;
-    char content_type[256];
-    char content_encoding[64];
-    bool active;
-    bool header_printed;  /* Whether we printed the body header */
-    bool needs_decompression;
-    uint8_t *accum_buf;   /* Accumulation buffer for compressed data */
-    size_t accum_len;
-} pending_body_t;
-
-#define MAX_PENDING_BODIES 16
-static pending_body_t g_pending_bodies[MAX_PENDING_BODIES];
-
-static pending_body_t *find_pending_body(uint32_t pid, uint64_t ssl_ctx) {
-    for (int i = 0; i < MAX_PENDING_BODIES; i++) {
-        if (g_pending_bodies[i].active &&
-            g_pending_bodies[i].pid == pid &&
-            g_pending_bodies[i].ssl_ctx == ssl_ctx) {
-            return &g_pending_bodies[i];
-        }
-    }
-    return NULL;
-}
-
-static void set_pending_body(uint32_t pid, uint64_t ssl_ctx, size_t len, const char *ct, const char *ce) {
-    /* Find existing or empty slot */
-    pending_body_t *slot = find_pending_body(pid, ssl_ctx);
-    if (!slot) {
-        for (int i = 0; i < MAX_PENDING_BODIES; i++) {
-            if (!g_pending_bodies[i].active) {
-                slot = &g_pending_bodies[i];
-                break;
-            }
-        }
-    }
-    if (slot) {
-        /* Free any existing buffer */
-        if (slot->accum_buf) {
-            free(slot->accum_buf);
-            slot->accum_buf = NULL;
-        }
-
-        slot->pid = pid;
-        slot->ssl_ctx = ssl_ctx;
-        slot->expected_len = len;
-        slot->received_len = 0;
-        slot->accum_len = 0;
-        slot->active = true;
-        slot->header_printed = false;
-
-        safe_strcpy(slot->content_type, sizeof(slot->content_type), ct ? ct : "");
-        safe_strcpy(slot->content_encoding, sizeof(slot->content_encoding), ce ? ce : "");
-
-        /* Check if decompression needed */
-        slot->needs_decompression = (ce && ce[0] &&
-            (strstr(ce, "gzip") || strstr(ce, "deflate") ||
-             strstr(ce, "br") || strstr(ce, "zstd")));
-
-        /* Allocate accumulation buffer for compressed data */
-        if (slot->needs_decompression) {
-            slot->accum_buf = malloc(BODY_ACCUM_SIZE);
-            if (!slot->accum_buf) {
-                slot->needs_decompression = false;  /* Fall back to no decompression */
-            }
-        }
-    }
-}
-
-static void clear_pending_body(uint32_t pid, uint64_t ssl_ctx) {
-    pending_body_t *p = find_pending_body(pid, ssl_ctx);
-    if (p) {
-        /* If we accumulated compressed data, decompress and display now */
-        if (p->accum_buf && p->accum_len > 0) {
-            uint8_t *decomp_buf = malloc(BODY_ACCUM_SIZE);
-            if (decomp_buf) {
-                int decomp_len = decompress_body(p->accum_buf, p->accum_len,
-                                                 p->content_encoding,
-                                                 decomp_buf, BODY_ACCUM_SIZE);
-                if (decomp_len > 0) {
-                    if (!p->header_printed) {
-                        printf("%s─── Body ───%s\n", display_color(C_DIM), display_color(C_RESET));
-                    }
-                    fwrite(decomp_buf, 1, decomp_len, stdout);
-                    if (decomp_buf[decomp_len-1] != '\n') printf("\n");
-                    p->header_printed = true;
-                }
-                free(decomp_buf);
-            }
-        }
-
-        if (p->header_printed) {
-            printf("%s────────────%s\n\n", display_color(C_DIM), display_color(C_RESET));
-        }
-
-        /* Free buffer */
-        if (p->accum_buf) {
-            free(p->accum_buf);
-            p->accum_buf = NULL;
-        }
-        p->active = false;
-    }
-}
-
-/* Cleanup all pending body buffers - called at exit */
-static void cleanup_pending_bodies(void) {
-    for (int i = 0; i < MAX_PENDING_BODIES; i++) {
-        if (g_pending_bodies[i].accum_buf) {
-            free(g_pending_bodies[i].accum_buf);
-            g_pending_bodies[i].accum_buf = NULL;
-        }
-        g_pending_bodies[i].active = false;
-    }
-}
-
-/* Cleanup pending body buffers for a specific PID (process exit) */
-static void cleanup_pending_bodies_pid(uint32_t pid) {
-    for (int i = 0; i < MAX_PENDING_BODIES; i++) {
-        if (g_pending_bodies[i].active && g_pending_bodies[i].pid == pid) {
-            if (g_pending_bodies[i].accum_buf) {
-                free(g_pending_bodies[i].accum_buf);
-                g_pending_bodies[i].accum_buf = NULL;
-            }
-            g_pending_bodies[i].active = false;
-        }
-    }
-}
 
 /* ============================================================================
  * Dynamic Probe Attachment - attaches probes to newly discovered SSL libraries
@@ -795,13 +552,7 @@ static void cleanup_all_resources(void) {
         g_bpf_initialized = false;
     }
 
-    /* Cleanup pending body buffers (only in non-threaded mode) */
-#ifdef HAVE_THREADING
-    if (!g_threading_enabled)
-#endif
-    {
-        cleanup_pending_bodies();
-    }
+    /* NOTE: Global pending_body cleanup removed - now handled per-worker */
 
     /* Cleanup modules in reverse order of initialization */
     if (g_modules_initialized) {
@@ -831,348 +582,10 @@ static void setup_signals(void) {
     signal(SIGPIPE, SIG_IGN);
 }
 
-/* Event processing callback */
-static void process_event(const ssl_data_event_t *event, void *ctx) {
-    (void)ctx;
-
-    /* Handle process exit events - cleanup resources */
-    if (event->event_type == EVENT_PROCESS_EXIT) {
-        http2_cleanup_pid(event->pid);
-        cleanup_pending_bodies_pid(event->pid);
-        return;
-    }
-
-    /* Handle process exec events - dynamic probe attachment for new processes */
-    if (event->event_type == EVENT_PROCESS_EXEC) {
-        handle_process_exec_event(event);
-        return;
-    }
-
-    /* Handle handshake events (no buffer data)
-     * NOTE: Handshake events may arrive out of order relative to HTTP data due to
-     * different probe timing. Future improvement: buffer events and sort by timestamp. */
-    if (event->event_type == EVENT_HANDSHAKE) {
-        if (g_config.show_handshake) {
-            char proc_name[TASK_COMM_LEN] = {0};
-            get_process_name(event->pid, proc_name, sizeof(proc_name));
-            const char *name = proc_name[0] ? proc_name : event->comm;
-            display_handshake(event->pid, name, event->delta_ns, (int)event->len);
-        }
-        return;
-    }
-
-    /* Handle ALPN protocol negotiation events */
-    if (event->event_type == EVENT_ALPN) {
-        if (event->buf_filled > 0 && event->buf_filled <= 255) {
-            char alpn_proto[256] = {0};
-            memcpy(alpn_proto, event->data, event->buf_filled);
-            /* Store ALPN for later inclusion in request/response display */
-            set_alpn_proto(event->pid, event->ssl_ctx, alpn_proto);
-        }
-        return;
-    }
-
-    if (event->buf_filled == 0) return;
-
-    const uint8_t *data = event->data;
-    size_t len = event->buf_filled;
-
-    /* Try HTTP/1.1 parsing first (using llhttp with HTTP_BOTH) */
-    if (http1_is_request(data, len) || http1_is_response(data, len)) {
-        /* New HTTP message - clear any pending body from this connection */
-        clear_pending_body(event->pid, event->ssl_ctx);
-
-        http_message_t msg = {0};
-        static uint8_t body_buf[MAX_BODY_BUFFER];  /* Static to avoid stack overflow */
-        size_t body_len = 0;
-
-        /* Parse with llhttp - handles both request/response and chunked decoding */
-        int result = http1_parse(data, len, &msg,
-                                 g_config.show_body ? body_buf : NULL,
-                                 g_config.show_body ? MAX_BODY_BUFFER : 0,
-                                 &body_len);
-
-        if (result < 0) {
-            /* Parse failed - show raw data info */
-            goto show_raw;
-        }
-
-        /* Set metadata AFTER parsing (parse function clears the struct) */
-        msg.pid = event->pid;
-        msg.timestamp_ns = event->timestamp_ns;
-        msg.delta_ns = event->delta_ns;
-
-        /* Get real process name (not thread name like "Socket Thread") */
-        char proc_name[TASK_COMM_LEN] = {0};
-        get_process_name(event->pid, proc_name, sizeof(proc_name));
-        if (proc_name[0]) {
-            safe_strcpy(msg.comm, sizeof(msg.comm), proc_name);
-        } else {
-            safe_strcpy(msg.comm, sizeof(msg.comm), event->comm);
-        }
-
-        /* Get ALPN protocol if available */
-        const char *alpn = get_alpn_proto(event->pid, event->ssl_ctx);
-        if (alpn) {
-            safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
-        }
-
-        /* Display based on direction (auto-detected by llhttp) */
-        if (msg.direction == DIR_REQUEST) {
-            /* Extract Host header for HTTP/1.1 and store for response correlation */
-            const char *host = NULL;
-            for (int i = 0; i < msg.header_count; i++) {
-                if (strcasecmp(msg.headers[i].name, "Host") == 0) {
-                    host = msg.headers[i].value;
-                    break;
-                }
-            }
-            /* Store request for response correlation */
-            set_h1_request(event->pid, event->ssl_ctx, msg.method, msg.path, host);
-            /* Copy host to authority for unified display */
-            if (host && !msg.authority[0]) {
-                safe_strcpy(msg.authority, sizeof(msg.authority), host);
-            }
-            display_http_request(&msg);
-        } else {
-            /* Look up cached request for URL correlation */
-            h1_request_cache_t *cached_req = find_h1_request(event->pid, event->ssl_ctx);
-            if (cached_req) {
-                safe_strcpy(msg.authority, sizeof(msg.authority), cached_req->host);
-                safe_strcpy(msg.path, sizeof(msg.path), cached_req->path);
-                safe_strcpy(msg.scheme, sizeof(msg.scheme), "https");
-            }
-            display_http_response(&msg);
-        }
-
-        /* Show headers unless compact mode */
-        if (!g_config.compact_mode && msg.header_count > 0) {
-            display_http_headers(&msg);
-        }
-
-        /* Show body if requested and present */
-        /* Note: llhttp already decoded chunked transfer encoding */
-        if (g_config.show_body) {
-            if (body_len > 0) {
-                const uint8_t *body_data = body_buf;
-                size_t display_len = body_len;
-
-                /* Decompress if content-encoding is set */
-                static uint8_t decomp_buf[MAX_BODY_BUFFER];  /* Static for large bodies */
-                if (msg.content_encoding[0]) {
-                    int decomp_len = decompress_body(body_data, body_len,
-                                                     msg.content_encoding,
-                                                     decomp_buf, MAX_BODY_BUFFER);
-                    if (decomp_len > 0) {
-                        body_data = decomp_buf;
-                        display_len = decomp_len;
-                    }
-                }
-
-                display_body(body_data, display_len, msg.content_type);
-                clear_pending_body(event->pid, event->ssl_ctx);
-            } else if (msg.direction == DIR_RESPONSE &&
-                       (msg.content_length > 0 || msg.is_chunked)) {
-                /* Body will arrive in next event - track it
-                 * For chunked encoding, use 0 as expected_len (unknown size) */
-                set_pending_body(event->pid, event->ssl_ctx,
-                                 msg.content_length > 0 ? msg.content_length : 0,
-                                 msg.content_type, msg.content_encoding);
-            }
-        }
-
-        printf("\n");
-        return;
-    }
-
-    /* Check if we already have an active HTTP/2 session for this (PID, ssl_ctx) */
-    bool has_h2 = http2_has_session(event->pid, event->ssl_ctx);
-    /* DEBUG: Always print H2 session processing */
-    if (has_h2) {
-        fprintf(stderr, "[H2-TRACK] existing session: pid=%u ssl=0x%llx type=%s len=%zu\n",
-                event->pid, (unsigned long long)event->ssl_ctx,
-                event->event_type == 0 ? "READ" : "WRITE", len);
-    }
-    DEBUG_MAIN("PID=%u ssl_ctx=0x%llx has_h2_session=%d len=%zu",
-               event->pid, (unsigned long long)event->ssl_ctx, has_h2, len);
-    if (has_h2) {
-        /* Always process data for active H2 sessions */
-        http2_process_frame(data, len, event);
-        return;
-    }
-
-    /* Check for HTTP/2 connection preface (client-side) */
-    if (http2_is_preface(data, len)) {
-        printf("%s[HTTP/2 connection]%s PID %u (%s)\n",
-               display_color(C_YELLOW), display_color(C_RESET),
-               event->pid, event->comm);
-
-        /* Process any frames following the preface */
-        if (len > 24) {
-            http2_process_frame(data + 24, len - 24, event);
-        }
-        return;
-    }
-
-    /* Check for HTTP/2 frames (may attach mid-connection) */
-    if (len >= 9) {
-        /*
-         * HTTP/2 frame header is 9 bytes:
-         * - 3 bytes: length (big-endian, max 16384)
-         * - 1 byte: type (0x00-0x09 are valid)
-         * - 1 byte: flags
-         * - 4 bytes: stream ID (with reserved bit)
-         */
-        uint32_t frame_len = ((uint32_t)data[0] << 16) |
-                             ((uint32_t)data[1] << 8) |
-                             (uint32_t)data[2];
-        uint8_t frame_type = data[3];
-        uint32_t stream_id = ((uint32_t)(data[5] & 0x7f) << 24) |
-                             ((uint32_t)data[6] << 16) |
-                             ((uint32_t)data[7] << 8) |
-                             (uint32_t)data[8];
-
-        /* Valid HTTP/2 frame: type 0x00-0x09, reasonable length */
-        if (frame_type <= 0x09 && frame_len <= 16384) {
-            /*
-             * Detect HTTP/2 session from various frame types:
-             * - SETTINGS (0x04): Standard connection start
-             * - HEADERS (0x01): May see if attached mid-connection
-             * - WINDOW_UPDATE (0x08): Common early frame
-             *
-             * Additional validation:
-             * - SETTINGS/WINDOW_UPDATE/PING on stream 0
-             * - HEADERS on odd stream IDs (client-initiated)
-             * - Frame length + 9 should not exceed total data length
-             */
-            bool is_valid_h2 = false;
-
-            if (frame_type == H2_FRAME_SETTINGS && stream_id == 0) {
-                is_valid_h2 = true;
-            } else if (frame_type == H2_FRAME_HEADERS && (stream_id & 1) != 0) {
-                /* HEADERS on odd stream ID (client-initiated) */
-                is_valid_h2 = true;
-            } else if (frame_type == H2_FRAME_WINDOW_UPDATE && stream_id == 0) {
-                is_valid_h2 = true;
-            } else if (frame_type == H2_FRAME_DATA && (stream_id & 1) != 0 && frame_len > 0) {
-                /* DATA frame on odd stream with actual content */
-                is_valid_h2 = true;
-            }
-
-            /* Verify frame fits in buffer (additional sanity check) */
-            if (is_valid_h2 && (9 + frame_len) <= len) {
-                printf("%s[HTTP/2 connection]%s PID %u (%s)\n",
-                       display_color(C_YELLOW), display_color(C_RESET),
-                       event->pid, event->comm);
-                http2_process_frame(data, len, event);
-                return;
-            }
-        }
-    }
-
-    /* Check if this is body data for a pending response */
-    if (g_config.show_body) {
-        pending_body_t *pending = find_pending_body(event->pid, event->ssl_ctx);
-        if (pending && pending->active) {
-            pending->received_len += len;
-
-            /* For compressed content, accumulate raw data for deferred decompression */
-            if (pending->needs_decompression && pending->accum_buf) {
-                /* Accumulate compressed data */
-                if (pending->accum_len + len <= BODY_ACCUM_SIZE) {
-                    memcpy(pending->accum_buf + pending->accum_len, data, len);
-                    pending->accum_len += len;
-                }
-                /* Check if complete (Content-Length known) */
-                if (pending->expected_len > 0 && pending->received_len >= pending->expected_len) {
-                    clear_pending_body(event->pid, event->ssl_ctx);
-                }
-                /* For chunked (expected_len=0), wait for next HTTP message to trigger clear */
-                return;
-            }
-
-            /* Non-compressed: stream directly */
-            if (!pending->header_printed) {
-                printf("%s─── Body ───%s\n", display_color(C_DIM), display_color(C_RESET));
-                pending->header_printed = true;
-            }
-
-            /* For text content, stream it directly */
-            bool is_text = (strstr(pending->content_type, "text/") != NULL ||
-                           strstr(pending->content_type, "json") != NULL ||
-                           strstr(pending->content_type, "xml") != NULL ||
-                           strstr(pending->content_type, "javascript") != NULL);
-
-            if (is_text) {
-                fwrite(data, 1, len, stdout);
-            } else {
-                printf("[binary chunk: %zu bytes]\n", len);
-            }
-
-            /* Check if we've received all expected data */
-            if (pending->expected_len > 0 && pending->received_len >= pending->expected_len) {
-                clear_pending_body(event->pid, event->ssl_ctx);
-            }
-            fflush(stdout);
-
-            return;
-        }
-    }
-
-show_raw:
-    /* Unknown/binary data - show basic info */
-    ;  /* Empty statement after label for C99 compliance */
-
-    /* Try to detect file type early to filter non-HTTP traffic */
-    const char *sig = signature_detect(data, len);
-    if (signature_is_local_file(sig)) {
-        /* Skip local file I/O (ELF, Mach-O, SQLite, etc.) - not HTTP traffic */
-        return;
-    }
-
-    /* Suppress HTTP/2 control frames in release mode (keep them in debug mode)
-     * HTTP/2 frame header is 9 bytes, control frames have small payloads:
-     * - SETTINGS ACK: 9 bytes (0 payload)
-     * - WINDOW_UPDATE: 13 bytes (4 byte payload)
-     * - PING: 17 bytes (8 byte payload)
-     * - RST_STREAM: 13 bytes (4 byte payload)
-     * - PRIORITY: 14 bytes (5 byte payload)
-     */
-    if (!g_config.debug_mode) {
-        if (len >= 9 && len <= 32) {
-            uint8_t frame_type = data[3];
-            /* Suppress known control frame types (types 0x02-0x08, excluding DATA and HEADERS) */
-            if (frame_type >= 0x02 && frame_type <= 0x08) {
-                return;  /* Suppress control frame output */
-            }
-        }
-
-        /* Also suppress very small writes (< 9 bytes) that can't be valid HTTP/2 frames
-         * and are likely partial control data or TCP-level artifacts */
-        if (len < 9 && http2_has_session(event->pid, event->ssl_ctx)) {
-            return;  /* Suppress tiny writes when HTTP/2 session is active */
-        }
-    }
-
-    char ts[32];
-    display_get_timestamp(ts, sizeof(ts));
-    const char *dir = (event->event_type == EVENT_SSL_WRITE) ? "WRITE" : "READ";
-
-    /* Get real process name */
-    char raw_proc_name[TASK_COMM_LEN] = {0};
-    get_process_name(event->pid, raw_proc_name, sizeof(raw_proc_name));
-    const char *display_name = raw_proc_name[0] ? raw_proc_name : event->comm;
-
-    printf("%s%s%s [%s%s%s] %s (PID %u) %d bytes ",
-           display_color(C_DIM), ts, display_color(C_RESET),
-           display_color(C_CYAN), dir, display_color(C_RESET),
-           display_name, event->pid, event->buf_filled);
-
-    if (sig) {
-        printf("%s[%s]%s", display_color(C_YELLOW), sig, display_color(C_RESET));
-    }
-    printf("\n");
-}
+/*
+ * NOTE: Single-threaded process_event() removed in Phase 3.6 migration.
+ * All event processing now uses multi-threaded process_worker_event().
+ */
 
 #ifdef HAVE_THREADING
 /* ============================================================================
@@ -1259,7 +672,53 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
 
     /* Try HTTP/1.1 parsing first */
     if (http1_is_request(data, len) || http1_is_response(data, len)) {
-        /* Clear any pending body from this connection */
+        /*
+         * Flow-based HTTP/1 parsing (Phase 3.6)
+         *
+         * When flow_ctx is available with HTTP/1 protocol, use the persistent
+         * flow-based parser. This handles:
+         * - Headers split across TCP segments
+         * - HTTP/1.1 keep-alive with on_reset callback
+         * - Chunked transfer encoding (automatic via llhttp)
+         *
+         * The parser displays output via callbacks (on_headers_complete_flow).
+         */
+        if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_HTTP1) {
+            /* Build ssl_data_event_t for flow-based parser */
+            ssl_data_event_t bpf_event = {
+                .timestamp_ns = event->timestamp_ns,
+                .delta_ns = event->delta_ns,
+                .ssl_ctx = event->ssl_ctx,
+                .pid = event->pid,
+                .tid = event->tid,
+                .uid = event->uid,
+                .event_type = event->event_type,
+                .buf_filled = (int32_t)event->data_len,
+            };
+            memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+
+            /* Parse using persistent flow-based parser */
+            int result = http1_parse_flow(event->flow_ctx, data, len, &bpf_event);
+            if (result >= 0) {
+                return;  /* Successfully parsed - display handled in callbacks */
+            }
+            /* Fall through to legacy parsing on error */
+        }
+
+        /*
+         * LEGACY HTTP/1 PARSING - DEPRECATED
+         *
+         * This fallback path uses worker caches (h1_request_entry_t,
+         * pending_body_entry_t) instead of flow_context_t. It's only
+         * reached when:
+         * 1. flow_ctx is not available (pool exhaustion)
+         * 2. flow_ctx->proto != FLOW_PROTO_HTTP1 (protocol not detected)
+         * 3. http1_parse_flow() returns an error
+         *
+         * TODO: Once flow-based parsing is fully validated, this entire
+         * block (through the matching closing brace) can be removed along
+         * with the worker_*_h1_request and worker_*_pending_body functions.
+         */
         pending_body_entry_t *old_pending = worker_find_pending_body(state,
                                                 event->pid, event->ssl_ctx);
         if (old_pending) {
@@ -1544,21 +1003,7 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
                                         event->pid, event->ssl_ctx, false);
     if (h2_conn && h2_conn->active) {
         /* Process HTTP/2 frame with per-worker session */
-        /* TODO: Integrate with http2_process_frame using worker state */
-        /* For now, fall back to global HTTP/2 processing */
-
-        /* Update XDP flow info if newly available */
-        if (event->flow_info) {
-            http2_set_flow_info(event->pid, event->ssl_ctx,
-                               event->flow_info->flow.saddr,
-                               event->flow_info->flow.daddr,
-                               event->flow_info->flow.sport,
-                               event->flow_info->flow.dport,
-                               event->flow_info->flow.ip_version,
-                               event->flow_info->direction,
-                               event->flow_info->category,
-                               event->flow_info->ifname);
-        }
+        /* NOTE: XDP flow info is in event->flow_ctx->flow (Phase 3.6) */
 
         ssl_data_event_t bpf_event = {
             .timestamp_ns = event->timestamp_ns,
@@ -1860,7 +1305,6 @@ static void print_usage(const char *prog) {
     printf("\nThreading Options:\n");
     printf("  -t, --threads N Worker threads (0=auto, default: auto)\n");
     printf("                  Auto: max(1, CPUs-3), capped at 16\n");
-    printf("  --no-threading  Disable multi-threading (single-threaded mode)\n");
 #endif
     printf("  -v, --version   Show version\n");
     printf("  -h, --help      Show this help\n");
@@ -1886,7 +1330,6 @@ int main(int argc, char **argv) {
 
 #ifdef HAVE_THREADING
     int num_threads = 0;           /* 0 = auto-detect based on CPU count */
-    bool disable_threading = false;
 #endif
 
     /* Filter options */
@@ -1985,8 +1428,6 @@ int main(int argc, char **argv) {
                 return 1;
             }
             num_threads = (int)threads;
-        } else if (strcmp(argv[i], "--no-threading") == 0) {
-            disable_threading = true;
 #endif
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -2021,7 +1462,7 @@ int main(int argc, char **argv) {
 
     printf("\n%s╔════════════════════════════════════════╗%s\n",
            display_color(C_CYAN), display_color(C_RESET));
-    printf("%s║      spliff v%-6s                  ║%s\n",
+    printf("%s║        spliff v%-6s                  ║%s\n",
            display_color(C_CYAN), SPLIFF_VERSION, display_color(C_RESET));
     printf("%s╚════════════════════════════════════════╝%s\n\n",
            display_color(C_CYAN), display_color(C_RESET));
@@ -2539,26 +1980,37 @@ int main(int argc, char **argv) {
     /* Note: IPC filtering is always on (BPF kernel-level + userspace heuristics) */
 
 #ifdef HAVE_THREADING
-    /* Initialize threading if enabled (default: auto-detect unless --no-threading) */
-    if (!disable_threading) {
-        if (threading_init(&g_threading, num_threads, false) == 0) {
-            g_threading_initialized = true;
-            g_threading_enabled = true;
-            printf("  %sMulti-threading:%s %d workers%s\n",
-                   display_color(C_GREEN), display_color(C_RESET),
-                   g_threading.num_workers,
-                   num_threads == 0 ? " (auto)" : "");
-        } else {
-            fprintf(stderr, "Warning: Failed to initialize threading, falling back to single-threaded mode\n");
-        }
-    }
+    /* Initialize threading (required for Phase 3.6+ architecture) */
+    if (threading_init(&g_threading, num_threads, false) == 0) {
+        g_threading_initialized = true;
+        printf("  %sMulti-threading:%s %d workers%s\n",
+               display_color(C_GREEN), display_color(C_RESET),
+               g_threading.num_workers,
+               num_threads == 0 ? " (auto)" : "");
 
-    if (!g_threading_enabled)
-#endif
-    {
-        /* Single-threaded mode: use direct callback */
-        probe_handler_set_callback(&g_handler, process_event, NULL);
+        /* Warm-up userspace flow_cache with existing flows from BPF.
+         * This fixes correlation for pre-existing connections that don't
+         * trigger XDP FLOW_NEW events (already classified in BPF).
+         * Uses real socket cookies from BPF flow_states map. */
+        int flow_states_fd = bpf_loader_get_flow_states_fd(&g_loader);
+        if (flow_states_fd >= 0) {
+            int warmed_cache = flow_cache_warmup_from_bpf(
+                &g_threading.dispatcher.flow_cache, flow_states_fd, debug_mode);
+            if (debug_mode && warmed_cache > 0) {
+                printf("  %s[DEBUG]%s Warmed up flow_cache with %d BPF flows\n",
+                       display_color(C_DIM), display_color(C_RESET), warmed_cache);
+            }
+        }
+    } else {
+        fprintf(stderr, "%sError:%s Failed to initialize threading\n",
+                display_color(C_RED), display_color(C_RESET));
+        return 1;  /* atexit handler will cleanup */
     }
+#else
+    fprintf(stderr, "%sError:%s spliff requires HAVE_THREADING support\n",
+            display_color(C_RED), display_color(C_RESET));
+    return 1;
+#endif
 
     if (probe_handler_setup_ringbuf(&g_handler, bpf_loader_get_object(&g_loader)) < 0) {
         fprintf(stderr, "%sError:%s Cannot setup ring buffer\n",
@@ -2628,69 +2080,46 @@ int main(int argc, char **argv) {
      */
 
 #ifdef HAVE_THREADING
-    if (g_threading_enabled) {
-        /* Multi-threaded mode: start threading and wait */
-        if (threading_start(&g_threading, &g_handler) != 0) {
-            fprintf(stderr, "%sError:%s Failed to start threading\n",
-                    display_color(C_RED), display_color(C_RESET));
-            return 1;
-        }
+    /* Start multi-threaded event processing */
+    if (threading_start(&g_threading, &g_handler) != 0) {
+        fprintf(stderr, "%sError:%s Failed to start threading\n",
+                display_color(C_RED), display_color(C_RESET));
+        return 1;
+    }
 
-        /* Register callback for dynamic SSL library detection (process exec events) */
-        dispatcher_set_lifecycle_callback(&g_threading.dispatcher,
-                                          threading_process_exec_callback, NULL);
+    /* Register callback for dynamic SSL library detection (process exec events) */
+    dispatcher_set_lifecycle_callback(&g_threading.dispatcher,
+                                      threading_process_exec_callback, NULL);
 
-        /* Re-register XDP callback with the threaded dispatcher's flow_cache.
-         * The initial registration (above) used g_xdp_dispatcher which has no
-         * flow_cache. Now that threading is started, use the real dispatcher
-         * so XDP events populate the same flow_cache that SSL events use. */
-        if (g_xdp_initialized) {
-            bpf_loader_xdp_set_event_callback(&g_loader,
-                                              dispatcher_xdp_event_handler,
-                                              &g_threading.dispatcher);
-            if (debug_mode) {
-                printf("  %s✓%s XDP callback re-registered with threaded dispatcher\n",
-                       display_color(C_GREEN), display_color(C_RESET));
-            }
-        }
-
-        /* Main thread polls XDP ring buffer while workers handle uprobes */
-        while (!g_exiting) {
-            if (g_xdp_initialized && bpf_loader_xdp_is_active(&g_loader)) {
-                /* Poll XDP events (non-blocking with short timeout) */
-                int xdp_err = bpf_loader_xdp_poll(&g_loader, 50);
-                if (xdp_err < 0 && xdp_err != -EINTR) {
-                    if (debug_mode) {
-                        fprintf(stderr, "[DEBUG] XDP poll error: %d\n", xdp_err);
-                    }
-                }
-            }
-            usleep(50000);  /* 50ms between XDP polls */
-        }
-
-        /* Shutdown handled by cleanup_all_resources via atexit */
-    } else
-#endif
-    {
-        /* Single-threaded main event loop - poll both uprobe and XDP */
-        while (!g_exiting) {
-            /* Poll uprobe ring buffer */
-            err = probe_handler_poll(&g_handler, 50);
-            if (err == -EINTR) continue;
-            if (err < 0) break;
-
-            /* Poll XDP ring buffer if active */
-            if (g_xdp_initialized && bpf_loader_xdp_is_active(&g_loader)) {
-                int xdp_err = bpf_loader_xdp_poll(&g_loader, 50);
-                if (xdp_err < 0 && xdp_err != -EINTR) {
-                    /* Non-fatal: XDP errors don't stop uprobe capture */
-                    if (debug_mode) {
-                        fprintf(stderr, "[DEBUG] XDP poll error: %d\n", xdp_err);
-                    }
-                }
-            }
+    /* Re-register XDP callback with the threaded dispatcher's flow_cache.
+     * The initial registration (above) used g_xdp_dispatcher which has no
+     * flow_cache. Now that threading is started, use the real dispatcher
+     * so XDP events populate the same flow_cache that SSL events use. */
+    if (g_xdp_initialized) {
+        bpf_loader_xdp_set_event_callback(&g_loader,
+                                          dispatcher_xdp_event_handler,
+                                          &g_threading.dispatcher);
+        if (debug_mode) {
+            printf("  %s✓%s XDP callback re-registered with threaded dispatcher\n",
+                   display_color(C_GREEN), display_color(C_RESET));
         }
     }
+
+    /* Main thread polls XDP ring buffer while workers handle uprobes */
+    while (!g_exiting) {
+        if (g_xdp_initialized && bpf_loader_xdp_is_active(&g_loader)) {
+            /* Poll XDP events (non-blocking with short timeout) */
+            int xdp_err = bpf_loader_xdp_poll(&g_loader, 50);
+            if (xdp_err < 0 && xdp_err != -EINTR) {
+                if (debug_mode) {
+                    fprintf(stderr, "[DEBUG] XDP poll error: %d\n", xdp_err);
+                }
+            }
+        }
+        usleep(50000);  /* 50ms between XDP polls */
+    }
+    /* Shutdown handled by cleanup_all_resources via atexit */
+#endif
 
     printf("\n%sDone.%s\n", display_color(C_GREEN), display_color(C_RESET));
 
