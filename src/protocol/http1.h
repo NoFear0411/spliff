@@ -209,6 +209,50 @@ int http1_find_body_start(const uint8_t *data, size_t len);
  */
 int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_size);
 
+/**
+ * @defgroup http1_flow Flow-Based HTTP/1 Parsing
+ * @brief Persistent parser for fragmented TCP streams
+ * @{
+ */
+
+/* Forward declarations */
+struct flow_context;
+struct ssl_data_event;
+
+/**
+ * @brief Get flow-based llhttp settings
+ *
+ * Returns settings configured for flow_transaction_t population.
+ * These settings use persistent state in flow_ctx->parser.h1.
+ *
+ * @return Pointer to flow-based llhttp settings
+ */
+struct llhttp_settings_s *http1_get_flow_settings(void);
+
+/**
+ * @brief Parse HTTP/1 data using persistent flow-based parser
+ *
+ * Uses the parser stored in flow_ctx->parser.h1 to maintain state
+ * across TCP segments. Handles:
+ * - Headers split across multiple SSL_read calls
+ * - Chunked transfer encoding (automatic via llhttp)
+ * - Partial body accumulation
+ *
+ * @param flow_ctx  Flow context with proto == FLOW_PROTO_HTTP1
+ * @param data      HTTP data to parse
+ * @param len       Data length
+ * @param event     SSL event being processed (for timestamps)
+ *
+ * @return Number of bytes parsed, or -1 on error
+ *
+ * @note Parser is auto-initialized on first call using http1_get_flow_settings()
+ * @note Message is displayed when headers complete (before body finishes)
+ */
+int http1_parse_flow(struct flow_context *flow_ctx, const uint8_t *data, size_t len,
+                     const struct ssl_data_event *event);
+
+/** @} */ /* End of http1_flow group */
+
 /** @} */ /* End of http1 group */
 
 #endif /* HTTP1_H */

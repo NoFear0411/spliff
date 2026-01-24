@@ -1655,3 +1655,71 @@ int bpf_loader_xdp_warmup_cookies(bpf_loader_t *loader, bool debug) {
 
     return seeded;
 }
+
+/* ============================================================================
+ * BPF Map Cookie Lookup - Find flow info by socket cookie
+ * ============================================================================
+ * Iterates flow_states map to find entry with matching cookie.
+ * Used as fallback when userspace cache misses.
+ */
+
+/* Must match struct flow_key in spliff.bpf.c */
+struct bpf_flow_key {
+    __u32 saddr;
+    __u32 daddr;
+    __u16 sport;
+    __u16 dport;
+    __u8  protocol;
+    __u8  ip_version;
+    __u8  _pad[2];
+} __attribute__((packed));
+
+/* Must match struct flow_state in spliff.bpf.c */
+struct bpf_flow_state {
+    __u64 socket_cookie;
+    __u64 first_seen_ns;
+    __u64 last_seen_ns;
+    __u32 pkt_count;
+    __u32 byte_count;
+    __u8  category;
+    __u8  state;
+    __u8  direction;
+    __u8  flags;
+} __attribute__((packed));
+
+int bpf_loader_lookup_flow_by_cookie(bpf_loader_t *loader, uint64_t cookie,
+                                     bpf_flow_info_t *info_out) {
+    if (!loader || !info_out || cookie == 0) {
+        return -1;
+    }
+
+    if (loader->xdp.flow_states_fd < 0) {
+        return -1;
+    }
+
+    struct bpf_flow_key key = {0};
+    struct bpf_flow_key next_key;
+    struct bpf_flow_state value;
+    int found = -1;
+
+    /* Iterate through all flow_states entries */
+    while (bpf_map_get_next_key(loader->xdp.flow_states_fd, &key, &next_key) == 0) {
+        if (bpf_map_lookup_elem(loader->xdp.flow_states_fd, &next_key, &value) == 0) {
+            if (value.socket_cookie == cookie) {
+                /* Found matching cookie - populate output */
+                info_out->saddr = next_key.saddr;
+                info_out->daddr = next_key.daddr;
+                info_out->sport = next_key.sport;
+                info_out->dport = next_key.dport;
+                info_out->category = value.category;
+                info_out->direction = value.direction;
+                info_out->ip_version = next_key.ip_version;
+                found = 0;
+                break;
+            }
+        }
+        key = next_key;
+    }
+
+    return found;
+}

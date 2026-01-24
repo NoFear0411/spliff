@@ -140,7 +140,8 @@ enum txn_flags {
     TXN_FLAG_BODY_ALLOCATED   = (1 << 3),  /**< body_buf dynamically allocated */
     TXN_FLAG_DISPLAYED        = (1 << 4),  /**< Already printed to output */
     TXN_FLAG_CHUNKED          = (1 << 5),  /**< Transfer-Encoding: chunked */
-    TXN_FLAG_COMPRESSED       = (1 << 6)   /**< Content-Encoding present */
+    TXN_FLAG_COMPRESSED       = (1 << 6),  /**< Content-Encoding present */
+    TXN_FLAG_KEEP_ALIVE       = (1 << 7)   /**< HTTP/1.1 Connection: keep-alive */
 };
 
 /**
@@ -160,9 +161,10 @@ enum txn_flags {
  * - Streams idle longer than FLOW_STREAM_TIMEOUT_MS are candidates for reaping
  */
 typedef struct flow_transaction {
-    /*=== Stream Identity (8 bytes) ===*/
+    /*=== Stream Identity (12 bytes) ===*/
     int32_t stream_id;              /**< HTTP/2 stream ID or 0 for HTTP/1 */
     txn_state_t state;              /**< Current state */
+    direction_t direction;          /**< DIR_REQUEST or DIR_RESPONSE */
 
     /*=== Flags and Timestamps (16 bytes) ===*/
     uint16_t flags;                 /**< TXN_FLAG_* bitfield */
@@ -217,6 +219,13 @@ typedef struct {
     llhttp_settings_t settings;     /**< Parser callback settings */
     bool initialized;               /**< true if parser is ready */
 
+    /*=== Header Parsing State (persistent across TCP segments) ===*/
+    char current_header_name[128];  /**< Header name being accumulated */
+    size_t header_name_len;         /**< Current header name length */
+    bool in_header_value;           /**< true if parsing header value */
+    bool headers_complete;          /**< true when headers section done */
+    bool message_complete;          /**< true when full message parsed */
+
     /*=== Transaction Support ===*/
     flow_transaction_t txn;         /**< Single transaction (HTTP/1 is sequential) */
 } h1_parser_ctx_t;
@@ -255,6 +264,16 @@ typedef struct {
 
     /*=== HPACK State ===*/
     bool hpack_corrupted;                   /**< Connection-fatal HPACK error */
+
+    /*=== Callback Context (Phase 3.6 migration) ===*/
+    /**
+     * @brief Opaque callback context for nghttp2
+     *
+     * Points to h2_callback_ctx_t (defined in http2.c).
+     * Allocated by flow_h2_session_init() and freed by flow_free_resources().
+     * This enables flow-based processing without global pool dependency.
+     */
+    void *callback_ctx;                     /**< Opaque nghttp2 callback context */
 } h2_parser_ctx_t;
 
 /**
@@ -742,6 +761,19 @@ int flow_manager_init(flow_manager_t *mgr);
 void flow_manager_cleanup(flow_manager_t *mgr);
 
 /**
+ * @brief Correlation path used for flow lookup
+ *
+ * Indicates which index was used to find the flow.
+ * Used for debugging and statistics.
+ */
+typedef enum {
+    FLOW_PATH_NONE     = 0,  /**< Flow not found */
+    FLOW_PATH_COOKIE   = 1,  /**< Found via cookie_index (fast path) */
+    FLOW_PATH_SHADOW   = 2,  /**< Found via shadow_index (fallback) */
+    FLOW_PATH_CREATED  = 3   /**< Newly created */
+} flow_lookup_path_t;
+
+/**
  * @brief Unified flow lookup
  *
  * Tries cookie_index first (fast path), falls back to shadow_index.
@@ -754,6 +786,23 @@ void flow_manager_cleanup(flow_manager_t *mgr);
  */
 flow_context_t *flow_lookup(flow_manager_t *mgr, uint64_t cookie,
                             uint32_t pid, uint64_t ssl_ctx);
+
+/**
+ * @brief Extended flow lookup with path information
+ *
+ * Same as flow_lookup() but also returns which index was used.
+ * Useful for debugging and monitoring correlation efficiency.
+ *
+ * @param mgr      Flow manager
+ * @param cookie   Socket cookie (0 if unknown)
+ * @param pid      Process ID
+ * @param ssl_ctx  SSL context
+ * @param path_out Output: which lookup path was used (may be NULL)
+ * @return Pointer to flow_context_t, or NULL if not found
+ */
+flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
+                               uint32_t pid, uint64_t ssl_ctx,
+                               flow_lookup_path_t *path_out);
 
 /**
  * @brief Get or create flow context
@@ -807,6 +856,53 @@ void flow_terminate(flow_manager_t *mgr, flow_context_t *ctx);
  * @return Number of flows evicted
  */
 int flow_evict_stale(flow_manager_t *mgr, uint64_t current_ns);
+
+/**
+ * @brief Pool statistics snapshot
+ *
+ * Read-only snapshot of pool and index statistics for monitoring
+ * and debugging. All values are captured atomically.
+ */
+typedef struct {
+    /* Pool statistics */
+    uint64_t pool_capacity;         /**< Total pool slots */
+    uint64_t pool_allocated;        /**< Currently allocated flows */
+    uint64_t pool_peak;             /**< Peak allocation (high water) */
+    uint64_t pool_total_allocs;     /**< Lifetime allocations */
+    uint64_t pool_total_frees;      /**< Lifetime frees */
+
+    /* Cookie index statistics */
+    uint64_t cookie_count;          /**< Entries in cookie index */
+    uint64_t cookie_hits;           /**< Successful cookie lookups */
+    uint64_t cookie_misses;         /**< Failed cookie lookups */
+
+    /* Shadow index statistics */
+    uint64_t shadow_count;          /**< Entries in shadow index */
+    uint64_t shadow_hits;           /**< Successful shadow lookups */
+    uint64_t shadow_promotions;     /**< Flows promoted to cookie index */
+} flow_pool_stats_t;
+
+/**
+ * @brief Get pool statistics snapshot
+ *
+ * Captures a consistent snapshot of all pool and index statistics.
+ * Uses atomic loads for thread-safety.
+ *
+ * @param mgr    Flow manager
+ * @param stats  Output structure to fill
+ */
+void flow_manager_get_stats(flow_manager_t *mgr, flow_pool_stats_t *stats);
+
+/**
+ * @brief Print pool statistics to stderr
+ *
+ * Displays human-readable pool statistics for debugging and monitoring.
+ * Called from threading_print_stats() on shutdown.
+ *
+ * @param mgr          Flow manager
+ * @param debug_mode   If true, show detailed breakdown
+ */
+void flow_manager_print_stats(flow_manager_t *mgr, bool debug_mode);
 
 /** @} */
 

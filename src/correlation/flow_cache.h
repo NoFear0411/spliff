@@ -147,4 +147,34 @@ int flow_cache_evict_stale(flow_cache_t *cache, uint64_t current_ns);
 void flow_cache_get_stats(flow_cache_t *cache, uint64_t *hits, uint64_t *misses,
                           uint64_t *inserts, uint64_t *evictions);
 
+/**
+ * @brief Warm-up flow cache from existing TCP connections (netlink)
+ *
+ * Queries netlink SOCK_DIAG for existing TCP connections and populates
+ * the cache with 5-tuple data. Uses socket inode as pseudo-cookie.
+ *
+ * @deprecated Use flow_cache_warmup_from_bpf() instead for accurate cookies
+ *
+ * @param cache Flow cache
+ * @param debug Enable debug output
+ * @return Number of connections seeded
+ */
+int flow_cache_warmup_from_netlink(flow_cache_t *cache, bool debug);
+
+/**
+ * @brief Warm-up flow cache from BPF flow_states map
+ *
+ * Iterates the BPF flow_states map and populates the cache with entries
+ * that have valid socket cookies. This provides accurate correlation for
+ * pre-existing connections that don't trigger XDP FLOW_NEW events.
+ *
+ * Should be called after BPF is loaded and XDP initialized.
+ *
+ * @param cache            Flow cache
+ * @param flow_states_fd   File descriptor for BPF flow_states map
+ * @param debug            Enable debug output
+ * @return Number of connections seeded
+ */
+int flow_cache_warmup_from_bpf(flow_cache_t *cache, int flow_states_fd, bool debug);
+
 #endif /* FLOW_CACHE_H */

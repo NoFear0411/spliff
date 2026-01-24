@@ -547,20 +547,24 @@ static void worker_loop(worker_ctx_t *ctx) {
                     switch (event->flow_ctx->proto) {
                     case FLOW_PROTO_HTTP2:
                         /*
-                         * HTTP/2: Create nghttp2 session
+                         * HTTP/2: Create nghttp2 session with proper callback context
                          *
-                         * Note: Currently passing NULL for user_data since the existing
-                         * callbacks expect h2_callback_ctx_t with global pool references.
-                         * This will be updated when callbacks are migrated to flow-based
-                         * processing (see SHARED_POOL_ARCHITECTURE.md Phase 3.3).
+                         * Creates callback context for flow-based processing, then
+                         * initializes the nghttp2 session. This enables direct use of
+                         * flow_ctx->parser.h2.session without global pool dependency.
                          */
                         if (event->flow_ctx->parser.h2.session == NULL) {
                             nghttp2_session_callbacks *cbs = http2_get_callbacks();
                             if (cbs) {
-                                int rv = flow_h2_session_init(event->flow_ctx, cbs, NULL);
-                                if (rv == 0 && g_config.debug_mode) {
-                                    fprintf(stderr, "[Worker %u] Initialized H2 session for flow_id=%u\n",
-                                            my_id, event->flow_ctx->self_id);
+                                /* Create callback context for this flow */
+                                void *cb_ctx = http2_create_callback_ctx(event->flow_ctx);
+                                if (cb_ctx) {
+                                    event->flow_ctx->parser.h2.callback_ctx = cb_ctx;
+                                    int rv = flow_h2_session_init(event->flow_ctx, cbs, cb_ctx);
+                                    if (rv == 0 && g_config.debug_mode) {
+                                        fprintf(stderr, "[Worker %u] Initialized H2 session for flow_id=%u\n",
+                                                my_id, event->flow_ctx->self_id);
+                                    }
                                 }
                             }
                         }
@@ -568,14 +572,14 @@ static void worker_loop(worker_ctx_t *ctx) {
 
                     case FLOW_PROTO_HTTP1:
                         /*
-                         * HTTP/1: Initialize llhttp parser with global callbacks
+                         * HTTP/1: Initialize llhttp parser with flow-based callbacks
                          *
-                         * Note: Currently the callbacks use parse_context_t which is
-                         * created fresh per http1_parse() call. The flow-based parser
-                         * will be used when parsing migration is complete.
+                         * The flow-based parser uses persistent state in flow_ctx->parser.h1
+                         * to handle headers/body split across TCP segments. Callbacks store
+                         * data in flow_transaction_t and display via on_headers_complete.
                          */
                         if (!event->flow_ctx->parser.h1.initialized) {
-                            llhttp_settings_t *settings = http1_get_settings();
+                            llhttp_settings_t *settings = http1_get_flow_settings();
                             int rv = flow_h1_parser_init(event->flow_ctx, settings);
                             if (rv == 0 && g_config.debug_mode) {
                                 fprintf(stderr, "[Worker %u] Initialized H1 parser for flow_id=%u\n",

@@ -544,4 +544,51 @@ const xdp_error_t *bpf_loader_xdp_get_last_error(bpf_loader_t *loader);
  */
 int bpf_loader_xdp_warmup_cookies(bpf_loader_t *loader, bool debug);
 
+/**
+ * @brief Flow info from BPF map lookup
+ *
+ * Contains network metadata retrieved from BPF flow_states map.
+ */
+typedef struct bpf_flow_info {
+    uint32_t saddr;           /**< Source IP (network byte order) */
+    uint32_t daddr;           /**< Dest IP (network byte order) */
+    uint16_t sport;           /**< Source port (network byte order) */
+    uint16_t dport;           /**< Dest port (network byte order) */
+    uint8_t  category;        /**< XDP protocol category */
+    uint8_t  direction;       /**< Traffic direction */
+    uint8_t  ip_version;      /**< IP version (4 or 6) */
+    uint8_t  _pad;
+} bpf_flow_info_t;
+
+/**
+ * @brief Lookup flow info from BPF map by socket cookie
+ *
+ * Iterates the flow_states BPF map to find an entry with matching cookie.
+ * This is used as a fallback when the userspace flow_cache misses but
+ * we know the connection exists in BPF.
+ *
+ * @param loader   BPF loader with XDP initialized
+ * @param cookie   Socket cookie to search for
+ * @param info_out Output structure for flow info
+ * @return 0 on success, -1 if not found
+ *
+ * @note This is O(n) in the number of flows, use sparingly
+ */
+int bpf_loader_lookup_flow_by_cookie(bpf_loader_t *loader, uint64_t cookie,
+                                     bpf_flow_info_t *info_out);
+
+/**
+ * @brief Get flow_states map file descriptor
+ *
+ * Returns the fd for the BPF flow_states map, used for userspace
+ * warm-up of the flow_cache.
+ *
+ * @param loader   BPF loader with XDP initialized
+ * @return File descriptor, or -1 if not available
+ */
+static inline int bpf_loader_get_flow_states_fd(bpf_loader_t *loader) {
+    return (loader && loader->xdp.flow_states_fd >= 0) ?
+           loader->xdp.flow_states_fd : -1;
+}
+
 #endif /* BPF_LOADER_H */

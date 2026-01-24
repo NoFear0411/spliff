@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.9.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.3-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -25,13 +25,15 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | HTTP/1.1 | llhttp  | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
 | HTTP/2   | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
 
-### Shared Pool Architecture (v0.9.2+)
+### Shared Pool Architecture (v0.9.3+)
 - **Unified Flow Context**: Pre-allocated pool of 8192 flow slots with dual-index lookup
 - **Zero-Copy Correlation**: Socket cookie index + shadow index (pid, ssl_ctx) for O(1) lookup
 - **Per-Flow HTTP/2 Streams**: 64-stream pool per flow with O(1) free-list allocation
 - **Worker Affinity**: Atomic CAS claim ensures single-writer guarantee per flow
 - **HPACK Corruption Detection**: Connection-fatal flag per RFC 7540 Section 4.3
 - **Ghost Stream Reaping**: 10-second timeout for idle stream cleanup
+- **Pool Statistics**: Runtime visibility into capacity, allocations, index hit rates
+- **BPF Map Warm-up**: Direct iteration of BPF flow_states for accurate pre-existing connection correlation
 
 ### Dynamic Process Monitoring (v0.9.0+)
 - **EDR-Style Process Scanning**: Discovers SSL libraries in running processes via `/proc/PID/maps`
@@ -45,7 +47,9 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **Auto-Attach**: Discovers and attaches to all suitable interfaces (physical/virtual)
 - **Protocol Detection**: TLS, HTTP/2, HTTP/1.x classification at packet level
 - **sock_ops Cookie Caching**: "Golden Thread" correlation between packets and SSL sessions
-- **Connection Warm-up**: Seeds existing TCP connections at startup via netlink SOCK_DIAG
+- **Dual Warm-up Strategy** (v0.9.3):
+  - BPF map warm-up: iterates `flow_states` for real socket cookies
+  - Netlink warm-up: seeds `flow_cookie_map` via SOCK_DIAG for XDP visibility
 - **XDP Statistics**: Debug-mode metrics (packets, flows, gatekeeper hits)
 
 ### BPF-Level Filtering (v0.7.0+)

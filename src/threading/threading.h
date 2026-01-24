@@ -474,9 +474,14 @@ void pool_free(object_pool_t *pool, void *obj);
 /**
  * @brief ALPN cache entry for protocol negotiation results
  *
- * Caches the Application-Layer Protocol Negotiation (ALPN) result for
- * each SSL connection. Used to determine whether to parse traffic as
- * HTTP/1.1, HTTP/2, or another protocol.
+ * @deprecated Phase 3.6 migrated to flow_context_t::alpn[16].
+ * Code already prefers flow_ctx->alpn with fallback to this cache.
+ * Once flow-based path is fully validated, this can be removed
+ * along with worker_*_alpn() functions.
+ *
+ * @par Replacement: Use flow_ctx->alpn which provides:
+ * - Direct storage in flow context (no separate lookup)
+ * - Automatic cleanup when flow expires
  *
  * @par Lookup Key: (pid, ssl_ctx)
  */
@@ -490,15 +495,17 @@ typedef struct {
 /**
  * @brief Pending body entry for chunked/streaming response assembly
  *
- * When an HTTP response body arrives in multiple SSL_read calls, this
- * structure accumulates the fragments until the complete body is received.
- * Supports decompression of gzip/brotli/zstd encoded bodies.
+ * @deprecated Phase 3.6 migrated to flow_context_t::body (body_ctx_t).
+ * This structure is only used by the legacy HTTP/1 fallback path when
+ * flow_ctx is not available. Once flow-based parsing is fully validated,
+ * this can be removed along with worker_*_pending_body() functions.
+ *
+ * @par Replacement: Use flow_ctx->body which provides:
+ * - Automatic cleanup when flow expires
+ * - Thread-safe access via worker affinity
+ * - Unified storage for HTTP/1 and HTTP/2
  *
  * @par Lookup Key: (pid, ssl_ctx)
- *
- * @par Memory Management:
- * accum_buf is dynamically allocated and grows as needed. Freed when
- * body is complete or connection closes.
  */
 typedef struct {
     uint32_t pid;               /**< Process ID */
@@ -529,14 +536,19 @@ typedef struct {
 /**
  * @brief HTTP/1.1 request cache entry for request-response correlation
  *
- * HTTP/1.1 is request-response sequential on a single connection. We cache
- * the most recent request details so when the response arrives, we can
- * display them together (method, path, status code).
+ * @deprecated Phase 3.6 migrated to flow_transaction_t in flow_context_t.
+ * This structure is only used by the legacy HTTP/1 fallback path when
+ * flow_ctx is not available. Once flow-based parsing is fully validated,
+ * this can be removed along with worker_*_h1_request() functions.
+ *
+ * @par Replacement: Use flow_ctx->parser.h1.txn which provides:
+ * - method, path, host fields for request-response correlation
+ * - Persistent across HTTP/1.1 keep-alive connections
+ * - Thread-safe access via worker affinity
  *
  * @par Lookup Key: (pid, ssl_ctx)
  *
  * @note Only one request cached per connection since HTTP/1.1 is sequential.
- *       HTTP/2 uses stream IDs for correlation instead.
  */
 typedef struct {
     uint32_t pid;       /**< Process ID */

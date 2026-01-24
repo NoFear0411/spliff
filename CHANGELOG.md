@@ -2,6 +2,83 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.3] - 2026-01-24
+
+### Added
+- **BPF Flow Cache Warm-up**: Direct BPF map iteration for accurate correlation
+  - `flow_cache_warmup_from_bpf()`: Iterates `flow_states` map at startup
+  - Uses real socket cookies instead of inode pseudo-cookies
+  - Significantly improves correlation rate for pre-existing connections
+
+- **Dual-Index Flow Lookup**: Extended correlation path visibility
+  - `flow_lookup_ex()`: Returns which index was used (COOKIE, SHADOW, CREATED, NONE)
+  - `flow_lookup_path_t` enum for tracking correlation paths
+  - Debug output shows correlation path in `-d` mode
+
+- **Pool Statistics API**: Runtime visibility into flow pool health
+  - `flow_pool_stats_t`: Capacity, allocations, frees, index hit rates
+  - `flow_manager_get_stats()` / `flow_manager_print_stats()`
+  - Statistics shown in threading summary output
+
+- **BPF Cookie Lookup Function**: Direct map query fallback
+  - `bpf_loader_lookup_flow_by_cookie()`: O(n) fallback lookup
+  - `bpf_loader_get_flow_states_fd()`: Access BPF map fd
+
+### Changed
+- **Legacy Code Cleanup**: Removed deprecated global pools and duplicate caches
+  - Deprecated `pending_body_entry_t` with migration notes
+  - Deprecated `alpn_cache_entry_t` in favor of flow-local storage
+  - Removed redundant global pool references from threading code
+
+- **Phase 4.1-4.3 Complete**: Pool statistics and correlation debug output
+  - Flow janitor evicts from both legacy cache and Shared Pool
+  - Correlation path visible in debug mode for troubleshooting
+  - VPN detection: expected ~7% correlation rate through WireGuard
+
+### Fixed
+- **Pre-existing Connection Correlation**: Major improvement in correlation rate
+  - Root cause: XDP FLOW_NEW events not emitted for already-classified flows
+  - Fix: BPF map warm-up provides real cookies to userspace cache
+  - Improvement: ~55% → ~80%+ correlation for pre-existing connections
+
+### Architecture
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    Shared Pool Architecture (v0.9.3)                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   ┌─────────────┐     ┌──────────────────┐     ┌──────────────────┐    │
+│   │ SSL Events  │────►│  Dual-Index      │────►│  flow_context_t  │    │
+│   │ (uprobe)    │     │  Lookup          │     │  Pool (8192)     │    │
+│   └─────────────┘     │  ┌────────────┐  │     └──────────────────┘    │
+│                       │  │cookie_index│  │              │              │
+│   ┌─────────────┐     │  │(fast path) │  │     ┌────────▼────────┐    │
+│   │ XDP Events  │────►│  ├────────────┤  │────►│ Per-Flow State  │    │
+│   │ (FLOW_NEW)  │     │  │shadow_index│  │     │  • H2 streams   │    │
+│   └─────────────┘     │  │(fallback)  │  │     │  • H1 parser    │    │
+│         │             │  └────────────┘  │     │  • Body buffer  │    │
+│         │             └──────────────────┘     └─────────────────┘    │
+│         │                                                              │
+│         ▼                                                              │
+│   ┌─────────────┐     ┌──────────────────┐                             │
+│   │ flow_cache  │────►│  5-tuple lookup  │◄── BPF warm-up at startup   │
+│   │ (legacy)    │     │  by cookie       │                             │
+│   └─────────────┘     └──────────────────┘                             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Known Issues
+- **Partial Correlation for Some Domains**: ~20% of requests may lack XDP correlation
+  - Affects: domains accessed immediately at startup (fonts, CDNs)
+  - Cause: timing race between SSL events and XDP map population
+  - Impact: cosmetic only (HTTP content captured, just no IP metadata)
+  - Workaround: BPF warm-up mitigates but cannot fully eliminate
+
+- **VPN/Tunnel Impact**: XDP sees encrypted outer packets, not inner TCP
+  - WireGuard/OpenVPN: ~7% correlation rate expected
+  - Solution: attach XDP to tunnel interface (tun0, wg0) if needed
+
 ## [0.9.2] - 2026-01-20
 
 ### Added

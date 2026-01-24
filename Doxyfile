@@ -308,6 +308,13 @@ EXPAND_AS_DEFINED      =
 SKIP_FUNCTION_MACROS   = YES
 
 #---------------------------------------------------------------------------
+# Custom command aliases
+#---------------------------------------------------------------------------
+
+# Define @license as a paragraph with "License:" header
+ALIASES                = "license=@par License:^^"
+
+#---------------------------------------------------------------------------
 # Configuration options related to the dot tool
 #---------------------------------------------------------------------------
 
@@ -316,9 +323,6 @@ HAVE_DOT               = YES
 
 # Dot tool path
 DOT_PATH               =
-
-# Class diagrams
-CLASS_DIAGRAMS         = YES
 
 # Collaboration diagrams
 COLLABORATION_GRAPH    = YES
@@ -355,9 +359,6 @@ DOT_GRAPH_MAX_NODES    = 50
 
 # Max dot graph depth
 MAX_DOT_GRAPH_DEPTH    = 0
-
-# Dot transparent
-DOT_TRANSPARENT        = NO
 
 # Dot multi targets
 DOT_MULTI_TARGETS      = YES
