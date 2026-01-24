@@ -23,21 +23,12 @@
 #include <stdint.h>
 
 /**
- * @brief Safely copy a null-terminated string
- *
  * Implementation uses memccpy for efficient single-pass copying that
  * stops at the null terminator. This is more efficient than strlen+memcpy
  * as it avoids scanning the string twice.
  *
- * @param dst      Destination buffer
- * @param dst_size Size of destination buffer
- * @param src      Source string
- * @return Number of characters copied (excluding null terminator)
- *
- * @internal
- * The memccpy function copies bytes until it finds the specified character
- * ('\0' in this case) or reaches the limit. It returns a pointer to the
- * byte after the copied character, or NULL if the character wasn't found.
+ * @note memccpy copies up to n bytes, stopping at char c ('\0' here).
+ * Returns pointer to byte after copied char, or NULL if not found.
  */
 size_t safe_strcpy(char *dst, size_t dst_size, const char *src) {
     if (dst_size == 0) return 0;
@@ -60,16 +51,8 @@ size_t safe_strcpy(char *dst, size_t dst_size, const char *src) {
 }
 
 /**
- * @brief Safely copy a string with explicit length limit
- *
- * Implementation combines length limiting with null-termination guarantee.
+ * Combines length limiting with null-termination guarantee.
  * Uses memccpy to efficiently handle embedded null bytes in the source.
- *
- * @param dst      Destination buffer
- * @param dst_size Size of destination buffer
- * @param src      Source string (may not be null-terminated)
- * @param src_len  Maximum bytes to copy from source
- * @return Number of characters copied (excluding null terminator)
  */
 size_t safe_strncpy(char *dst, size_t dst_size, const char *src, size_t src_len) {
     if (dst_size == 0) return 0;
@@ -95,16 +78,8 @@ size_t safe_strncpy(char *dst, size_t dst_size, const char *src, size_t src_len)
 }
 
 /**
- * @brief Safely copy memory with bounds checking
- *
  * Simple wrapper around memcpy that enforces destination size limits.
  * Does not handle overlapping regions - use safe_memmove() for that.
- *
- * @param dst      Destination buffer
- * @param dst_size Size of destination buffer
- * @param src      Source buffer
- * @param src_len  Bytes to copy from source
- * @return Number of bytes actually copied
  */
 size_t safe_memcpy(void *dst, size_t dst_size, const void *src, size_t src_len) {
     if (dst_size == 0 || !dst || !src) return 0;
@@ -115,21 +90,11 @@ size_t safe_memcpy(void *dst, size_t dst_size, const void *src, size_t src_len) 
 }
 
 /**
- * @brief Safely concatenate strings
+ * First finds the current string length using strnlen (bounded to prevent
+ * scanning past dst_size), then appends as much of src as will fit.
  *
- * Implementation first finds the current string length using strnlen
- * (bounded to prevent scanning past dst_size), then appends as much
- * of src as will fit.
- *
- * @param dst      Destination buffer with existing string
- * @param dst_size Total size of destination buffer
- * @param src      String to append
- * @return Total length of concatenated string (may exceed dst_size if truncated)
- *
- * @internal
- * The return value semantics match BSD strlcat: it returns the total length
- * that would result from concatenation, even if truncation occurred. This
- * allows callers to detect truncation by comparing with dst_size.
+ * @note Return value semantics match BSD strlcat: returns total length
+ * that would result from concatenation, even if truncation occurred.
  */
 size_t safe_strcat(char *dst, size_t dst_size, const char *src) {
     if (dst_size == 0 || !dst || !src) return 0;
@@ -152,27 +117,12 @@ size_t safe_strcat(char *dst, size_t dst_size, const char *src) {
 }
 
 /**
- * @brief Securely clear memory (cannot be optimized away)
+ * Ensures memory is actually zeroed, even when the compiler might otherwise
+ * optimize away the clearing.
  *
- * This function ensures memory is actually zeroed, even when the compiler
- * might otherwise optimize away the clearing (e.g., when the memory is
- * not read after being cleared).
- *
- * @param ptr Pointer to memory to clear
- * @param len Number of bytes to clear
- *
- * @internal
- * Two implementations are provided:
- *
- * 1. **C23 with Annex K**: Uses memset_explicit() which is guaranteed
- *    not to be optimized away.
- *
- * 2. **Fallback**: Uses a volatile pointer to prevent optimization.
- *    The volatile qualifier on both the pointer and the pointed-to type
- *    ensures the compiler cannot assume the memory operations are dead.
- *
- * @note This is critical for security: passwords, keys, and other sensitive
- *       data must be cleared before the memory is freed or goes out of scope.
+ * Implementation:
+ * - **C23 with Annex K**: Uses memset_explicit() (guaranteed not optimized away)
+ * - **Fallback**: Uses volatile pointer to prevent optimization
  */
 void safe_memclear(void *ptr, size_t len) {
     if (!ptr || len == 0) return;
@@ -190,18 +140,9 @@ void safe_memclear(void *ptr, size_t len) {
 }
 
 /**
- * @brief Safely move memory with bounds checking
- *
  * Wrapper around memmove that enforces destination size limits.
  * Unlike memcpy, memmove correctly handles overlapping source and
- * destination regions by copying through an intermediate buffer
- * (conceptually) or by copying in the appropriate direction.
- *
- * @param dst      Destination buffer
- * @param dst_size Size of destination buffer
- * @param src      Source buffer (may overlap with dst)
- * @param src_len  Bytes to move from source
- * @return Number of bytes actually moved
+ * destination regions.
  */
 size_t safe_memmove(void *dst, size_t dst_size, const void *src, size_t src_len) {
     if (dst_size == 0 || !dst || !src) return 0;

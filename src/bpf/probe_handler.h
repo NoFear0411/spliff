@@ -45,7 +45,7 @@ enum event_type {
 };
 
 /* SSL data event from BPF (must match BPF side) */
-typedef struct {
+typedef struct ssl_data_event {
     uint64_t timestamp_ns;
     uint64_t delta_ns;       /* Latency (function execution time) */
     uint64_t ssl_ctx;        /* SSL context pointer for connection tracking */

@@ -35,7 +35,11 @@
  */
 
 #include "http1.h"
+#include "../include/spliff.h"
+#include "../bpf/probe_handler.h"
 #include "../util/safe_str.h"
+#include "../correlation/flow_context.h"
+#include "../output/display.h"
 #include <llhttp.h>
 #include <string.h>
 #include <strings.h>
@@ -622,3 +626,370 @@ int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t 
 }
 
 /** @} */ /* End of http1_public group */
+
+/*============================================================================
+ * Flow-Based HTTP/1 Parsing (Phase 3.6.5)
+ *
+ * These functions implement persistent HTTP/1 parsing using flow_context_t
+ * storage. The parser maintains state across TCP segments and populates
+ * flow_transaction_t for unified transaction handling.
+ *
+ * Key design: All parsing state is stored in h1_parser_ctx_t (inside flow_ctx)
+ * so that fragmented headers and chunked bodies work correctly across
+ * multiple SSL_read calls.
+ *============================================================================*/
+
+/**
+ * @brief Minimal callback context for flow-based parsing
+ *
+ * Only holds pointers - actual state is in flow_ctx->parser.h1
+ * which persists across TCP segments.
+ */
+typedef struct {
+    struct flow_context *flow_ctx;      /**< Flow context (has persistent state) */
+    const struct ssl_data_event *event; /**< Current SSL event */
+} h1_flow_cb_ctx_t;
+
+/* Forward declaration */
+static void h1_display_message_flow(struct flow_context *flow_ctx,
+                                     const struct ssl_data_event *event);
+
+/*--- Flow-based llhttp callbacks using persistent state ---*/
+
+static int on_message_begin_flow(llhttp_t *parser) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+
+    /* Reset persistent parsing state for new message */
+    h1->header_name_len = 0;
+    h1->in_header_value = false;
+    h1->headers_complete = false;
+    h1->message_complete = false;
+
+    /* Reset transaction for new message */
+    flow_h1_reset_txn(cb->flow_ctx);
+    h1->txn.state = TXN_STATE_OPEN;
+    h1->txn.stream_id = 0;  /* HTTP/1 has no streams */
+
+    /* Set start time from current event */
+    if (cb->event) {
+        h1->txn.start_time_ns = cb->event->timestamp_ns;
+    }
+
+    return 0;
+}
+
+static int on_url_flow(llhttp_t *parser, const char *at, size_t len) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    flow_transaction_t *txn = &cb->flow_ctx->parser.h1.txn;
+
+    /* Append to path (URL may arrive in multiple chunks) */
+    size_t current_len = strlen(txn->path);
+    size_t space = sizeof(txn->path) - current_len - 1;
+    size_t to_copy = len < space ? len : space;
+
+    if (to_copy > 0) {
+        memcpy(txn->path + current_len, at, to_copy);
+        txn->path[current_len + to_copy] = '\0';
+    }
+
+    return 0;
+}
+
+static int on_status_flow(llhttp_t *parser, const char *at, size_t len) {
+    (void)parser;
+    (void)at;
+    (void)len;
+    /* Status text not stored in flow_transaction_t */
+    return 0;
+}
+
+static int on_header_field_flow(llhttp_t *parser, const char *at, size_t len) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+
+    if (h1->in_header_value) {
+        /* Starting new header - reset accumulated name */
+        h1->header_name_len = 0;
+        h1->in_header_value = false;
+    }
+
+    /* Accumulate header name (may arrive in chunks) */
+    size_t space = sizeof(h1->current_header_name) - h1->header_name_len - 1;
+    size_t to_copy = len < space ? len : space;
+
+    if (to_copy > 0) {
+        memcpy(h1->current_header_name + h1->header_name_len, at, to_copy);
+        h1->header_name_len += to_copy;
+        h1->current_header_name[h1->header_name_len] = '\0';
+    }
+
+    return 0;
+}
+
+static int on_header_value_flow(llhttp_t *parser, const char *at, size_t len) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+    flow_transaction_t *txn = &h1->txn;
+
+    h1->in_header_value = true;
+
+    if (h1->header_name_len == 0) return 0;
+
+    /* Extract important headers into flow_transaction_t */
+    if (strcasecmp(h1->current_header_name, "Host") == 0) {
+        size_t cur = strlen(txn->host);
+        size_t space = sizeof(txn->host) - cur - 1;
+        size_t to_copy = len < space ? len : space;
+        if (to_copy > 0) {
+            memcpy(txn->host + cur, at, to_copy);
+            txn->host[cur + to_copy] = '\0';
+        }
+    } else if (strcasecmp(h1->current_header_name, "Content-Type") == 0) {
+        size_t cur = strlen(txn->content_type);
+        size_t space = sizeof(txn->content_type) - cur - 1;
+        size_t to_copy = len < space ? len : space;
+        if (to_copy > 0) {
+            memcpy(txn->content_type + cur, at, to_copy);
+            txn->content_type[cur + to_copy] = '\0';
+        }
+    } else if (strcasecmp(h1->current_header_name, "Content-Length") == 0) {
+        char len_str[32] = {0};
+        size_t to_copy = len < 31 ? len : 31;
+        memcpy(len_str, at, to_copy);
+        txn->content_length = strtoull(len_str, NULL, 10);
+    }
+
+    return 0;
+}
+
+static int on_header_value_complete_flow(llhttp_t *parser) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+
+    h1->header_name_len = 0;
+    h1->in_header_value = false;
+    return 0;
+}
+
+static int on_headers_complete_flow(llhttp_t *parser) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+    flow_transaction_t *txn = &h1->txn;
+
+    h1->headers_complete = true;
+
+    /* Set direction and extract method/status from parser */
+    if (parser->type == HTTP_REQUEST) {
+        txn->direction = DIR_REQUEST;
+        const char *method_str = llhttp_method_name((llhttp_method_t)parser->method);
+        if (method_str) {
+            safe_strcpy(txn->method, sizeof(txn->method), method_str);
+        }
+    } else {
+        txn->direction = DIR_RESPONSE;
+        txn->status_code = (int)parser->status_code;
+    }
+
+    txn->state = TXN_STATE_OPEN;  /* Headers received, body may follow */
+
+    /* Display immediately when headers complete */
+    if (!(txn->flags & TXN_FLAG_DISPLAYED)) {
+        txn->flags |= TXN_FLAG_DISPLAYED;
+        h1_display_message_flow(cb->flow_ctx, cb->event);
+    }
+
+    return 0;
+}
+
+static int on_body_flow(llhttp_t *parser, const char *at, size_t len) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    flow_transaction_t *txn = &cb->flow_ctx->parser.h1.txn;
+
+    /* Append body data using flow helper (handles buffer allocation) */
+    flow_txn_append_body(txn, (const uint8_t *)at, len);
+
+    return 0;
+}
+
+static int on_message_complete_flow(llhttp_t *parser) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+
+    h1->message_complete = true;
+    h1->txn.state = TXN_STATE_CLOSED;
+
+    /*
+     * Check keep-alive status per llhttp docs:
+     * llhttp_should_keep_alive() returns 1 if there might be any other
+     * messages following the last that was successfully parsed.
+     *
+     * Note: For HTTP/1.1, Connection: keep-alive is default.
+     * For HTTP/1.0, Connection: keep-alive must be explicit.
+     */
+    h1->txn.flags |= llhttp_should_keep_alive(parser) ? TXN_FLAG_KEEP_ALIVE : 0;
+
+    return 0;
+}
+
+/**
+ * @brief Reset callback for HTTP/1.1 keep-alive connections
+ *
+ * Called after on_message_complete and before on_message_begin when
+ * a new message is received on the same parser (HTTP/1.1 keep-alive).
+ * This is NOT called for the first message.
+ *
+ * @note Per llhttp docs: "Invoked after on_message_complete and before
+ * on_message_begin when a new message is received on the same parser."
+ */
+static int on_reset_flow(llhttp_t *parser) {
+    h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
+    h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+
+    /* Clear transaction for next message (keep-alive pipelining) */
+    memset(&h1->txn, 0, sizeof(h1->txn));
+
+    /* Reset header parsing state */
+    h1->header_name_len = 0;
+    h1->in_header_value = false;
+    h1->headers_complete = false;
+    h1->message_complete = false;
+
+    return 0;
+}
+
+/* Global flow-based settings */
+static llhttp_settings_t g_flow_settings;
+static bool g_flow_settings_initialized = false;
+
+/**
+ * @brief Initialize flow-based llhttp settings
+ */
+static void http1_init_flow_settings(void) {
+    if (g_flow_settings_initialized) return;
+
+    llhttp_settings_init(&g_flow_settings);
+    g_flow_settings.on_message_begin = on_message_begin_flow;
+    g_flow_settings.on_url = on_url_flow;
+    g_flow_settings.on_status = on_status_flow;
+    g_flow_settings.on_header_field = on_header_field_flow;
+    g_flow_settings.on_header_value = on_header_value_flow;
+    g_flow_settings.on_header_value_complete = on_header_value_complete_flow;
+    g_flow_settings.on_headers_complete = on_headers_complete_flow;
+    g_flow_settings.on_body = on_body_flow;
+    g_flow_settings.on_message_complete = on_message_complete_flow;
+    g_flow_settings.on_reset = on_reset_flow;  /* HTTP/1.1 keep-alive support */
+
+    g_flow_settings_initialized = true;
+}
+
+llhttp_settings_t *http1_get_flow_settings(void) {
+    if (!g_flow_settings_initialized) {
+        http1_init_flow_settings();
+    }
+    return &g_flow_settings;
+}
+
+/**
+ * @brief Display HTTP/1 message from flow transaction
+ */
+static void h1_display_message_flow(struct flow_context *flow_ctx,
+                                     const struct ssl_data_event *event) {
+    flow_transaction_t *txn = &flow_ctx->parser.h1.txn;
+    http_message_t msg = {0};
+
+    msg.protocol = PROTO_HTTP1;
+    msg.direction = txn->direction;
+    msg.pid = flow_ctx->pid;
+    msg.timestamp_ns = event ? event->timestamp_ns : 0;
+    msg.delta_ns = event ? event->delta_ns : 0;
+
+    safe_strcpy(msg.method, sizeof(msg.method), txn->method);
+    safe_strcpy(msg.path, sizeof(msg.path), txn->path);
+    safe_strcpy(msg.authority, sizeof(msg.authority), txn->host);
+    msg.status_code = txn->status_code;
+    safe_strcpy(msg.content_type, sizeof(msg.content_type), txn->content_type);
+    msg.content_length = txn->content_length;
+    safe_strcpy(msg.comm, sizeof(msg.comm), flow_ctx->comm);
+
+    /* Add ALPN protocol if negotiated */
+    if (flow_ctx->alpn[0]) {
+        safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), flow_ctx->alpn);
+    }
+
+    /* Add XDP flow correlation if available */
+    if (flow_ctx->flags & FLOW_FLAG_HAS_XDP) {
+        msg.has_flow_info = true;
+        msg.flow_src_ip = flow_ctx->flow.saddr;
+        msg.flow_dst_ip = flow_ctx->flow.daddr;
+        msg.flow_src_port = flow_ctx->flow.sport;
+        msg.flow_dst_port = flow_ctx->flow.dport;
+        msg.flow_ip_version = flow_ctx->flow.ip_version;
+    }
+
+    if (txn->direction == DIR_REQUEST) {
+        display_http_request(&msg);
+    } else {
+        display_http_response(&msg);
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+int http1_parse_flow(struct flow_context *flow_ctx, const uint8_t *data, size_t len,
+                     const struct ssl_data_event *event) {
+    if (!flow_ctx || flow_ctx->proto != FLOW_PROTO_HTTP1) {
+        return -1;
+    }
+
+    h1_parser_ctx_t *h1 = &flow_ctx->parser.h1;
+
+    /* Initialize parser with flow-based settings if needed */
+    if (!h1->initialized) {
+        llhttp_settings_t *settings = http1_get_flow_settings();
+        if (flow_h1_parser_init(flow_ctx, settings) != 0) {
+            return -1;
+        }
+    }
+
+    /* Setup minimal callback context (just pointers, state is in h1) */
+    h1_flow_cb_ctx_t cb_ctx = {
+        .flow_ctx = flow_ctx,
+        .event = event
+    };
+
+    /* Attach context to parser for this execution */
+    h1->parser.data = &cb_ctx;
+
+    /* Execute parser - llhttp maintains internal state across calls */
+    llhttp_errno_t err = llhttp_execute(&h1->parser, (const char *)data, len);
+
+    if (err == HPE_OK) {
+        /* All data consumed successfully */
+        return (int)len;
+    }
+
+    if (err == HPE_PAUSED_UPGRADE) {
+        /* Connection upgrade (WebSocket, h2c, etc.) - normal completion */
+        return (int)len;
+    }
+
+    /*
+     * Parse error - use llhttp_get_error_pos() to determine bytes consumed.
+     * This is important for partial parses where some data was processed.
+     */
+    const char *error_pos = llhttp_get_error_pos(&h1->parser);
+    size_t parsed = error_pos ? (size_t)(error_pos - (const char *)data) : 0;
+
+    if (!h1->headers_complete) {
+        /* Headers incomplete - real error */
+        return -1;
+    }
+
+    /*
+     * Headers done, truncated body is acceptable for sniffing.
+     * This commonly happens when we don't receive the full body
+     * in a single buffer, which is normal for large responses.
+     */
+    return (int)(parsed > 0 ? parsed : len);
+}

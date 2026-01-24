@@ -1,8 +1,8 @@
 # Shared Pool Architecture: Implementation Plan
 
-**Version:** 1.1
-**Date:** 2026-01-20
-**Status:** Phase 3.6 Complete (v0.9.2)
+**Version:** 1.4
+**Date:** 2026-01-24
+**Status:** Phase 3.6 Complete - Single-Threaded Mode Retired (v0.9.2)
 
 ## Executive Summary
 
@@ -145,18 +145,20 @@ Update workers to use unified flow context.
 |------|-------------|--------|
 | 3.1 | Update `worker_event_t` to carry `flow_id` | ✅ Done |
 | 3.2 | Update workers to resolve `flow_id` → `flow_context_t*` | ✅ Done |
-| 3.3 | Migrate protocol parsers to use `flow_context.parser` | 🔶 Partial |
+| 3.3 | Migrate protocol parsers to use `flow_context.parser` | ✅ Done |
 | 3.4 | Remove duplicate caches from `worker_state_t` | ⬜ Deferred |
 
 **Task 3.3 Notes:**
 - ✅ ALPN storage: `flow_ctx->alpn` populated on EVENT_ALPN
 - ✅ ALPN lookup: `process_worker_event()` prefers `flow_ctx->alpn`
 - ✅ Parser init: `flow_init_parser()` called when ALPN received
-- ✅ HTTP/1 parser: `flow_h1_parser_init()` called on worker claim (infrastructure ready)
-- ✅ HTTP/2 parser: `flow_h2_session_init()` called on worker claim (infrastructure ready)
-- ⬜ HTTP/1 parsing: Still uses global `http1_parse()` - needs migration
-- ⬜ HTTP/2 parsing: Still uses global `g_h2_connections[]` - needs migration
-- ⬜ Stream tracking: HTTP/2 streams still use `worker_state.h2_streams[]`
+- ✅ HTTP/1 parser: `flow_h1_parser_init()` called on worker claim
+- ✅ HTTP/2 parser: `flow_h2_session_init()` called on worker claim
+- ✅ HTTP/1 parsing: Uses `http1_parse_flow()` with persistent state (Phase D complete)
+- ✅ HTTP/2 request parsing: Uses `flow_ctx->parser.h2.session` (nghttp2)
+- ✅ HTTP/2 response parsing: Uses `flow_ctx->parser.h2.inflater` (HPACK)
+- ✅ Stream tracking: HTTP/2 streams use `flow_ctx->parser.h2.streams[]`
+- ⚠️ Legacy code: Global pools still exist but no longer used in flow-based path (cleanup pending)
 
 **Task 3.4 Notes:**
 Deferred - requires completing HTTP/2 stream migration first. Current architecture:
@@ -212,10 +214,10 @@ Fixes race conditions and memory leaks in multi-threaded HTTP/2 parsing.
 | 3.6.2 | Update `h1_parser_ctx_t` with embedded `txn` | ✅ Done |
 | 3.6.3 | Update `h2_parser_ctx_t` with `streams[]` array | ✅ Done |
 | 3.6.4 | Create transaction helper functions | ✅ Done |
-| 3.6.5 | Update HTTP/1 to use persistent parser | ⬜ Pending |
+| 3.6.5 | Update HTTP/1 to use persistent parser | ✅ Done |
 | 3.6.6 | Update HTTP/2 callbacks for flow-based streams | ✅ Done |
 | 3.6.7 | Update `process_worker_event` for flow parsing | ✅ Done |
-| 3.6.8 | Remove global `g_h2_connections`, `g_h2_streams` | ⬜ Pending |
+| 3.6.8 | Remove global `g_h2_connections`, `g_h2_streams` | ✅ Done |
 
 **Phase A Complete (2026-01-20):**
 - `flow_transaction_t` defined in `flow_context.h` with RFC 7540-aligned state machine
@@ -240,6 +242,32 @@ Fixes race conditions and memory leaks in multi-threaded HTTP/2 parsing.
 - `http2_process_frame_flow()` bridge function created
 - `process_worker_event()` in main.c updated to call `http2_process_frame_flow()`
 - Backward compatibility maintained (both global pools AND flow_transaction_t populated)
+
+**Phase C Complete (2026-01-24):**
+- Added `callback_ctx` field to `h2_parser_ctx_t` for per-flow callback context
+- Added `http2_create_callback_ctx()`, `http2_free_callback_ctx()`, `http2_set_callback_event()`
+- Worker now creates callback context when initializing H2 sessions
+- `http2_process_frame_flow()` now uses flow-based session for **both requests AND responses**
+- Response processing fully migrated to flow-based storage:
+  - `h2_process_response_header_flow()`: Stores response headers in `flow_transaction_t`
+  - `h2_display_response_flow()`: Displays response using flow transaction data
+  - `h2_process_complete_response_frame_flow()`: HPACK decode using `flow_ctx->parser.h2.inflater`
+  - `h2_process_response_frame_flow()`: Reassembly using `flow_ctx->parser.h2.reassembly_buf`
+- Global pool (`g_h2_connections`, `g_h2_streams`) no longer used in flow-based path
+
+**Phase D Complete (2026-01-24) - HTTP/1 Flow-Based Parsing:**
+- Implemented persistent llhttp parser using `flow_ctx->parser.h1`
+- Flow-based callbacks store data in persistent `h1_parser_ctx_t` state:
+  - `on_url_flow()`: Accumulates URL fragments across TCP segments
+  - `on_header_field_flow()`, `on_header_value_flow()`: Header accumulation
+  - `on_headers_complete_flow()`: Sets direction, extracts method/status
+  - `on_body_flow()`: Appends body to `flow_transaction_t`
+  - `on_message_complete_flow()`: Marks transaction closed, tracks keep-alive
+  - `on_reset_flow()`: HTTP/1.1 keep-alive reset between pipelined requests
+- Added `http1_parse_flow()`: Main entry point for flow-based HTTP/1 parsing
+- Added `TXN_FLAG_KEEP_ALIVE` for HTTP/1.1 Connection tracking
+- Used `llhttp_get_error_pos()` for accurate partial parse byte counting
+- Named `ssl_data_event_t` struct in probe_handler.h for forward declarations
 
 **Architecture:**
 ```
@@ -343,9 +371,9 @@ Add observability for the new architecture.
 
 | Task | Description | Status |
 |------|-------------|--------|
-| 4.1 | Add pool statistics (allocated, peak, reused) | ⬜ Pending |
-| 4.2 | Add index statistics (hits, misses, promotions) | ⬜ Pending |
-| 4.3 | Update debug output to show correlation path | ⬜ Pending |
+| 4.1 | Add pool statistics (allocated, peak, reused) | ✅ Done |
+| 4.2 | Add index statistics (hits, misses, promotions) | ✅ Done |
+| 4.3 | Update debug output to show correlation path | ✅ Done |
 
 ### Phase 5: Testing & Documentation (4 tasks)
 
@@ -356,7 +384,7 @@ Verify correctness and update docs.
 | 5.1 | Build and fix compilation errors | ✅ Done |
 | 5.2 | Test without VPN - verify dual-index correlation | ⬜ Pending |
 | 5.3 | Test under burst load - verify no dropped events | ⬜ Pending |
-| 5.4 | Update documentation with final architecture | ⬜ Pending |
+| 5.4 | Update documentation with final architecture | ✅ Done |
 
 ---
 
@@ -516,9 +544,158 @@ int flow_promote_cookie(flow_manager_t *mgr, uint32_t pid,
 
 ---
 
+## Future Improvements
+
+### HTTP/2 Response Parsing with Client Session
+
+**Current State:** Response parsing uses manual HPACK inflation (`nghttp2_hd_inflate_hd2`)
+instead of nghttp2 session callbacks.
+
+**Rationale for Current Approach:**
+- `nghttp2_session_server_new` parses requests (client→server)
+- `nghttp2_session_client_new` parses responses (server→client)
+- Client sessions expect to have *initiated* requests before receiving responses
+- For passive sniffing, we never "sent" requests, so client session rejects responses
+
+**Potential Improvement:**
+Use a permissive client session for response parsing:
+
+```c
+nghttp2_option *opt;
+nghttp2_option_new(&opt);
+nghttp2_option_set_no_recv_client_magic(opt, 1);  // Don't expect preface
+// Potentially other permissive options for passive sniffing
+nghttp2_session_client_new2(&session, callbacks, user_data, opt);
+```
+
+**Challenges:**
+1. Stream ID validation - responses arrive for streams we didn't track
+2. Mid-connection joins - HPACK dynamic table state mismatch
+3. Would need to "fake" request submissions for observed stream IDs
+
+**Benefits if Implemented:**
+- Unified callback architecture for both requests and responses
+- Automatic frame validation and flow control tracking
+- Better error reporting from nghttp2
+
+**Priority:** Low - Current manual HPACK approach is robust and handles mid-stream
+joins gracefully. Consider after HTTP/1 flow-based parsing is complete.
+
+---
+
+## Maintenance & Deprecation Roadmap
+
+This section provides guidance for ongoing maintenance and future cleanup.
+
+### Legacy Code Status (as of v0.9.2)
+
+| Component | Status | Location | Notes |
+|-----------|--------|----------|-------|
+| Single-threaded mode | **REMOVED** | src/main.c | `process_event()` retired; threading is now required |
+| Global ALPN cache | **REMOVED** | src/main.c | Replaced by per-worker cache in `worker_state_t` |
+| Global HTTP/1 caches | **REMOVED** | src/main.c | `h1_request_cache_t`, `pending_body_t` removed |
+| Global HTTP/2 pools | **DEPRECATED** | src/protocol/http2.c | `g_h2_connections[]`, `g_h2_streams[]` - see below |
+| nghttp2 callbacks | **KEEP** | src/protocol/http2.c | `g_h2_callbacks` shared by all sessions |
+
+### HTTP/2 Global Pool Deprecation
+
+The global pools in `http2.c` are deprecated but still present for backwards compatibility
+with some code paths. To complete the migration:
+
+**Step 1: Verify Flow-Based Path**
+- [x] `http2_process_frame_flow()` uses `flow_ctx->parser.h2` for session
+- [x] `h2_callback_ctx_t` uses `flow_ctx` for stream storage
+- [x] Response processing uses `flow_transaction_t`
+
+**Step 2: Remove Global Accessors** (Future)
+```
+http2_set_flow_info()    → Flow info in flow_ctx->flow (already there)
+http2_has_session()      → Check flow_ctx->parser.h2.session != NULL
+http2_get_stream()       → Use flow_transaction_t in flow_ctx
+http2_free_stream()      → Auto-freed with flow_ctx
+http2_cleanup_pid()      → Handled by flow_pool timeout
+```
+
+**Step 3: Remove Global State** (Future)
+```c
+// These can be removed once all callers use flow_ctx:
+static h2_connection_t g_h2_connections[MAX_H2_SESSIONS];  // Remove
+static h2_stream_t g_h2_streams[MAX_H2_STREAMS];           // Remove
+
+// This must be KEPT - shared callbacks for all sessions:
+static nghttp2_session_callbacks *g_h2_callbacks = NULL;   // Keep
+```
+
+### Adding New Features
+
+When adding new functionality, follow these guidelines:
+
+1. **Use flow_context_t**: Store per-connection state in `flow_context_t`
+2. **No new globals**: Avoid global arrays; use worker-local or flow-local state
+3. **Worker affinity**: First worker to see a flow "claims" it via `home_worker_id`
+4. **Automatic cleanup**: Resources freed when flow expires via `flow_free_resources()`
+
+### Code Organization
+
+```
+src/
+├── bpf/           # BPF programs and loaders (kernel-side)
+├── correlation/   # Flow context, pool, cache (the "Double View" core)
+├── threading/     # Worker threads, dispatcher, output serialization
+├── protocol/      # HTTP/1 and HTTP/2 parsers
+├── content/       # Body handling, decompression, signatures
+├── output/        # Display formatting
+└── util/          # Safe string helpers
+```
+
+---
+
+## Pool Statistics (Phase 4.1)
+
+The Shared Pool provides comprehensive statistics for monitoring and debugging:
+
+### Available Metrics
+
+| Metric | Description |
+|--------|-------------|
+| `pool_allocated` | Currently active flows |
+| `pool_peak` | High water mark (peak concurrent flows) |
+| `pool_total_allocs` | Lifetime flow allocations |
+| `pool_total_frees` | Lifetime flow frees |
+| `cookie_hits` | Successful cookie index lookups (fast path) |
+| `cookie_misses` | Failed cookie lookups (fallback to shadow) |
+| `shadow_hits` | Successful shadow index lookups |
+| `shadow_promotions` | Flows promoted from shadow to cookie index |
+
+### API Functions
+
+```c
+// Get statistics snapshot
+flow_pool_stats_t stats;
+flow_manager_get_stats(&mgr->flow_mgr, &stats);
+
+// Print human-readable stats (called on shutdown)
+flow_manager_print_stats(&mgr->flow_mgr, debug_mode);
+```
+
+### Interpreting Statistics
+
+- **XDP Correlation Rate**: `shadow_promotions / pool_total_allocs` - shows how often
+  socket_cookie is successfully correlated (higher is better)
+- **Cookie Hit Rate**: `cookie_hits / (cookie_hits + cookie_misses)` - indicates fast-path
+  efficiency (>90% is good)
+- **Pool Pressure**: `pool_peak / pool_capacity` - shows if pool sizing is adequate (<75% is safe)
+
+---
+
 ## Changelog
 
 | Date | Version | Changes |
 |------|---------|---------|
+| 2026-01-24 | 1.6 | Phase 4.3: Added `flow_lookup_ex()` with correlation path debug output |
+| 2026-01-24 | 1.5 | Phase 4.1: Added pool statistics API (`flow_manager_get_stats`, `flow_manager_print_stats`) |
+| 2026-01-24 | 1.4 | Retired single-threaded mode; removed global HTTP/1 caches; added maintenance docs |
+| 2026-01-24 | 1.3 | Phase 3.6.8 complete: Flow-based response processing, eliminates global pool dependency |
+| 2026-01-24 | 1.2 | Phase 3.6.8 partial: Flow-based request processing, callback_ctx per flow |
 | 2026-01-20 | 1.1 | Phase 3.6 complete: flow_transaction_t, HTTP/2 callbacks, http2_process_frame_flow() |
 | 2026-01-19 | 1.0 | Initial plan document |
