@@ -17,17 +17,17 @@
  * SSL data → http2_is_preface() → Connection setup
  *               │
  *               ▼
- *         http2_process_frame()
+ *         http2_process_frame_flow()
  *               │
- *               ├── HEADERS → HPACK decode → h2_stream_t.headers[]
- *               ├── DATA → h2_stream_t.body_buf accumulation
+ *               ├── HEADERS → HPACK decode → flow_transaction_t
+ *               ├── DATA → flow body accumulation
  *               ├── RST_STREAM → Stream cleanup
  *               └── GOAWAY → Session cleanup
  * @endcode
  *
  * @par Session Management:
- * Sessions are keyed by (PID, ssl_ctx) tuple to handle multiple connections
- * per process. Each session maintains independent HPACK state.
+ * Sessions are managed per flow_context_t, with streams stored in
+ * flow_transaction_t structures. Each flow maintains independent HPACK state.
  *
  * @author spliff authors
  * @copyright 2025-2026 spliff authors
@@ -140,88 +140,6 @@ typedef enum {
 } h2_stream_state_t;
 
 /**
- * @brief Per-stream state tracking structure
- *
- * Maintains complete state for a single HTTP/2 stream including
- * request/response info, headers, and accumulated body data.
- *
- * @note Streams are uniquely identified by (pid, ssl_ctx, stream_id) tuple
- */
-typedef struct {
-    /**
-     * @name Stream Identification
-     * @{
-     */
-    uint32_t pid;           /**< Process ID owning the connection */
-    uint64_t ssl_ctx;       /**< SSL context pointer for connection disambiguation */
-    int32_t stream_id;      /**< HTTP/2 stream identifier (odd=client, even=server) */
-    bool active;            /**< True if stream slot is in use */
-    /** @} */
-
-    /**
-     * @name State Machine
-     * @{
-     */
-    h2_stream_state_t state; /**< Current stream state */
-    /** @} */
-
-    /**
-     * @name Request Information
-     * Populated from HEADERS frame pseudo-headers (:method, :path, etc.)
-     * @{
-     */
-    char method[MAX_METHOD_LEN];      /**< HTTP method (GET, POST, etc.) */
-    char path[MAX_PATH_LEN];          /**< Request path */
-    char authority[MAX_HEADER_VALUE]; /**< :authority pseudo-header (host) */
-    char scheme[16];                  /**< :scheme (http or https) */
-    uint64_t request_time_ns;         /**< Request timestamp (nanoseconds) */
-    bool request_headers_done;        /**< Request headers fully received */
-    bool request_complete;            /**< Request body complete (END_STREAM seen) */
-    /** @} */
-
-    /**
-     * @name Response Information
-     * Populated from response HEADERS frame
-     * @{
-     */
-    int status_code;                  /**< HTTP status code (200, 404, etc.) */
-    char content_type[256];           /**< Content-Type header value */
-    char content_encoding[64];        /**< Content-Encoding header value */
-    size_t content_length;            /**< Content-Length (if specified) */
-    uint64_t response_time_ns;        /**< Response timestamp (nanoseconds) */
-    bool response_headers_done;       /**< Response headers fully received */
-    bool response_complete;           /**< Response body complete (END_STREAM seen) */
-    bool hpack_decode_failed;         /**< HPACK decode failed (mid-stream join) */
-    /** @} */
-
-    /**
-     * @name Header Storage
-     * @{
-     */
-    http_header_t headers[MAX_HEADERS]; /**< Parsed header name/value pairs */
-    int header_count;                   /**< Number of headers stored */
-    bool headers_displayed;             /**< Headers already output to console */
-    /** @} */
-
-    /**
-     * @name Body Accumulation
-     * @{
-     */
-    uint8_t *body_buf;      /**< Dynamically allocated body buffer */
-    size_t body_buf_size;   /**< Allocated buffer capacity */
-    size_t body_len;        /**< Current body length */
-    /** @} */
-
-    /**
-     * @name Display Metadata
-     * @{
-     */
-    uint64_t delta_ns;              /**< Latency (response_time - request_time) */
-    char comm[TASK_COMM_LEN];       /**< Process command name */
-    /** @} */
-} h2_stream_t;
-
-/**
  * @brief Initialize HTTP/2 parser system
  *
  * Initializes nghttp2 session infrastructure and allocates
@@ -316,135 +234,19 @@ const char *http2_frame_name(int type);
 bool http2_is_preface(const uint8_t *data, size_t len);
 
 /**
- * @brief Process HTTP/2 data from BPF event
+ * @brief Process HTTP/2 data with flow context
  *
  * Main entry point for HTTP/2 frame processing. Feeds data into
- * the nghttp2 session for the connection identified by the event's
- * (pid, ssl_ctx) tuple.
- *
- * @param[in] data  Raw HTTP/2 frame data
- * @param[in] len   Length of frame data
- * @param[in] event BPF event with connection context (pid, ssl_ctx, etc.)
- *
- * @note Creates session if needed; handles mid-stream joins
- */
-void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *event);
-
-/* Forward declaration for flow_context_t */
-struct flow_context;
-
-/**
- * @brief Process HTTP/2 data with flow context (Phase 3.6)
- *
- * Flow-aware version that uses flow_context_t for stream storage.
- * Populates both the legacy global pools AND flow_transaction_t
- * for gradual migration.
+ * the nghttp2 session using flow_context_t for stream storage.
  *
  * @param[in] data     Raw HTTP/2 frame data
  * @param[in] len      Length of frame data
  * @param[in] event    BPF event with connection context
- * @param[in] flow_ctx Flow context with embedded stream storage (may be NULL)
- *
- * @note When flow_ctx is NULL, behaves identically to http2_process_frame()
+ * @param[in] flow_ctx Flow context with embedded stream storage
  */
 void http2_process_frame_flow(const uint8_t *data, int len,
                               const ssl_data_event_t *event,
                               struct flow_context *flow_ctx);
-
-/**
- * @brief Check if connection has active HTTP/2 session
- *
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- *
- * @return true if an HTTP/2 session exists for this connection
- */
-bool http2_has_session(uint32_t pid, uint64_t ssl_ctx);
-
-/**
- * @brief Set ALPN protocol for a connection
- *
- * Records the negotiated ALPN protocol (e.g., "h2", "http/1.1")
- * for display purposes.
- *
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- * @param[in] alpn    Protocol string (copied internally)
- *
- * @see http2_get_alpn()
- */
-void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn);
-
-/**
- * @brief Set XDP flow correlation info for an HTTP/2 connection
- *
- * Stores network-layer metadata from XDP packet capture, enabling
- * "Golden Thread" double-view correlation between network and
- * application layers.
- *
- * @param[in] pid       Process ID
- * @param[in] ssl_ctx   SSL context pointer
- * @param[in] src_ip    Source IP address (network byte order)
- * @param[in] dst_ip    Destination IP address (network byte order)
- * @param[in] src_port  Source port (network byte order)
- * @param[in] dst_port  Destination port (network byte order)
- * @param[in] ip_ver    IP version (4 or 6)
- * @param[in] direction Flow direction (0=outbound, 1=inbound)
- * @param[in] category  Traffic category (1=TLS, 2=QUIC, 3=HTTP, 4=H2)
- * @param[in] ifname    Interface name (may be NULL)
- */
-void http2_set_flow_info(uint32_t pid, uint64_t ssl_ctx,
-                         uint32_t src_ip, uint32_t dst_ip,
-                         uint16_t src_port, uint16_t dst_port,
-                         uint8_t ip_ver, uint8_t direction,
-                         uint8_t category, const char *ifname);
-
-/**
- * @brief Get ALPN protocol for a connection
- *
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- *
- * @return ALPN protocol string, or empty string if not set
- */
-const char *http2_get_alpn(uint32_t pid, uint64_t ssl_ctx);
-
-/**
- * @brief Get or create stream state structure
- *
- * Looks up an existing stream or optionally creates a new one.
- *
- * @param[in] pid       Process ID
- * @param[in] ssl_ctx   SSL context pointer
- * @param[in] stream_id HTTP/2 stream identifier
- * @param[in] create    If true, create stream if not found
- *
- * @return Pointer to stream structure, or NULL if not found/create failed
- *
- * @note Stream IDs: odd numbers are client-initiated, even are server push
- */
-h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id, bool create);
-
-/**
- * @brief Free stream resources
- *
- * Releases body buffer and marks stream slot as available.
- *
- * @param[in] pid       Process ID
- * @param[in] ssl_ctx   SSL context pointer
- * @param[in] stream_id HTTP/2 stream identifier
- */
-void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id);
-
-/**
- * @brief Cleanup all HTTP/2 resources for a process
- *
- * Called when a process exits to release all sessions and
- * streams associated with that PID.
- *
- * @param[in] pid Process ID to clean up
- */
-void http2_cleanup_pid(uint32_t pid);
 
 /**
  * @brief Validate HTTP/2 frame header
@@ -464,6 +266,26 @@ void http2_cleanup_pid(uint32_t pid);
  * @return true if frame header appears valid, false if invalid or buffer too small
  */
 bool http2_is_valid_frame_header(const uint8_t *data, size_t len);
+
+/**
+ * @brief Unified HTTP/2 event processing entry point
+ *
+ * Single entry point for all HTTP/2 processing from main.c.
+ * Handles detection, session initialization, frame processing,
+ * and noise suppression. Keeps all HTTP/2 logic in http2.c.
+ *
+ * @param[in] data       Raw data buffer
+ * @param[in] len        Data length
+ * @param[in] event      Worker event with full context
+ * @param[in] worker     Worker context for output
+ *
+ * @return true if data was processed as HTTP/2, false to try other protocols
+ */
+struct worker_event;
+struct worker_ctx;
+bool http2_try_process_event(const uint8_t *data, size_t len,
+                             struct worker_event *event,
+                             struct worker_ctx *worker);
 
 /** @} */ /* End of http2 group */
 

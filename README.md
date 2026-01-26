@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.9.3-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.5-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -24,6 +24,12 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 |----------|---------|----------|
 | HTTP/1.1 | llhttp  | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
 | HTTP/2   | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
+
+### Modular Protocol Architecture (v0.9.5+)
+- **Unified Protocol Entry Points**: `http1_try_process_event()` and `http2_try_process_event()`
+- **Vectorscan Protocol Detection**: O(n) NFA-based pattern matching for HTTP identification
+- **Clean Orchestration**: main.c reduced to ~50 lines of protocol routing logic
+- **Enterprise-Grade Separation**: Each protocol handler returns `true` if processed, enabling fallback chain
 
 ### Shared Pool Architecture (v0.9.3+)
 - **Unified Flow Context**: Pre-allocated pool of 8192 flow slots with dual-index lookup
@@ -98,18 +104,33 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | zstd | zstd decompression | libzstd-devel | libzstd-dev |
 | brotli | brotli decompression | brotli-devel | libbrotli-dev |
 
+#### Optional Performance Libraries (v0.9.5+)
+
+| Library | Purpose | Package (Fedora) | Package (Debian/Ubuntu) |
+|---------|---------|------------------|-------------------------|
+| vectorscan | O(n) protocol detection | vectorscan-devel | (build from source) |
+| zlib-ng | SIMD-accelerated compression | zlib-ng-devel | zlib1g-ng-dev |
+
 ### Quick Install (Fedora)
 ```bash
+# Required dependencies
 sudo dnf install libbpf-devel elfutils-libelf-devel zlib-devel \
     llhttp-devel nghttp2-devel ck-devel libxdp-devel userspace-rcu-devel \
     jemalloc-devel pcre2-devel libzstd-devel brotli-devel clang
+
+# Optional: Performance libraries (v0.9.5+)
+sudo dnf install vectorscan-devel zlib-ng-devel
 ```
 
 ### Quick Install (Debian/Ubuntu)
 ```bash
+# Required dependencies
 sudo apt install libbpf-dev libelf-dev zlib1g-dev \
     libllhttp-dev libnghttp2-dev libck-dev libxdp-dev liburcu-dev \
     libjemalloc-dev libpcre2-dev libzstd-dev libbrotli-dev clang
+
+# Optional: zlib-ng for SIMD compression (vectorscan requires building from source)
+sudo apt install zlib1g-ng-dev
 ```
 
 ## Installation
@@ -169,9 +190,19 @@ Documentation includes:
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_SANITIZERS=OFF \
     -DENABLE_ZSTD=ON \
-    -DENABLE_BROTLI=ON
+    -DENABLE_BROTLI=ON \
+    -DUSE_VECTORSCAN=ON \
+    -DUSE_ZLIB_NG=ON
 cmake --build build
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `USE_VECTORSCAN` | ON | Use vectorscan for O(n) protocol detection |
+| `USE_ZLIB_NG` | ON | Use zlib-ng for SIMD-accelerated compression |
+| `ENABLE_ZSTD` | ON | Enable zstd decompression |
+| `ENABLE_BROTLI` | ON | Enable brotli decompression |
+| `ENABLE_SANITIZERS` | OFF | Enable AddressSanitizer/UBSan (debug builds) |
 
 ## Usage
 
@@ -519,13 +550,13 @@ connection from which process.
 
 ### Data Flow
 
-1. **Startup** → Scan `/proc/PID/maps` for SSL libraries, attach uprobes, seed `flow_cookie_map` via SOCK_DIAG, init flow pool (8192 slots)
+1. **Startup** → Scan `/proc/PID/maps` for SSL libraries, attach uprobes, seed `flow_cookie_map` via SOCK_DIAG, init flow pool (8192 slots), init vectorscan detector
 2. **Packet arrives** → XDP classifies protocol (TLS/HTTP2/HTTP1), tracks flow state, emits metadata
 3. **TCP established** → sock_ops caches socket cookie in `flow_cookie_map` (5-tuple → cookie)
 4. **SSL call** → Uprobe captures decrypted data, links SSL* → fd → socket cookie
 5. **Flow lookup** → Dual-index lookup: cookie_index (fast) or shadow_index (pid, ssl_ctx)
-6. **Worker claim** → Atomic CAS on `home_worker_id` ensures single-writer per flow, init parsers
-7. **Processing** → Workers use per-flow `flow_context_t` with embedded HTTP/2 stream pool (64 streams)
+6. **Worker claim** → Atomic CAS on `home_worker_id` ensures single-writer per flow
+7. **Protocol routing** (v0.9.5+) → `http1_try_process_event()` → `http2_try_process_event()` → fallback
 8. **HTTP/2 streams** → O(1) allocation from free-list, per-stream body buffers, ghost stream timeout
 9. **Output** → Serialized display with request/response correlation, ALPN indicator
 10. **Cleanup** → Process exit triggers flow eviction, stream body buffer free, slot return to pool
@@ -544,7 +575,7 @@ spliff/
 │   ├── html/                   # HTML API documentation
 │   └── man/                    # Man pages
 ├── src/
-│   ├── main.c                  # Entry point, CLI, event loop, dynamic probe management
+│   ├── main.c                  # Entry point, CLI, orchestration (v0.9.5: protocol routing only)
 │   ├── include/
 │   │   └── spliff.h            # Public header, shared types, version info
 │   ├── bpf/
@@ -556,8 +587,12 @@ spliff/
 │   │   ├── boringssl_offsets.h # Known BoringSSL function offsets by build ID
 │   │   └── vmlinux.h           # Kernel BTF type definitions
 │   ├── protocol/
-│   │   ├── http1.c             # HTTP/1.1 parser (llhttp)
-│   │   ├── http2.c             # HTTP/2 parser (nghttp2 + HPACK)
+│   │   ├── detector.c          # Vectorscan protocol detection (v0.9.5+)
+│   │   ├── detector.h          # Protocol detector API
+│   │   ├── http1.c             # HTTP/1.1 parser + unified entry point
+│   │   ├── http1.h             # HTTP/1.1 API + http1_try_process_event()
+│   │   ├── http2.c             # HTTP/2 parser + unified entry point
+│   │   ├── http2.h             # HTTP/2 API + http2_try_process_event()
 │   │   └── websocket.c         # WebSocket frame parser (planned)
 │   ├── content/
 │   │   ├── decompressor.c      # gzip/brotli/zstd/deflate decompression
@@ -565,8 +600,6 @@ spliff/
 │   ├── output/
 │   │   └── display.c           # Terminal output formatting, colors
 │   ├── correlation/            # XDP-SSL correlation (v0.8.0+)
-│   │   ├── flow_cache.c        # XDP flow cache, socket cookie lookup
-│   │   ├── flow_cache.h        # Flow cache API
 │   │   ├── flow_context.c      # Per-flow context management, stream pools
 │   │   └── flow_context.h      # flow_context_t, flow_transaction_t types
 │   ├── threading/              # Multi-threaded event processing
@@ -597,15 +630,15 @@ spliff/
 | v0.6.x | Multi-threaded event processing | ✅ Complete |
 | v0.7.x | BPF-level IPC filtering + Unified display | ✅ Complete |
 | v0.8.x | XDP packet-level flow tracking + sock_ops | ✅ Complete |
-| v0.9.x | Dynamic process monitoring + Shared Pool Architecture + Unified Transaction | ✅ **Current** |
-| v0.10.0 | PCRE2-JIT pattern matching for plain HTTP | 🔄 Next |
-| v0.11.0 | HTTP/3 + QUIC protocol support | Planned |
+| v0.9.x | Dynamic process monitoring + Shared Pool + Modular Protocol Architecture | ✅ **Current (v0.9.5)** |
+| v0.10.0 | BPF/XDP improvements + IPv6 correlation + Ring buffer expansion | 🔄 Next |
+| v0.11.0 | HTTP/3 + QUIC protocol support (ngtcp2/nghttp3) | Planned |
 | v1.0.0 | WebSocket support + Enhanced display | Planned |
 | v1.1.0 | EDR agent mode + Event streaming (NATS/Kafka) | Planned |
 | v1.2.0 | Behavioral analysis + Threat detection | Planned |
 
 ### Near-Term Goals (v0.10.x - v1.0)
-- **PCRE2-JIT Integration**: Pattern matching for ambiguous traffic classification
+- **BPF/XDP Improvements**: IPv6 correlation, expanded ring buffers, atomic state machine
 - **Plain HTTP Capture**: XDP payload extraction for unencrypted traffic
 - **WebSocket Support**: Frame parsing and message reconstruction
 - **Enhanced Display**: XDP flow metrics in output, connection timeline
@@ -700,7 +733,8 @@ BPF code (`src/bpf/spliff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel r
 ### Protocol Parsing
 - [llhttp](https://github.com/nodejs/llhttp) - HTTP/1.1 parser from Node.js
 - [nghttp2](https://github.com/nghttp2/nghttp2) - HTTP/2 library with HPACK compression
-- [PCRE2](https://github.com/PCRE2Project/pcre2) - Perl Compatible Regular Expressions (pattern matching)
+- [vectorscan](https://github.com/VectorCamp/vectorscan) - High-performance regex/pattern matching (Hyperscan fork)
+- [PCRE2](https://github.com/PCRE2Project/pcre2) - Perl Compatible Regular Expressions (fallback)
 
 ### Concurrency & Memory
 - [Concurrency Kit](https://github.com/concurrencykit/ck) - Lock-free data structures (SPSC rings, spinlocks)
@@ -709,6 +743,7 @@ BPF code (`src/bpf/spliff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel r
 
 ### Compression
 - [zlib](https://zlib.net/) - gzip/deflate decompression
+- [zlib-ng](https://github.com/zlib-ng/zlib-ng) - SIMD-optimized zlib replacement (optional)
 - [zstd](https://github.com/facebook/zstd) - Zstandard compression by Facebook
 - [brotli](https://github.com/google/brotli) - Brotli compression by Google
 

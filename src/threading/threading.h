@@ -58,7 +58,6 @@
 #include "../include/spliff.h"
 #include "../bpf/probe_handler.h"
 #include "../protocol/http2.h"  /* For h2_stream_state_t, frame types */
-#include "../correlation/flow_cache.h"  /* For flow_info_t, flow_cache_t (legacy) */
 #include "../correlation/flow_context.h"  /* For flow_manager_t (Shared Pool) */
 
 /**
@@ -121,8 +120,6 @@
  */
 #define MAX_H2_SESSIONS_PER_WORKER      16   /**< HTTP/2 connections per worker */
 #define MAX_H2_STREAMS_PER_WORKER       128  /**< HTTP/2 streams per worker */
-#define MAX_ALPN_CACHE_PER_WORKER       32   /**< ALPN cache entries per worker */
-#define MAX_PENDING_BODIES_PER_WORKER   4    /**< Pending body buffers per worker */
 /** @} */
 
 /**
@@ -312,16 +309,11 @@ typedef struct worker_event {
     uint32_t flow_hash;     /**< FNV-1a hash of (pid, ssl_ctx) */
     /** @} */
 
-    /** @name XDP Correlation (Legacy) */
+    /** @name Shared Pool Correlation */
     /** @{ */
-    flow_info_t *flow_info; /**< Legacy: Cached XDP flow data (may be NULL) */
-    bool needs_cookie_retry; /**< True if cookie lookup missed but retry possible */
-    /** @} */
-
-    /** @name Shared Pool Correlation (New Architecture) */
-    /** @{ */
-    flow_id_t flow_id;          /**< Flow ID in shared pool (FLOW_ID_INVALID if none) */
-    flow_context_t *flow_ctx;   /**< Resolved flow context (NULL until resolved) */
+    flow_id_t flow_id;           /**< Flow ID in shared pool (FLOW_ID_INVALID if none) */
+    flow_context_t *flow_ctx;    /**< Resolved flow context (NULL until resolved) */
+    bool needs_cookie_retry;     /**< True if XDP data not yet available for retry */
     /** @} */
 
     /** @name Payload */
@@ -471,95 +463,7 @@ void pool_free(object_pool_t *pool, void *obj);
  * @{
  */
 
-/**
- * @brief ALPN cache entry for protocol negotiation results
- *
- * @deprecated Phase 3.6 migrated to flow_context_t::alpn[16].
- * Code already prefers flow_ctx->alpn with fallback to this cache.
- * Once flow-based path is fully validated, this can be removed
- * along with worker_*_alpn() functions.
- *
- * @par Replacement: Use flow_ctx->alpn which provides:
- * - Direct storage in flow context (no separate lookup)
- * - Automatic cleanup when flow expires
- *
- * @par Lookup Key: (pid, ssl_ctx)
- */
-typedef struct {
-    uint32_t pid;           /**< Process ID */
-    uint64_t ssl_ctx;       /**< SSL context pointer */
-    char alpn_proto[16];    /**< Negotiated protocol ("h2", "http/1.1", etc.) */
-    bool active;            /**< true if entry is in use */
-} alpn_cache_entry_t;
-
-/**
- * @brief Pending body entry for chunked/streaming response assembly
- *
- * @deprecated Phase 3.6 migrated to flow_context_t::body (body_ctx_t).
- * This structure is only used by the legacy HTTP/1 fallback path when
- * flow_ctx is not available. Once flow-based parsing is fully validated,
- * this can be removed along with worker_*_pending_body() functions.
- *
- * @par Replacement: Use flow_ctx->body which provides:
- * - Automatic cleanup when flow expires
- * - Thread-safe access via worker affinity
- * - Unified storage for HTTP/1 and HTTP/2
- *
- * @par Lookup Key: (pid, ssl_ctx)
- */
-typedef struct {
-    uint32_t pid;               /**< Process ID */
-    uint64_t ssl_ctx;           /**< SSL context pointer */
-    size_t expected_len;        /**< Content-Length (0 if chunked/unknown) */
-    size_t received_len;        /**< Bytes received so far */
-    char content_type[256];     /**< Content-Type for display */
-    char content_encoding[64];  /**< Content-Encoding (gzip, br, zstd) */
-    bool active;                /**< true if entry is in use */
-    bool header_printed;        /**< Response header already output */
-    bool needs_decompression;   /**< Body requires decompression */
-    uint8_t *accum_buf;         /**< Accumulation buffer (dynamically allocated) */
-    size_t accum_len;           /**< Current data in accum_buf */
-    size_t accum_capacity;      /**< Allocated capacity of accum_buf */
-} pending_body_entry_t;
-
 /** @} */ /* end threading_cache group */
-
-/**
- * @defgroup threading_h1cache HTTP/1.1 Request Cache
- * @brief Request-response correlation for HTTP/1.1
- * @{
- */
-
-/** Maximum HTTP/1.1 request cache entries per worker */
-#define MAX_H1_REQUEST_CACHE_PER_WORKER 16
-
-/**
- * @brief HTTP/1.1 request cache entry for request-response correlation
- *
- * @deprecated Phase 3.6 migrated to flow_transaction_t in flow_context_t.
- * This structure is only used by the legacy HTTP/1 fallback path when
- * flow_ctx is not available. Once flow-based parsing is fully validated,
- * this can be removed along with worker_*_h1_request() functions.
- *
- * @par Replacement: Use flow_ctx->parser.h1.txn which provides:
- * - method, path, host fields for request-response correlation
- * - Persistent across HTTP/1.1 keep-alive connections
- * - Thread-safe access via worker affinity
- *
- * @par Lookup Key: (pid, ssl_ctx)
- *
- * @note Only one request cached per connection since HTTP/1.1 is sequential.
- */
-typedef struct {
-    uint32_t pid;       /**< Process ID */
-    uint64_t ssl_ctx;   /**< SSL context pointer */
-    char method[16];    /**< HTTP method (GET, POST, etc.) */
-    char path[512];     /**< Request path with query string */
-    char host[256];     /**< Host header value */
-    bool active;        /**< true if entry is in use */
-} h1_request_entry_t;
-
-/** @} */ /* end threading_h1cache group */
 
 /**
  * @defgroup threading_state Per-Worker State
@@ -601,24 +505,6 @@ typedef struct worker_state {
     h2_stream_local_t *h2_streams;  /**< Stream state array */
     int h2_stream_count;            /**< Active streams */
     int h2_stream_capacity;         /**< Array capacity */
-    /** @} */
-
-    /** @name ALPN Cache */
-    /** @{ */
-    alpn_cache_entry_t alpn_cache[MAX_ALPN_CACHE_PER_WORKER]; /**< Protocol cache */
-    int alpn_cache_count;           /**< Active entries */
-    /** @} */
-
-    /** @name Pending Bodies */
-    /** @{ */
-    pending_body_entry_t pending_bodies[MAX_PENDING_BODIES_PER_WORKER]; /**< Body assembly */
-    int pending_body_count;         /**< Active entries */
-    /** @} */
-
-    /** @name HTTP/1.1 Request Cache */
-    /** @{ */
-    h1_request_entry_t h1_request_cache[MAX_H1_REQUEST_CACHE_PER_WORKER]; /**< Request cache */
-    int h1_request_count;           /**< Active entries */
     /** @} */
 
     /** @name Scratch Buffers */
@@ -852,12 +738,7 @@ typedef struct dispatcher_ctx {
     _Atomic uint64_t xdp_debug_samples;     /**< Debug sampling counter */
     /** @} */
 
-    /** @name XDP Flow Cache (legacy - for backward compatibility) */
-    /** @{ */
-    flow_cache_t flow_cache;    /**< Socket cookie → flow info cache (legacy) */
-    /** @} */
-
-    /** @name Shared Pool Flow Manager (new architecture) */
+    /** @name Shared Pool Flow Manager */
     /** @{ */
     flow_manager_t flow_mgr;    /**< Unified pool with dual indexes */
     /** @} */
@@ -1325,131 +1206,6 @@ void worker_free_h2_stream(worker_state_t *state, h2_stream_local_t *stream);
  */
 void worker_cleanup_h2_streams_for_connection(worker_state_t *state,
                                                 uint32_t pid, uint64_t ssl_ctx);
-
-/** @} */
-
-/**
- * @name ALPN Cache
- * @{
- */
-
-/**
- * @brief Get cached ALPN protocol for connection
- *
- * @param[in] state   Worker state
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- *
- * @return Protocol string ("h2", "http/1.1", etc.), or NULL if not cached
- */
-const char *worker_get_alpn(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx);
-
-/**
- * @brief Cache ALPN protocol for connection
- *
- * @param[in] state   Worker state
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- * @param[in] alpn    Protocol string to cache
- */
-void worker_set_alpn(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
-                       const char *alpn);
-
-/** @} */
-
-/**
- * @name Pending Body Management
- * @{
- */
-
-/**
- * @brief Find pending body entry for connection
- *
- * @param[in] state   Worker state
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- *
- * @return Pending body entry, or NULL if none
- */
-pending_body_entry_t *worker_find_pending_body(worker_state_t *state,
-                                                  uint32_t pid, uint64_t ssl_ctx);
-
-/**
- * @brief Create pending body entry for response assembly
- *
- * @param[in] state            Worker state
- * @param[in] pid              Process ID
- * @param[in] ssl_ctx          SSL context pointer
- * @param[in] expected_len     Content-Length (0 if unknown/chunked)
- * @param[in] content_type     Content-Type header value
- * @param[in] content_encoding Content-Encoding (gzip, br, etc.)
- *
- * @return New entry, or NULL if pool exhausted
- */
-pending_body_entry_t *worker_create_pending_body(worker_state_t *state,
-                                                    uint32_t pid, uint64_t ssl_ctx,
-                                                    size_t expected_len,
-                                                    const char *content_type,
-                                                    const char *content_encoding);
-
-/**
- * @brief Clear and free pending body entry
- *
- * @param[in] state Worker state
- * @param[in] entry Entry to clear
- */
-void worker_clear_pending_body(worker_state_t *state, pending_body_entry_t *entry);
-
-/**
- * @brief Cleanup all pending bodies for a process
- *
- * Called when process exits.
- *
- * @param[in] state Worker state
- * @param[in] pid   Process ID
- */
-void worker_cleanup_pending_bodies_pid(worker_state_t *state, uint32_t pid);
-
-/** @} */
-
-/**
- * @name HTTP/1.1 Request Cache
- * @{
- */
-
-/**
- * @brief Find cached HTTP/1.1 request for connection
- *
- * @param[in] state   Worker state
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- *
- * @return Request entry, or NULL if none cached
- */
-h1_request_entry_t *worker_find_h1_request(worker_state_t *state,
-                                            uint32_t pid, uint64_t ssl_ctx);
-
-/**
- * @brief Cache HTTP/1.1 request for response correlation
- *
- * @param[in] state   Worker state
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- * @param[in] method  HTTP method
- * @param[in] path    Request path
- * @param[in] host    Host header value
- */
-void worker_set_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx,
-                           const char *method, const char *path, const char *host);
-
-/**
- * @brief Clear cached HTTP/1.1 request
- *
- * @param[in] state   Worker state
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- */
-void worker_clear_h1_request(worker_state_t *state, uint32_t pid, uint64_t ssl_ctx);
 
 /** @} */
 /** @} */ /* end threading_h2mgmt group */

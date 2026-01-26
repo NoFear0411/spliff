@@ -56,7 +56,11 @@
 #include "../util/safe_str.h"
 #include "../output/display.h"
 #include "../content/decompressor.h"
+#include "../content/signatures.h"
 #include "../correlation/flow_context.h"
+#ifdef HAVE_THREADING
+#include "../threading/threading.h"
+#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -68,60 +72,12 @@
 #include <unistd.h>
 #include <libgen.h>
 
-/**
- * @brief Get real process name from /proc filesystem
- *
- * Reads /proc/PID/exe symlink to get the actual executable name.
- * For threaded processes, /proc/PID/comm gives thread name (e.g.,
- * "Socket Thread" for Firefox), but /proc/PID/exe gives the actual
- * executable ("firefox").
- *
- * @param[in]  pid     Process ID
- * @param[out] buf     Output buffer for process name
- * @param[in]  bufsize Buffer capacity
- *
- * @note Handles " (deleted)" suffix for processes that have exited
- *
- * @internal
- */
-static void h2_get_process_name(uint32_t pid, char *buf, size_t bufsize) {
-    char path[64];
-    char link[256];
-
-    if (bufsize == 0) return;
-    buf[0] = '\0';
-
-    snprintf(path, sizeof(path), "/proc/%u/exe", pid);
-    ssize_t len = readlink(path, link, sizeof(link) - 1);
-    if (len > 0) {
-        link[len] = '\0';
-        /* Extract basename */
-        char *base = strrchr(link, '/');
-        if (base) {
-            base++;
-        } else {
-            base = link;
-        }
-        /* Copy, handling " (deleted)" suffix if process exited */
-        char *deleted = strstr(base, " (deleted)");
-        if (deleted) {
-            size_t copylen = deleted - base;
-            if (copylen >= bufsize) copylen = bufsize - 1;
-            memcpy(buf, base, copylen);
-            buf[copylen] = '\0';
-        } else {
-            size_t copylen = strlen(base);
-            if (copylen >= bufsize) copylen = bufsize - 1;
-            memcpy(buf, base, copylen);
-            buf[copylen] = '\0';
-        }
-    }
-}
-
-/* Forward declarations for display functions */
-static void h2_display_request(h2_stream_t *stream);
-static void h2_display_response(h2_stream_t *stream);
-static void h2_display_body(h2_stream_t *stream, direction_t dir);
+/* Flow-based display functions */
+static void h2_display_request_flow(flow_transaction_t *txn, flow_context_t *flow_ctx,
+                                    const ssl_data_event_t *event);
+static void h2_display_response_flow(flow_transaction_t *txn, flow_context_t *flow_ctx,
+                                     const ssl_data_event_t *event);
+static void h2_display_body_flow(flow_transaction_t *txn, flow_context_t *flow_ctx);
 
 /* Forward declaration for frame validation helper */
 static size_t h2_find_frame_start(const uint8_t *buf, size_t len);
@@ -153,92 +109,18 @@ typedef struct h2_callback_ctx h2_callback_ctx_t;
 #define H2_REASSEMBLY_BUF_SIZE 65536
 
 /**
- * @brief Per-connection HTTP/2 session state
- *
- * Maintains nghttp2 session and HPACK inflater for a single
- * HTTP/2 connection identified by (pid, ssl_ctx) tuple.
- *
- * @internal
- */
-typedef struct {
-    uint32_t pid;            /**< Process ID owning connection */
-    uint64_t ssl_ctx;        /**< SSL context for connection disambiguation */
-    bool active;             /**< True if session slot is in use */
-
-    /* nghttp2 server session for parsing requests */
-    nghttp2_session *server_session;
-
-    /* HPACK inflater for decoding response headers directly */
-    nghttp2_hd_inflater *response_inflater;
-
-    /* Callback context for server session */
-    h2_callback_ctx_t *server_ctx;
-
-    /* Connection state */
-    bool client_preface_seen;
-    bool server_settings_seen;
-
-    /* Response reassembly buffer for fragmented frames */
-    uint8_t *response_buf;
-    size_t response_buf_len;
-
-    /* HPACK error tracking for mid-stream recovery */
-    uint16_t hpack_error_count;    /* Consecutive HPACK decode errors */
-    uint16_t hpack_success_count;  /* Consecutive successful decodes */
-    bool mid_stream_joined;        /* Detected mid-stream join */
-
-    /* Timestamp for cleanup */
-    uint64_t last_activity_ns;
-
-    /* Process name cache */
-    char comm[TASK_COMM_LEN];
-
-    /* ALPN negotiated protocol */
-    char alpn_proto[16];
-
-    /**
-     * @name XDP Flow Correlation
-     * "Golden Thread" double-view: network-layer metadata from XDP packets
-     * correlated with application-layer HTTP/2 data via socket cookie.
-     * @{
-     */
-    bool has_flow_info;           /**< True if flow info available */
-    uint32_t flow_src_ip;         /**< Source IP (network byte order) */
-    uint32_t flow_dst_ip;         /**< Destination IP (network byte order) */
-    uint16_t flow_src_port;       /**< Source port (network byte order) */
-    uint16_t flow_dst_port;       /**< Destination port (network byte order) */
-    uint8_t flow_ip_version;      /**< IP version (4 or 6) */
-    uint8_t flow_direction;       /**< Flow direction (0=outbound, 1=inbound) */
-    uint8_t flow_category;        /**< Traffic category (1=TLS, 2=QUIC, etc.) */
-    char flow_ifname[16];         /**< Interface name (eth0, lo, etc.) */
-    /** @} */
-} h2_connection_t;
-
-/* Forward declarations for internal functions */
-static h2_connection_t *get_h2_connection(uint32_t pid, uint64_t ssl_ctx, bool create);
-static void h2_connection_cleanup(h2_connection_t *conn);
-
-/**
  * @brief Context passed to nghttp2 callbacks
  *
  * Contains all state needed by nghttp2 callback functions to process
- * HTTP/2 frames and associate them with the correct connection/stream.
+ * HTTP/2 frames and associate them with the correct flow/stream.
  */
 struct h2_callback_ctx {
     uint32_t pid;
     uint64_t ssl_ctx;
-    h2_connection_t *conn;
     const ssl_data_event_t *event;
     h2_dir_t direction;
 
-    /*
-     * Flow-based storage (Phase 3.6 migration)
-     *
-     * When flow_ctx is non-NULL, callbacks should prefer using
-     * flow_h2_find_stream()/flow_h2_alloc_stream() over the global
-     * g_h2_streams pool. This enables gradual migration to the
-     * new Shared Pool Architecture.
-     */
+    /* Flow-based storage - uses flow_context_t for all session/stream state */
     flow_context_t *flow_ctx;
 };
 
@@ -268,7 +150,6 @@ void *http2_create_callback_ctx(flow_context_t *flow_ctx) {
     /* For flow-based processing, pid/ssl_ctx come from event at runtime */
     ctx->pid = 0;
     ctx->ssl_ctx = 0;
-    ctx->conn = NULL;  /* No global pool dependency */
     ctx->event = NULL; /* Set per-call */
     ctx->direction = H2_DIR_SERVER; /* Parses client requests */
     ctx->flow_ctx = flow_ctx;
@@ -304,113 +185,9 @@ void http2_set_callback_event(void *callback_ctx, const ssl_data_event_t *event)
     }
 }
 
-/*============================================================================
- * LEGACY GLOBAL STATE - DEPRECATED
- *
- * These global pools are deprecated as of Phase 3.6 (Shared Pool Architecture).
- * New code should use flow_context_t which provides:
- *   - Thread-safe access via worker affinity
- *   - Unified XDP-SSL correlation ("Double View")
- *   - Automatic cleanup on flow termination
- *
- * Migration Status:
- *   - g_h2_callbacks: KEEP - Shared callback table for all nghttp2 sessions
- *   - g_h2_connections: DEPRECATED - Use flow_context_t + h2_connection_local_t
- *   - g_h2_streams: DEPRECATED - Use flow_transaction_t in flow_context
- *
- * TODO: Complete migration by:
- *   1. Remove http2_set_flow_info() calls (flow_ctx has this info)
- *   2. Update http2_process_frame_flow() to use only flow_ctx
- *   3. Remove functions that access g_h2_connections/g_h2_streams
- *   4. Keep g_h2_callbacks as shared resource
- *============================================================================*/
-static h2_connection_t g_h2_connections[MAX_H2_SESSIONS];  /* @deprecated Use flow_context_t */
-static h2_stream_t g_h2_streams[MAX_H2_STREAMS];           /* @deprecated Use flow_transaction_t */
-static nghttp2_session_callbacks *g_h2_callbacks = NULL;   /* Shared - keep */
+/* Global state - callbacks shared across all flow-based sessions */
+static nghttp2_session_callbacks *g_h2_callbacks = NULL;
 static bool g_h2_initialized = false;
-
-/* Get current time in nanoseconds */
-static uint64_t get_time_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
-/* Stream management */
-h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id, bool create) {
-    /* Find existing by (pid, ssl_ctx, stream_id) */
-    for (int i = 0; i < MAX_H2_STREAMS; i++) {
-        if (g_h2_streams[i].active &&
-            g_h2_streams[i].pid == pid &&
-            g_h2_streams[i].ssl_ctx == ssl_ctx &&
-            g_h2_streams[i].stream_id == stream_id) {
-            return &g_h2_streams[i];
-        }
-    }
-
-    if (!create) return NULL;
-
-    /* Find empty slot or evict closed stream */
-    h2_stream_t *slot = NULL;
-    for (int i = 0; i < MAX_H2_STREAMS; i++) {
-        if (!g_h2_streams[i].active) {
-            slot = &g_h2_streams[i];
-            break;
-        }
-    }
-
-    if (!slot) {
-        /* Evict oldest closed stream */
-        for (int i = 0; i < MAX_H2_STREAMS; i++) {
-            if (g_h2_streams[i].state == H2_STREAM_CLOSED) {
-                http2_free_stream(g_h2_streams[i].pid, g_h2_streams[i].ssl_ctx,
-                                  g_h2_streams[i].stream_id);
-                slot = &g_h2_streams[i];
-                break;
-            }
-        }
-    }
-
-    if (!slot) return NULL;
-
-    /* Initialize stream */
-    memset(slot, 0, sizeof(*slot));
-    slot->pid = pid;
-    slot->ssl_ctx = ssl_ctx;
-    slot->stream_id = stream_id;
-    slot->active = true;
-    slot->state = H2_STREAM_OPEN;
-
-    /* Allocate body buffer */
-    slot->body_buf_size = H2_BODY_BUFFER_SIZE;
-    slot->body_buf = malloc(slot->body_buf_size);
-    if (!slot->body_buf) {
-        slot->active = false;
-        slot->body_buf_size = 0;
-        return NULL;  /* Allocation failed */
-    }
-
-    return slot;
-}
-
-void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id) {
-    for (int i = 0; i < MAX_H2_STREAMS; i++) {
-        if (g_h2_streams[i].active &&
-            g_h2_streams[i].pid == pid &&
-            g_h2_streams[i].ssl_ctx == ssl_ctx &&
-            g_h2_streams[i].stream_id == stream_id) {
-            if (g_h2_streams[i].body_buf) {
-                free(g_h2_streams[i].body_buf);
-                g_h2_streams[i].body_buf = NULL;
-            }
-            g_h2_streams[i].active = false;
-            return;
-        }
-    }
-}
-
-/* Forward declaration for cleanup */
-static void h2_connection_cleanup(h2_connection_t *conn);
 
 /*
  * Flow-based stream helper (Phase 3.6 migration)
@@ -443,30 +220,11 @@ static flow_transaction_t *get_flow_stream(h2_callback_ctx_t *ctx,
     return flow_h2_alloc_stream(ctx->flow_ctx, stream_id);
 }
 
-void http2_cleanup_pid(uint32_t pid) {
-    /* Free all streams for this PID */
-    for (int i = 0; i < MAX_H2_STREAMS; i++) {
-        if (g_h2_streams[i].active && g_h2_streams[i].pid == pid) {
-            if (g_h2_streams[i].body_buf) {
-                free(g_h2_streams[i].body_buf);
-                g_h2_streams[i].body_buf = NULL;
-            }
-            g_h2_streams[i].active = false;
-        }
-    }
-
-    /* Free all connections for this PID */
-    for (int i = 0; i < MAX_H2_SESSIONS; i++) {
-        if (g_h2_connections[i].active && g_h2_connections[i].pid == pid) {
-            h2_connection_cleanup(&g_h2_connections[i]);
-        }
-    }
-}
-
 /* nghttp2 callbacks */
 static int on_begin_headers_callback(nghttp2_session *session,
                                      const nghttp2_frame *frame,
                                      void *user_data) {
+    (void)session;
     h2_callback_ctx_t *ctx = (h2_callback_ctx_t *)user_data;
 
     DEBUG_H2("on_begin_headers: stream=%d type=%d dir=%s",
@@ -479,59 +237,23 @@ static int on_begin_headers_callback(nghttp2_session *session,
 
     /* Only process on appropriate session */
     if (ctx->direction == H2_DIR_SERVER) {
-        /* Server session sees requests - create/update stream state */
-
-        /* Try flow-based storage first (Phase 3.6) */
+        /* Server session sees requests - create stream state */
         flow_transaction_t *ftxn = get_flow_stream(ctx, frame->hd.stream_id, true);
         if (ftxn) {
             ftxn->state = TXN_STATE_OPEN;
+            ftxn->direction = DIR_REQUEST;
             if (ctx->event) {
                 ftxn->start_time_ns = ctx->event->timestamp_ns;
             }
         }
-
-        /* Also use global pool for backward compatibility */
-        h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, true);
-        if (!stream) {
-            return 0;
-        }
-
-        /* Reset headers for new block */
-        stream->header_count = 0;
-
-        /* Capture timing */
-        if (ctx->event) {
-            stream->request_time_ns = ctx->event->timestamp_ns;
-            stream->delta_ns = ctx->event->delta_ns;
-            /* Resolve actual process name (not thread name) */
-            if (!stream->comm[0]) {
-                h2_get_process_name(ctx->pid, stream->comm, sizeof(stream->comm));
-                /* Fall back to event comm if resolution failed */
-                if (!stream->comm[0] && ctx->event->comm[0]) {
-                    safe_strcpy(stream->comm, sizeof(stream->comm), ctx->event->comm);
-                }
-            }
-        }
     } else {
         /* Client session sees responses - update existing stream */
-
-        /* Try flow-based storage first (Phase 3.6) */
         flow_transaction_t *ftxn = get_flow_stream(ctx, frame->hd.stream_id, false);
-        /* Response handling in flow_transaction_t will be added in Phase 3.6.6 */
-        (void)ftxn;
-
-        h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
-        if (!stream) {
+        if (!ftxn) {
             DEBUG_H2("Response for unknown stream %d", frame->hd.stream_id);
             return 0;
         }
-
-        /* Reset headers for response block */
-        stream->header_count = 0;
-
-        if (ctx->event) {
-            stream->response_time_ns = ctx->event->timestamp_ns;
-        }
+        ftxn->direction = DIR_RESPONSE;
     }
 
     return 0;
@@ -550,11 +272,8 @@ static int on_header_callback(nghttp2_session *session,
     DEBUG_H2("on_header: stream=%d '%.*s: %.*s'",
              frame->hd.stream_id, (int)namelen, name, (int)valuelen, value);
 
-    /* Try flow-based storage first (Phase 3.6) */
     flow_transaction_t *ftxn = get_flow_stream(ctx, frame->hd.stream_id, false);
-
-    h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
-    if (!stream) {
+    if (!ftxn) {
         DEBUG_H2("on_header: stream %d not found!", frame->hd.stream_id);
         return 0;
     }
@@ -562,90 +281,47 @@ static int on_header_callback(nghttp2_session *session,
     /* Handle pseudo-headers (start with ':') */
     if (namelen > 0 && name[0] == ':') {
         if (namelen == 7 && memcmp(name, ":method", 7) == 0) {
-            size_t copylen = valuelen < sizeof(stream->method) - 1 ? valuelen : sizeof(stream->method) - 1;
-            memcpy(stream->method, value, copylen);
-            stream->method[copylen] = '\0';
-
-            /* Also populate flow_transaction_t */
-            if (ftxn) {
-                copylen = valuelen < sizeof(ftxn->method) - 1 ? valuelen : sizeof(ftxn->method) - 1;
-                memcpy(ftxn->method, value, copylen);
-                ftxn->method[copylen] = '\0';
-            }
+            size_t copylen = valuelen < sizeof(ftxn->method) - 1 ? valuelen : sizeof(ftxn->method) - 1;
+            memcpy(ftxn->method, value, copylen);
+            ftxn->method[copylen] = '\0';
         } else if (namelen == 5 && memcmp(name, ":path", 5) == 0) {
-            size_t copylen = valuelen < sizeof(stream->path) - 1 ? valuelen : sizeof(stream->path) - 1;
-            memcpy(stream->path, value, copylen);
-            stream->path[copylen] = '\0';
-
-            if (ftxn) {
-                copylen = valuelen < sizeof(ftxn->path) - 1 ? valuelen : sizeof(ftxn->path) - 1;
-                memcpy(ftxn->path, value, copylen);
-                ftxn->path[copylen] = '\0';
-            }
+            size_t copylen = valuelen < sizeof(ftxn->path) - 1 ? valuelen : sizeof(ftxn->path) - 1;
+            memcpy(ftxn->path, value, copylen);
+            ftxn->path[copylen] = '\0';
         } else if (namelen == 10 && memcmp(name, ":authority", 10) == 0) {
-            size_t copylen = valuelen < sizeof(stream->authority) - 1 ? valuelen : sizeof(stream->authority) - 1;
-            memcpy(stream->authority, value, copylen);
-            stream->authority[copylen] = '\0';
-
-            /* :authority maps to host in flow_transaction_t */
-            if (ftxn) {
-                copylen = valuelen < sizeof(ftxn->host) - 1 ? valuelen : sizeof(ftxn->host) - 1;
-                memcpy(ftxn->host, value, copylen);
-                ftxn->host[copylen] = '\0';
-            }
-        } else if (namelen == 7 && memcmp(name, ":scheme", 7) == 0) {
-            size_t copylen = valuelen < sizeof(stream->scheme) - 1 ? valuelen : sizeof(stream->scheme) - 1;
-            memcpy(stream->scheme, value, copylen);
-            stream->scheme[copylen] = '\0';
-            /* flow_transaction_t doesn't store scheme separately */
+            size_t copylen = valuelen < sizeof(ftxn->host) - 1 ? valuelen : sizeof(ftxn->host) - 1;
+            memcpy(ftxn->host, value, copylen);
+            ftxn->host[copylen] = '\0';
         } else if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
             char status_str[8] = {0};
             size_t copylen = valuelen < 7 ? valuelen : 7;
             memcpy(status_str, value, copylen);
-            stream->status_code = atoi(status_str);
-
-            if (ftxn) {
-                ftxn->status_code = stream->status_code;
-            }
+            ftxn->status_code = atoi(status_str);
         }
+        /* :scheme not stored - always https for HTTP/2 */
         return 0;
     }
 
-    /* Store regular header */
-    if (stream->header_count < MAX_HEADERS) {
-        http_header_t *hdr = &stream->headers[stream->header_count];
-        size_t name_copylen = namelen < sizeof(hdr->name) - 1 ? namelen : sizeof(hdr->name) - 1;
-        size_t val_copylen = valuelen < sizeof(hdr->value) - 1 ? valuelen : sizeof(hdr->value) - 1;
-
-        memcpy(hdr->name, name, name_copylen);
-        hdr->name[name_copylen] = '\0';
-        memcpy(hdr->value, value, val_copylen);
-        hdr->value[val_copylen] = '\0';
-
-        stream->header_count++;
-
-        /* Extract special headers */
-        if (strcasecmp(hdr->name, "content-type") == 0) {
-            safe_strcpy(stream->content_type, sizeof(stream->content_type), hdr->value);
-            if (ftxn) {
-                safe_strcpy(ftxn->content_type, sizeof(ftxn->content_type), hdr->value);
-            }
-        } else if (strcasecmp(hdr->name, "content-encoding") == 0) {
-            safe_strcpy(stream->content_encoding, sizeof(stream->content_encoding), hdr->value);
-            /* flow_transaction_t uses TXN_FLAG_COMPRESSED instead */
-            if (ftxn && hdr->value[0]) {
-                ftxn->flags |= TXN_FLAG_COMPRESSED;
-            }
-        } else if (strcasecmp(hdr->name, "content-length") == 0) {
-            stream->content_length = strtoull(hdr->value, NULL, 10);
-            if (ftxn) {
-                ftxn->content_length = stream->content_length;
-            }
-        } else if (strcasecmp(hdr->name, "transfer-encoding") == 0 &&
-                   strcasestr(hdr->value, "chunked")) {
-            if (ftxn) {
-                ftxn->flags |= TXN_FLAG_CHUNKED;
-            }
+    /* Extract special headers */
+    if (namelen == 12 && strncasecmp((const char *)name, "content-type", 12) == 0) {
+        size_t copylen = valuelen < sizeof(ftxn->content_type) - 1 ? valuelen : sizeof(ftxn->content_type) - 1;
+        memcpy(ftxn->content_type, value, copylen);
+        ftxn->content_type[copylen] = '\0';
+    } else if (namelen == 16 && strncasecmp((const char *)name, "content-encoding", 16) == 0) {
+        if (valuelen > 0) {
+            ftxn->flags |= TXN_FLAG_COMPRESSED;
+            size_t copylen = valuelen < sizeof(ftxn->encoding) - 1 ? valuelen : sizeof(ftxn->encoding) - 1;
+            memcpy(ftxn->encoding, value, copylen);
+            ftxn->encoding[copylen] = '\0';
+        }
+    } else if (namelen == 14 && strncasecmp((const char *)name, "content-length", 14) == 0) {
+        char len_str[32] = {0};
+        size_t copylen = valuelen < 31 ? valuelen : 31;
+        memcpy(len_str, value, copylen);
+        ftxn->content_length = strtoull(len_str, NULL, 10);
+    } else if (namelen == 17 && strncasecmp((const char *)name, "transfer-encoding", 17) == 0) {
+        if (valuelen >= 7 && strcasestr((const char *)value, "chunked")) {
+            ftxn->flags |= TXN_FLAG_CHUNKED;
         }
     }
 
@@ -662,52 +338,39 @@ static int on_frame_recv_callback(nghttp2_session *session,
              http2_frame_name(frame->hd.type), frame->hd.type,
              frame->hd.stream_id, frame->hd.flags);
 
-    /* Get flow-based transaction if available (Phase 3.6) */
+    /* Get flow-based transaction (required for display) */
     flow_transaction_t *ftxn = get_flow_stream(ctx, frame->hd.stream_id, false);
 
     switch (frame->hd.type) {
     case NGHTTP2_HEADERS:
         /* Headers complete - check END_HEADERS flag */
         if (frame->hd.flags & NGHTTP2_FLAG_END_HEADERS) {
-            h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
-            if (stream) {
+            if (ftxn && ctx->flow_ctx) {
                 if (ctx->direction == H2_DIR_SERVER) {
                     /* Request headers complete - only display once */
-                    if (!stream->request_headers_done) {
-                        stream->request_headers_done = true;
-                        h2_display_request(stream);
+                    if (!(ftxn->flags & TXN_FLAG_REQ_HEADERS_DONE)) {
+                        ftxn->flags |= TXN_FLAG_REQ_HEADERS_DONE;
+                        h2_display_request_flow(ftxn, ctx->flow_ctx, ctx->event);
                     }
 
                     /* If END_STREAM also set, request is complete (no body) */
                     if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-                        stream->request_complete = true;
-
-                        /* Update flow_transaction_t state */
-                        if (ftxn) {
-                            ftxn->flags |= TXN_FLAG_REQ_END_STREAM;
-                            ftxn->state = TXN_STATE_HALF_CLOSED_REMOTE;
-                        }
+                        ftxn->flags |= TXN_FLAG_REQ_END_STREAM;
+                        ftxn->state = TXN_STATE_HALF_CLOSED_REMOTE;
                     }
                 } else {
                     /* Response headers complete - only display once */
-                    if (!stream->response_headers_done) {
-                        stream->response_headers_done = true;
-                        h2_display_response(stream);
+                    if (!(ftxn->flags & TXN_FLAG_RSP_HEADERS_DONE)) {
+                        ftxn->flags |= TXN_FLAG_RSP_HEADERS_DONE;
+                        h2_display_response_flow(ftxn, ctx->flow_ctx, ctx->event);
 
                         /* If END_STREAM also set, response is complete (no body) */
                         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-                            stream->response_complete = true;
-                            printf("\n");
-
-                            /* Update flow_transaction_t state */
-                            if (ftxn) {
-                                ftxn->flags |= TXN_FLAG_RSP_END_STREAM;
-                                /* If both ends closed, stream is done */
-                                if (ftxn->flags & TXN_FLAG_REQ_END_STREAM) {
-                                    ftxn->state = TXN_STATE_CLOSED;
-                                } else {
-                                    ftxn->state = TXN_STATE_HALF_CLOSED_LOCAL;
-                                }
+                            ftxn->flags |= TXN_FLAG_RSP_END_STREAM;
+                            if (ftxn->flags & TXN_FLAG_REQ_END_STREAM) {
+                                ftxn->state = TXN_STATE_CLOSED;
+                            } else {
+                                ftxn->state = TXN_STATE_HALF_CLOSED_LOCAL;
                             }
                         }
                     }
@@ -719,43 +382,28 @@ static int on_frame_recv_callback(nghttp2_session *session,
     case NGHTTP2_DATA:
         /* DATA frame - check END_STREAM */
         if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
-            h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
-            if (stream) {
+            if (ftxn) {
                 if (ctx->direction == H2_DIR_SERVER) {
                     /* Request body complete */
-                    stream->request_complete = true;
-                    h2_display_body(stream, DIR_REQUEST);
-
-                    if (ftxn) {
-                        ftxn->flags |= TXN_FLAG_REQ_END_STREAM;
-                        ftxn->state = TXN_STATE_HALF_CLOSED_REMOTE;
-                    }
+                    ftxn->flags |= TXN_FLAG_REQ_END_STREAM;
+                    ftxn->state = TXN_STATE_HALF_CLOSED_REMOTE;
+                    /* Body display handled by flow_txn_append_body if enabled */
                 } else {
                     /* Response body complete */
-                    stream->response_complete = true;
-                    h2_display_body(stream, DIR_RESPONSE);
-
-                    if (ftxn) {
-                        ftxn->flags |= TXN_FLAG_RSP_END_STREAM;
-                        if (ftxn->flags & TXN_FLAG_REQ_END_STREAM) {
-                            ftxn->state = TXN_STATE_CLOSED;
-                        } else {
-                            ftxn->state = TXN_STATE_HALF_CLOSED_LOCAL;
-                        }
+                    ftxn->flags |= TXN_FLAG_RSP_END_STREAM;
+                    if (ftxn->flags & TXN_FLAG_REQ_END_STREAM) {
+                        ftxn->state = TXN_STATE_CLOSED;
+                    } else {
+                        ftxn->state = TXN_STATE_HALF_CLOSED_LOCAL;
                     }
+                    /* Body display handled by flow_txn_append_body if enabled */
                 }
             }
         }
         break;
 
     case NGHTTP2_SETTINGS:
-        if (frame->hd.flags & NGHTTP2_FLAG_ACK) {
-            /* SETTINGS ACK - connection fully established */
-        } else {
-            if (ctx->direction == H2_DIR_CLIENT) {
-                ctx->conn->server_settings_seen = true;
-            }
-        }
+        /* SETTINGS frames are tracked by nghttp2 session state */
         break;
 
     case NGHTTP2_GOAWAY:
@@ -767,16 +415,8 @@ static int on_frame_recv_callback(nghttp2_session *session,
 
     case NGHTTP2_RST_STREAM:
         /* Stream reset - mark as closed */
-        {
-            h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, frame->hd.stream_id, false);
-            if (stream) {
-                stream->state = H2_STREAM_CLOSED;
-            }
-
-            /* Update flow_transaction_t state */
-            if (ftxn) {
-                ftxn->state = TXN_STATE_RESET;
-            }
+        if (ftxn) {
+            ftxn->state = TXN_STATE_RESET;
         }
         break;
 
@@ -797,22 +437,10 @@ static int on_data_chunk_recv_callback(nghttp2_session *session,
     (void)flags;
     h2_callback_ctx_t *ctx = (h2_callback_ctx_t *)user_data;
 
-    /* Also append to flow_transaction_t body buffer if configured */
+    /* Append to flow_transaction_t body buffer if configured */
     flow_transaction_t *ftxn = get_flow_stream(ctx, stream_id, false);
     if (ftxn && g_config.show_body) {
         flow_txn_append_body(ftxn, data, len);
-    }
-
-    h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, stream_id, false);
-    if (!stream || !stream->body_buf) return 0;
-
-    /* Accumulate body data */
-    size_t available = stream->body_buf_size - stream->body_len;
-    size_t to_copy = (len < available) ? len : available;
-
-    if (to_copy > 0) {
-        memcpy(stream->body_buf + stream->body_len, data, to_copy);
-        stream->body_len += to_copy;
     }
 
     return 0;
@@ -834,15 +462,10 @@ static int on_stream_close_callback(nghttp2_session *session,
             ftxn->state = TXN_STATE_CLOSED;
         }
         ftxn->flags |= TXN_FLAG_DISPLAYED;  /* Mark as ready for cleanup */
-    }
 
-    h2_stream_t *stream = http2_get_stream(ctx->pid, ctx->ssl_ctx, stream_id, false);
-    if (stream) {
-        stream->state = H2_STREAM_CLOSED;
-
-        /* Display any remaining body data if not yet shown */
-        if (stream->body_len > 0 && !stream->response_complete) {
-            h2_display_body(stream, DIR_RESPONSE);
+        /* Display body if accumulated and not yet shown */
+        if (ftxn->body_len > 0 && g_config.show_body && ctx->flow_ctx) {
+            h2_display_body_flow(ftxn, ctx->flow_ctx);
         }
     }
 
@@ -887,366 +510,117 @@ static int on_error_callback(nghttp2_session *session,
     return 0;
 }
 
-/* Display functions */
-static void h2_display_request(h2_stream_t *stream) {
-    DEBUG_H2("h2_display_request: stream=%d method='%s' path='%s' authority='%s'",
-             stream->stream_id, stream->method, stream->path, stream->authority);
+/**
+ * @brief Display HTTP/2 request using flow-based transaction
+ *
+ * Flow-based version of h2_display_request() that uses flow_transaction_t
+ * instead of the deprecated h2_stream_t global pool.
+ *
+ * @param[in] txn       Flow transaction containing request data
+ * @param[in] flow_ctx  Flow context for connection metadata
+ * @param[in] event     SSL event for timestamp
+ */
+static void h2_display_request_flow(flow_transaction_t *txn, flow_context_t *flow_ctx,
+                                    const ssl_data_event_t *event) {
+    DEBUG_H2("h2_display_request_flow: stream=%d method='%s' path='%s' host='%s'",
+             txn->stream_id, txn->method, txn->path, txn->host);
 
-    /* Build http_message_t from stream state */
     http_message_t msg = {0};
 
     msg.protocol = PROTO_HTTP2;
     msg.direction = DIR_REQUEST;
-    msg.stream_id = stream->stream_id;
-    msg.pid = stream->pid;
-    msg.timestamp_ns = stream->request_time_ns;
-    msg.delta_ns = stream->delta_ns;
+    msg.stream_id = txn->stream_id;
+    msg.pid = flow_ctx->pid;
+    msg.timestamp_ns = event ? event->timestamp_ns : 0;
 
-    safe_strcpy(msg.method, sizeof(msg.method), stream->method);
-    safe_strcpy(msg.path, sizeof(msg.path), stream->path);
-    safe_strcpy(msg.authority, sizeof(msg.authority), stream->authority);
-    safe_strcpy(msg.scheme, sizeof(msg.scheme),
-                stream->scheme[0] ? stream->scheme : "https");
-    safe_strcpy(msg.comm, sizeof(msg.comm), stream->comm);
+    /* Copy request info from transaction */
+    safe_strcpy(msg.method, sizeof(msg.method), txn->method);
+    safe_strcpy(msg.path, sizeof(msg.path), txn->path);
+    safe_strcpy(msg.authority, sizeof(msg.authority), txn->host);
+    safe_strcpy(msg.scheme, sizeof(msg.scheme), "https");
+    safe_strcpy(msg.comm, sizeof(msg.comm), flow_ctx->comm);
 
-    /* Get ALPN protocol from connection */
-    const char *alpn = http2_get_alpn(stream->pid, stream->ssl_ctx);
-    if (alpn && alpn[0]) {
-        safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
+    /* Use ALPN from flow context if available */
+    if (flow_ctx->alpn[0]) {
+        safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), flow_ctx->alpn);
     }
 
-    /* Get XDP flow correlation info from connection ("Golden Thread" double-view) */
-    h2_connection_t *conn = get_h2_connection(stream->pid, stream->ssl_ctx, false);
-    if (conn && conn->has_flow_info) {
+    /* Use XDP flow correlation info from flow context ("Golden Thread" double-view) */
+    if (flow_ctx->flags & FLOW_FLAG_HAS_XDP) {
         msg.has_flow_info = true;
-        msg.flow_src_ip = conn->flow_src_ip;
-        msg.flow_dst_ip = conn->flow_dst_ip;
-        msg.flow_src_port = conn->flow_src_port;
-        msg.flow_dst_port = conn->flow_dst_port;
-        msg.flow_ip_version = conn->flow_ip_version;
-        msg.flow_direction = conn->flow_direction;
-        msg.flow_category = conn->flow_category;
-        memcpy(msg.flow_ifname, conn->flow_ifname, sizeof(msg.flow_ifname));
+        msg.flow_src_ip = flow_ctx->flow.saddr;
+        msg.flow_dst_ip = flow_ctx->flow.daddr;
+        msg.flow_src_port = flow_ctx->flow.sport;
+        msg.flow_dst_port = flow_ctx->flow.dport;
+        msg.flow_ip_version = flow_ctx->flow.ip_version;
+        msg.flow_category = flow_ctx->xdp_category;
     }
 
-    /* Copy headers */
-    msg.header_count = stream->header_count;
-    for (int i = 0; i < stream->header_count && i < MAX_HEADERS; i++) {
-        memcpy(&msg.headers[i], &stream->headers[i], sizeof(http_header_t));
+    /* Store request start time for latency calculation */
+    if (event && txn->start_time_ns == 0) {
+        txn->start_time_ns = event->timestamp_ns;
     }
 
-    /* Display using existing functions */
     display_http_request(&msg);
 
-    if (!g_config.compact_mode && msg.header_count > 0) {
-        display_http_headers(&msg);
+    if (!g_config.compact_mode) {
+        /* TODO: Add header display when headers are stored in flow_transaction_t */
     }
 
-    stream->headers_displayed = true;
     printf("\n");
     fflush(stdout);
 }
 
-static void h2_display_response(h2_stream_t *stream) {
-    DEBUG_H2("h2_display_response: stream=%d status=%d content_type='%s'",
-             stream->stream_id, stream->status_code, stream->content_type);
+/**
+ * @brief Display HTTP/2 body using flow-based transaction
+ *
+ * @param[in] txn       Flow transaction containing body data
+ * @param[in] flow_ctx  Flow context for connection metadata
+ */
+static void h2_display_body_flow(flow_transaction_t *txn, flow_context_t *flow_ctx) {
+    (void)flow_ctx;
 
-    /*
-     * Handle HPACK decode failures - show partial info instead of dropping entirely.
-     * This happens when joining HTTP/2 connections mid-stream (e.g., Chrome connection reuse).
-     * The HPACK dynamic table wasn't built from connection start, so we can't decode headers.
-     */
-    if (stream->status_code == 0) {
-        /* Still show something useful for visibility */
-        char time_str[16];
-        time_t now = time(NULL);
-        struct tm *tm = localtime(&now);
-        strftime(time_str, sizeof(time_str), "%H:%M:%S", tm);
-
-        /* Use request info if available (we may have captured it earlier) */
-        if (stream->method[0] && stream->authority[0]) {
-            printf("%s ← [HPACK decode error] %s://%s%s stream:%d %s (%u)\n",
-                   time_str,
-                   stream->scheme[0] ? stream->scheme : "https",
-                   stream->authority,
-                   stream->path[0] ? stream->path : "/",
-                   stream->stream_id,
-                   stream->comm[0] ? stream->comm : "unknown",
-                   stream->pid);
-        } else {
-            printf("%s ← [HPACK decode error] stream:%d %s (%u)\n",
-                   time_str,
-                   stream->stream_id,
-                   stream->comm[0] ? stream->comm : "unknown",
-                   stream->pid);
-        }
-        fflush(stdout);
+    if (!txn->body_buf || txn->body_len == 0) {
         return;
     }
 
-    http_message_t msg = {0};
+    const uint8_t *display_data = txn->body_buf;
+    size_t display_len = txn->body_len;
 
-    msg.protocol = PROTO_HTTP2;
-    msg.direction = DIR_RESPONSE;
-    msg.stream_id = stream->stream_id;
-    msg.pid = stream->pid;
-    msg.status_code = stream->status_code;
-    msg.timestamp_ns = stream->response_time_ns;
+    /* Decompress if Content-Encoding present */
+    uint8_t *decomp_buf = NULL;
+    if (txn->encoding[0] != '\0') {
+        /* Smart buffer allocation based on compressed size:
+         * - Estimate 10x compression ratio (typical for text content)
+         * - Minimum 8KB for small payloads
+         * - Maximum 10MB to prevent memory bombs
+         */
+        size_t est_size = txn->body_len * 10;
+        if (est_size < 8 * 1024) est_size = 8 * 1024;
+        if (est_size > 10 * 1024 * 1024) est_size = 10 * 1024 * 1024;
 
-    /* Copy request info for correlation - this lets us show which URL this response is for */
-    safe_strcpy(msg.method, sizeof(msg.method), stream->method);
-    safe_strcpy(msg.path, sizeof(msg.path), stream->path);
-    safe_strcpy(msg.authority, sizeof(msg.authority), stream->authority);
-    safe_strcpy(msg.scheme, sizeof(msg.scheme), stream->scheme[0] ? stream->scheme : "https");
-
-    /* Calculate latency from request to response */
-    if (stream->request_time_ns > 0 && stream->response_time_ns > 0) {
-        msg.delta_ns = stream->response_time_ns - stream->request_time_ns;
+        decomp_buf = malloc(est_size);
+        if (decomp_buf) {
+            int decomp_len = decompress_body(txn->body_buf, (int)txn->body_len,
+                                             txn->encoding, decomp_buf, (int)est_size);
+            if (decomp_len > 0) {
+                display_data = decomp_buf;
+                display_len = (size_t)decomp_len;
+            }
+        }
     }
 
-    safe_strcpy(msg.content_type, sizeof(msg.content_type), stream->content_type);
-    msg.content_length = stream->content_length;
-    safe_strcpy(msg.comm, sizeof(msg.comm), stream->comm);
-
-    /* Get ALPN protocol from connection */
-    const char *alpn = http2_get_alpn(stream->pid, stream->ssl_ctx);
-    if (alpn && alpn[0]) {
-        safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
-    }
-
-    /* Get XDP flow correlation info from connection ("Golden Thread" double-view) */
-    h2_connection_t *conn = get_h2_connection(stream->pid, stream->ssl_ctx, false);
-    if (conn && conn->has_flow_info) {
-        msg.has_flow_info = true;
-        msg.flow_src_ip = conn->flow_src_ip;
-        msg.flow_dst_ip = conn->flow_dst_ip;
-        msg.flow_src_port = conn->flow_src_port;
-        msg.flow_dst_port = conn->flow_dst_port;
-        msg.flow_ip_version = conn->flow_ip_version;
-        msg.flow_direction = conn->flow_direction;
-        msg.flow_category = conn->flow_category;
-        memcpy(msg.flow_ifname, conn->flow_ifname, sizeof(msg.flow_ifname));
-    }
-
-    msg.header_count = stream->header_count;
-    for (int i = 0; i < stream->header_count && i < MAX_HEADERS; i++) {
-        memcpy(&msg.headers[i], &stream->headers[i], sizeof(http_header_t));
-    }
-
-    display_http_response(&msg);
-
-    if (!g_config.compact_mode && msg.header_count > 0) {
-        display_http_headers(&msg);
-    }
+    display_body(display_data, display_len, txn->content_type);
     fflush(stdout);
-}
 
-static void h2_display_body(h2_stream_t *stream, direction_t dir) {
-    (void)dir;
-
-    if (!g_config.show_body || stream->body_len == 0) {
-        printf("\n");
-        return;
+    if (decomp_buf) {
+        free(decomp_buf);
     }
-
-    const uint8_t *body_data = stream->body_buf;
-    size_t body_len = stream->body_len;
-
-    /* Decompress if needed */
-    static uint8_t decomp_buf[MAX_BODY_BUFFER];
-    if (stream->content_encoding[0]) {
-        int decomp_len = decompress_body(stream->body_buf, (int)stream->body_len,
-                                         stream->content_encoding,
-                                         decomp_buf, MAX_BODY_BUFFER);
-        if (decomp_len > 0) {
-            body_data = decomp_buf;
-            body_len = (size_t)decomp_len;
-        }
-    }
-
-    /* Display using existing function */
-    display_body(body_data, body_len, stream->content_type);
-
-    /* Clear body buffer after display */
-    stream->body_len = 0;
-    printf("\n");
-    fflush(stdout);
-}
-
-/* Connection management */
-static void h2_connection_cleanup(h2_connection_t *conn) {
-    if (!conn || !conn->active) return;
-
-    /* Free nghttp2 server session */
-    if (conn->server_session) {
-        nghttp2_session_del(conn->server_session);
-        conn->server_session = NULL;
-    }
-
-    /* Free HPACK inflater for responses */
-    if (conn->response_inflater) {
-        nghttp2_hd_inflate_del(conn->response_inflater);
-        conn->response_inflater = NULL;
-    }
-
-    /* Free response reassembly buffer */
-    if (conn->response_buf) {
-        free(conn->response_buf);
-        conn->response_buf = NULL;
-        conn->response_buf_len = 0;
-    }
-
-    /* Free callback context */
-    free(conn->server_ctx);
-    conn->server_ctx = NULL;
-
-    /* Cleanup associated streams for this connection */
-    for (int i = 0; i < MAX_H2_STREAMS; i++) {
-        if (g_h2_streams[i].active &&
-            g_h2_streams[i].pid == conn->pid &&
-            g_h2_streams[i].ssl_ctx == conn->ssl_ctx) {
-            http2_free_stream(g_h2_streams[i].pid, g_h2_streams[i].ssl_ctx,
-                              g_h2_streams[i].stream_id);
-        }
-    }
-
-    conn->active = false;
-}
-
-static h2_connection_t *get_h2_connection(uint32_t pid, uint64_t ssl_ctx, bool create) {
-    /* Find existing by (pid, ssl_ctx) */
-    for (int i = 0; i < MAX_H2_SESSIONS; i++) {
-        if (g_h2_connections[i].active &&
-            g_h2_connections[i].pid == pid &&
-            g_h2_connections[i].ssl_ctx == ssl_ctx) {
-            g_h2_connections[i].last_activity_ns = get_time_ns();
-            return &g_h2_connections[i];
-        }
-    }
-
-    if (!create) return NULL;
-
-    /* Find empty slot (or evict oldest) */
-    h2_connection_t *slot = NULL;
-    uint64_t oldest = UINT64_MAX;
-
-    for (int i = 0; i < MAX_H2_SESSIONS; i++) {
-        if (!g_h2_connections[i].active) {
-            slot = &g_h2_connections[i];
-            break;
-        }
-        if (g_h2_connections[i].last_activity_ns < oldest) {
-            oldest = g_h2_connections[i].last_activity_ns;
-            slot = &g_h2_connections[i];
-        }
-    }
-
-    /* Cleanup old session if reusing */
-    if (slot && slot->active) {
-        h2_connection_cleanup(slot);
-    }
-
-    if (!slot) return NULL;
-
-    /* Initialize new connection */
-    memset(slot, 0, sizeof(*slot));
-    slot->pid = pid;
-    slot->ssl_ctx = ssl_ctx;
-    slot->active = true;
-    slot->last_activity_ns = get_time_ns();
-
-    /* Create callback context for server session */
-    h2_callback_ctx_t *server_ctx = malloc(sizeof(h2_callback_ctx_t));
-    if (!server_ctx) {
-        slot->active = false;
-        return NULL;
-    }
-
-    memset(server_ctx, 0, sizeof(*server_ctx));
-    server_ctx->pid = pid;
-    server_ctx->ssl_ctx = ssl_ctx;
-    server_ctx->conn = slot;
-    server_ctx->direction = H2_DIR_SERVER;
-
-    /* Create nghttp2 server session with options for passive sniffing */
-    int rv;
-    nghttp2_option *server_opt = NULL;
-
-    rv = nghttp2_option_new(&server_opt);
-    if (rv != 0) {
-        free(server_ctx);
-        slot->active = false;
-        return NULL;
-    }
-
-    /*
-     * Critical for passive sniffing: we detect and skip the 24-byte
-     * client magic preface in main.c before calling http2_process_frame().
-     * Tell nghttp2 we've already consumed it so it doesn't expect it.
-     */
-    nghttp2_option_set_no_recv_client_magic(server_opt, 1);
-
-    /*
-     * Disable automatic WINDOW_UPDATE - we're passive sniffers,
-     * not actual endpoints generating flow control.
-     */
-    nghttp2_option_set_no_auto_window_update(server_opt, 1);
-
-    /* Server session (parses data FROM client = requests) */
-    rv = nghttp2_session_server_new2(&slot->server_session, g_h2_callbacks,
-                                      server_ctx, server_opt);
-    nghttp2_option_del(server_opt);
-
-    if (rv != 0) {
-        free(server_ctx);
-        slot->active = false;
-        return NULL;
-    }
-
-    /* Create HPACK inflater for decoding response headers */
-    rv = nghttp2_hd_inflate_new(&slot->response_inflater);
-    if (rv != 0) {
-        nghttp2_session_del(slot->server_session);
-        free(server_ctx);
-        slot->active = false;
-        return NULL;
-    }
-
-    /* Allocate response reassembly buffer */
-    slot->response_buf = malloc(H2_REASSEMBLY_BUF_SIZE);
-    if (!slot->response_buf) {
-        nghttp2_hd_inflate_del(slot->response_inflater);
-        nghttp2_session_del(slot->server_session);
-        free(server_ctx);
-        slot->active = false;
-        return NULL;
-    }
-    slot->response_buf_len = 0;
-
-    /* Store context pointer for later cleanup and event updates */
-    slot->server_ctx = server_ctx;
-
-    /*
-     * Important: Drain the initial SETTINGS frame that nghttp2 queues
-     * upon session creation. This ensures our session is in the proper
-     * state (SETTINGS "sent") before we receive any peer data.
-     */
-    for (;;) {
-        const uint8_t *send_data;
-        ssize_t send_len = nghttp2_session_mem_send(slot->server_session, &send_data);
-        if (send_len <= 0) break;
-    }
-
-    DEBUG_H2("Created new session for PID %u", pid);
-    return slot;
 }
 
 /* Public API */
 int http2_init(void) {
     if (g_h2_initialized) return 0;
-
-    memset(g_h2_connections, 0, sizeof(g_h2_connections));
-    memset(g_h2_streams, 0, sizeof(g_h2_streams));
 
     /* Create shared callback structure */
     int rv = nghttp2_session_callbacks_new(&g_h2_callbacks);
@@ -1279,20 +653,7 @@ nghttp2_session_callbacks *http2_get_callbacks(void) {
 }
 
 void http2_cleanup(void) {
-    /* Free all streams */
-    for (int i = 0; i < MAX_H2_STREAMS; i++) {
-        if (g_h2_streams[i].body_buf) {
-            free(g_h2_streams[i].body_buf);
-            g_h2_streams[i].body_buf = NULL;
-        }
-        g_h2_streams[i].active = false;
-    }
-
-    /* Free all connections */
-    for (int i = 0; i < MAX_H2_SESSIONS; i++) {
-        h2_connection_cleanup(&g_h2_connections[i]);
-    }
-
+    /* Free shared callbacks (flow sessions manage their own state) */
     if (g_h2_callbacks) {
         nghttp2_session_callbacks_del(g_h2_callbacks);
         g_h2_callbacks = NULL;
@@ -1312,285 +673,6 @@ const char *http2_frame_name(int type) {
 bool http2_is_preface(const uint8_t *data, size_t len) {
     const char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     return len >= 24 && memcmp(data, preface, 24) == 0;
-}
-
-bool http2_has_session(uint32_t pid, uint64_t ssl_ctx) {
-    for (int i = 0; i < MAX_H2_SESSIONS; i++) {
-        if (g_h2_connections[i].active &&
-            g_h2_connections[i].pid == pid &&
-            g_h2_connections[i].ssl_ctx == ssl_ctx) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
-    /* Find existing connection or create one */
-    h2_connection_t *conn = get_h2_connection(pid, ssl_ctx, true);
-    if (conn && alpn) {
-        safe_strcpy(conn->alpn_proto, sizeof(conn->alpn_proto), alpn);
-    }
-}
-
-/**
- * @brief Set XDP flow correlation info for an HTTP/2 connection
- *
- * Stores network-layer metadata from XDP packet capture, enabling
- * "Golden Thread" double-view correlation between network and
- * application layers.
- *
- * @param pid       Process ID
- * @param ssl_ctx   SSL context pointer
- * @param src_ip    Source IP address (network byte order)
- * @param dst_ip    Destination IP address (network byte order)
- * @param src_port  Source port (network byte order)
- * @param dst_port  Destination port (network byte order)
- * @param ip_ver    IP version (4 or 6)
- * @param direction Flow direction (0=outbound, 1=inbound)
- * @param category  Traffic category (1=TLS, 2=QUIC, 3=HTTP, 4=H2)
- * @param ifname    Interface name (may be NULL)
- */
-void http2_set_flow_info(uint32_t pid, uint64_t ssl_ctx,
-                         uint32_t src_ip, uint32_t dst_ip,
-                         uint16_t src_port, uint16_t dst_port,
-                         uint8_t ip_ver, uint8_t direction,
-                         uint8_t category, const char *ifname) {
-    h2_connection_t *conn = get_h2_connection(pid, ssl_ctx, true);
-    if (!conn) return;
-
-    conn->has_flow_info = true;
-    conn->flow_src_ip = src_ip;
-    conn->flow_dst_ip = dst_ip;
-    conn->flow_src_port = src_port;
-    conn->flow_dst_port = dst_port;
-    conn->flow_ip_version = ip_ver;
-    conn->flow_direction = direction;
-    conn->flow_category = category;
-    if (ifname) {
-        safe_strcpy(conn->flow_ifname, sizeof(conn->flow_ifname), ifname);
-    }
-}
-
-const char *http2_get_alpn(uint32_t pid, uint64_t ssl_ctx) {
-    for (int i = 0; i < MAX_H2_SESSIONS; i++) {
-        if (g_h2_connections[i].active &&
-            g_h2_connections[i].pid == pid &&
-            g_h2_connections[i].ssl_ctx == ssl_ctx) {
-            return g_h2_connections[i].alpn_proto;
-        }
-    }
-    return "";
-}
-
-/* ============================================================================
- * HPACK Fallback Parser
- *
- * When HPACK dynamic table decoding fails (mid-stream join), this parser
- * scans raw header data for recognizable patterns. It extracts:
- *   - Status codes from :status pseudo-headers
- *   - Literal header values (ASCII strings)
- *   - Recognizable HTTP patterns (methods, paths, content-types)
- *
- * This provides partial visibility into HTTP/2 traffic even when we can't
- * fully decode the HPACK-compressed headers.
- * ============================================================================
- */
-
-/* Extract printable ASCII string from position, return length */
-static size_t extract_ascii_string(const uint8_t *data, size_t len,
-                                    char *out, size_t out_size) {
-    size_t extracted = 0;
-    for (size_t i = 0; i < len && extracted < out_size - 1; i++) {
-        uint8_t c = data[i];
-        /* Printable ASCII (excluding control chars) */
-        if (c >= 0x20 && c <= 0x7e) {
-            out[extracted++] = (char)c;
-        } else if (extracted > 0) {
-            /* Stop at first non-printable after collecting some chars */
-            break;
-        }
-    }
-    out[extracted] = '\0';
-    return extracted;
-}
-
-/* Check if data looks like a 3-digit HTTP status code */
-static int parse_status_code(const uint8_t *data, size_t len) {
-    if (len < 3) return 0;
-
-    /* Check for 3-digit numeric status */
-    if (data[0] >= '1' && data[0] <= '5' &&
-        data[1] >= '0' && data[1] <= '9' &&
-        data[2] >= '0' && data[2] <= '9') {
-        return (data[0] - '0') * 100 + (data[1] - '0') * 10 + (data[2] - '0');
-    }
-    return 0;
-}
-
-/* HPACK static table indices for common headers */
-#define HPACK_STATUS_200 8
-#define HPACK_STATUS_204 9
-#define HPACK_STATUS_206 10
-#define HPACK_STATUS_304 11
-#define HPACK_STATUS_400 12
-#define HPACK_STATUS_404 13
-#define HPACK_STATUS_500 14
-#define HPACK_METHOD_GET 2
-#define HPACK_METHOD_POST 3
-#define HPACK_PATH_ROOT 4
-#define HPACK_PATH_INDEX 5
-#define HPACK_SCHEME_HTTP 6
-#define HPACK_SCHEME_HTTPS 7
-#define HPACK_CONTENT_TYPE 31
-
-/* Decode status from HPACK static table index */
-static int static_table_status(uint8_t index) {
-    switch (index) {
-        case HPACK_STATUS_200: return 200;
-        case HPACK_STATUS_204: return 204;
-        case HPACK_STATUS_206: return 206;
-        case HPACK_STATUS_304: return 304;
-        case HPACK_STATUS_400: return 400;
-        case HPACK_STATUS_404: return 404;
-        case HPACK_STATUS_500: return 500;
-        default: return 0;
-    }
-}
-
-/* Try to extract useful info from raw HPACK data */
-static void hpack_fallback_parse(const uint8_t *data, size_t len,
-                                  h2_stream_t *stream) {
-    if (!data || len == 0 || !stream) return;
-
-    /* Scan for recognizable patterns */
-    for (size_t i = 0; i < len; i++) {
-        uint8_t byte = data[i];
-
-        /* Check for indexed header field (top bit set)
-         * Format: 1xxxxxxx where xxxxxxx is the index */
-        if (byte & 0x80) {
-            uint8_t index = byte & 0x7f;
-            /* Check static table status codes */
-            int status = static_table_status(index);
-            if (status > 0 && stream->status_code == 0) {
-                stream->status_code = status;
-                DEBUG_H2("Fallback: extracted status %d from static table index %d",
-                         status, index);
-            }
-            continue;
-        }
-
-        /* Check for literal with indexing (0100xxxx) or without (0000xxxx)
-         * These often contain readable ASCII values */
-        if ((byte & 0xc0) == 0x40 || (byte & 0xf0) == 0x00) {
-            /* Skip the index byte, look for length prefix + value */
-            size_t remaining = len - i - 1;
-            if (remaining < 2) continue;
-
-            /* Next byte(s) contain length - check for Huffman bit */
-            size_t j = i + 1;
-            uint8_t len_byte = data[j];
-            bool huffman = (len_byte & 0x80) != 0;
-            size_t str_len = len_byte & 0x7f;
-
-            /* Skip Huffman encoded strings (can't easily decode without table) */
-            if (huffman) continue;
-
-            /* Check if we have enough data for the literal string */
-            if (j + 1 + str_len <= len && str_len > 0 && str_len < 512) {
-                const uint8_t *str_data = &data[j + 1];
-
-                /* Check if this looks like a status code */
-                int status = parse_status_code(str_data, str_len);
-                if (status > 0 && stream->status_code == 0) {
-                    stream->status_code = status;
-                    DEBUG_H2("Fallback: extracted literal status %d", status);
-                    continue;
-                }
-
-                /* Check for content-type patterns */
-                if (str_len > 5) {
-                    char temp[256] = {0};
-                    extract_ascii_string(str_data, str_len < 255 ? str_len : 255,
-                                         temp, sizeof(temp));
-                    if (strncasecmp(temp, "text/", 5) == 0 ||
-                        strncasecmp(temp, "application/", 12) == 0 ||
-                        strncasecmp(temp, "image/", 6) == 0) {
-                        if (!stream->content_type[0]) {
-                            safe_strcpy(stream->content_type, sizeof(stream->content_type), temp);
-                            DEBUG_H2("Fallback: extracted content-type '%s'", temp);
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Look for literal ":status" header name followed by value */
-        if (i + 10 < len && data[i] == ':' && data[i+1] == 's' &&
-            data[i+2] == 't' && data[i+3] == 'a' && data[i+4] == 't' &&
-            data[i+5] == 'u' && data[i+6] == 's') {
-            /* Found ":status" - look for numeric value nearby */
-            for (size_t k = i + 7; k < len - 2 && k < i + 20; k++) {
-                int status = parse_status_code(&data[k], len - k);
-                if (status > 0 && stream->status_code == 0) {
-                    stream->status_code = status;
-                    DEBUG_H2("Fallback: found :status %d at offset %zu", status, k);
-                    break;
-                }
-            }
-        }
-    }
-
-    /* If we found a status, mark that we recovered partial info */
-    if (stream->status_code > 0) {
-        DEBUG_H2("Fallback parse successful: status=%d", stream->status_code);
-    }
-}
-
-/* Process a single decoded header from HPACK inflater */
-static void h2_process_response_header(h2_stream_t *stream, const nghttp2_nv *nv) {
-    const uint8_t *name = nv->name;
-    size_t namelen = nv->namelen;
-    const uint8_t *value = nv->value;
-    size_t valuelen = nv->valuelen;
-
-    DEBUG_H2("Response header: '%.*s: %.*s'",
-             (int)namelen, name, (int)valuelen, value);
-
-    /* Handle pseudo-headers */
-    if (namelen > 0 && name[0] == ':') {
-        if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
-            char status_str[8] = {0};
-            size_t copylen = valuelen < 7 ? valuelen : 7;
-            memcpy(status_str, value, copylen);
-            stream->status_code = atoi(status_str);
-        }
-        return;
-    }
-
-    /* Store regular header */
-    if (stream->header_count < MAX_HEADERS) {
-        http_header_t *hdr = &stream->headers[stream->header_count];
-        size_t name_copylen = namelen < sizeof(hdr->name) - 1 ? namelen : sizeof(hdr->name) - 1;
-        size_t val_copylen = valuelen < sizeof(hdr->value) - 1 ? valuelen : sizeof(hdr->value) - 1;
-
-        memcpy(hdr->name, name, name_copylen);
-        hdr->name[name_copylen] = '\0';
-        memcpy(hdr->value, value, val_copylen);
-        hdr->value[val_copylen] = '\0';
-
-        stream->header_count++;
-
-        /* Extract special headers */
-        if (strcasecmp(hdr->name, "content-type") == 0) {
-            safe_strcpy(stream->content_type, sizeof(stream->content_type), hdr->value);
-        } else if (strcasecmp(hdr->name, "content-encoding") == 0) {
-            safe_strcpy(stream->content_encoding, sizeof(stream->content_encoding), hdr->value);
-        } else if (strcasecmp(hdr->name, "content-length") == 0) {
-            stream->content_length = strtoull(hdr->value, NULL, 10);
-        }
-    }
 }
 
 /*============================================================================
@@ -1632,6 +714,13 @@ static void h2_process_response_header_flow(flow_transaction_t *txn, const nghtt
         size_t copylen = valuelen < sizeof(txn->content_type) - 1 ? valuelen : sizeof(txn->content_type) - 1;
         memcpy(txn->content_type, value, copylen);
         txn->content_type[copylen] = '\0';
+    } else if (namelen == 16 && strncasecmp((const char *)name, "content-encoding", 16) == 0) {
+        if (valuelen > 0) {
+            txn->flags |= TXN_FLAG_COMPRESSED;
+            size_t copylen = valuelen < sizeof(txn->encoding) - 1 ? valuelen : sizeof(txn->encoding) - 1;
+            memcpy(txn->encoding, value, copylen);
+            txn->encoding[copylen] = '\0';
+        }
     } else if (namelen == 14 && strncasecmp((const char *)name, "content-length", 14) == 0) {
         char len_str[32] = {0};
         size_t copylen = valuelen < 31 ? valuelen : 31;
@@ -1708,6 +797,12 @@ static void h2_display_response_flow(flow_transaction_t *txn, flow_context_t *fl
         msg.flow_src_port = flow_ctx->flow.sport;
         msg.flow_dst_port = flow_ctx->flow.dport;
         msg.flow_ip_version = flow_ctx->flow.ip_version;
+        msg.flow_category = flow_ctx->xdp_category;
+    }
+
+    /* Use ALPN from flow context */
+    if (flow_ctx->alpn[0]) {
+        safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), flow_ctx->alpn);
     }
 
     display_http_response(&msg);
@@ -1843,7 +938,7 @@ static void h2_process_complete_response_frame_flow(flow_context_t *flow_ctx,
     case 0x00: /* DATA */
         {
             flow_transaction_t *txn = flow_h2_find_stream(flow_ctx, stream_id);
-            if (txn && txn->body_buf) {
+            if (txn) {
                 /* Skip padding if present */
                 const uint8_t *body_data = payload;
                 uint32_t body_len = payload_len;
@@ -1857,8 +952,10 @@ static void h2_process_complete_response_frame_flow(flow_context_t *flow_ctx,
                     body_len -= pad_len;
                 }
 
-                /* Append body data using flow transaction helper */
-                flow_txn_append_body(txn, body_data, body_len);
+                /* Append body data if configured (allocates body_buf on first use) */
+                if (body_len > 0 && g_config.show_body) {
+                    flow_txn_append_body(txn, body_data, body_len);
+                }
 
                 /* Update activity timestamp */
                 txn->last_active_ms = flow_get_monotonic_ms();
@@ -1867,7 +964,11 @@ static void h2_process_complete_response_frame_flow(flow_context_t *flow_ctx,
                 if (flags & 0x01) { /* END_STREAM */
                     txn->state = TXN_STATE_CLOSED;
                     txn->flags |= TXN_FLAG_RSP_END_STREAM;
-                    /* TODO: Display body content if needed */
+
+                    /* Display body if accumulated and configured */
+                    if (txn->body_len > 0 && g_config.show_body) {
+                        h2_display_body_flow(txn, flow_ctx);
+                    }
                 }
             }
         }
@@ -1972,205 +1073,6 @@ static void h2_process_response_frame_flow(flow_context_t *flow_ctx,
     }
 }
 
-/* Process a complete HTTP/2 response frame */
-static void h2_process_complete_response_frame(h2_connection_t *conn, const uint8_t *frame_data,
-                                                size_t frame_total_len, const ssl_data_event_t *event) {
-    (void)frame_total_len; /* Used for bounds checking at caller */
-
-    /* Parse frame header */
-    uint32_t frame_len = ((uint32_t)frame_data[0] << 16) | ((uint32_t)frame_data[1] << 8) | (uint32_t)frame_data[2];
-    uint8_t frame_type = frame_data[3];
-    uint8_t flags = frame_data[4];
-    int32_t stream_id = (int32_t)(((uint32_t)(frame_data[5] & 0x7f) << 24) | ((uint32_t)frame_data[6] << 16) |
-                         ((uint32_t)frame_data[7] << 8) | (uint32_t)frame_data[8]);
-
-    const uint8_t *payload = frame_data + 9;
-    uint32_t payload_len = frame_len;
-
-    DEBUG_H2("Response frame: type=%s len=%u stream=%d flags=0x%02x",
-             http2_frame_name(frame_type), frame_len, stream_id, flags);
-
-    switch (frame_type) {
-    case 0x01: /* HEADERS */
-        {
-            /* Get or create stream - for responses we need the stream to exist from request */
-            h2_stream_t *stream = http2_get_stream(conn->pid, conn->ssl_ctx, stream_id, false);
-            if (!stream) {
-                DEBUG_H2("Response for unknown stream %d, creating", stream_id);
-                stream = http2_get_stream(conn->pid, conn->ssl_ctx, stream_id, true);
-                if (!stream) break;
-            }
-
-            /* Update timing */
-            stream->response_time_ns = event->timestamp_ns;
-            /* Resolve actual process name (not thread name) */
-            if (!stream->comm[0]) {
-                h2_get_process_name(conn->pid, stream->comm, sizeof(stream->comm));
-                /* Fall back to event comm if resolution failed */
-                if (!stream->comm[0] && event->comm[0]) {
-                    safe_strcpy(stream->comm, sizeof(stream->comm), event->comm);
-                }
-            }
-
-            /* Reset header count for response headers */
-            stream->header_count = 0;
-
-            /* Skip padding if present */
-            const uint8_t *hdr_data = payload;
-            uint32_t hdr_len = payload_len;
-
-            if (flags & 0x08) { /* PADDED */
-                if (hdr_len < 1) break;
-                uint8_t pad_len = hdr_data[0];
-                hdr_data++;
-                hdr_len--;
-                if (hdr_len < pad_len) break;
-                hdr_len -= pad_len;
-            }
-
-            /* Skip priority if present */
-            if (flags & 0x20) { /* PRIORITY */
-                if (hdr_len < 5) break;
-                hdr_data += 5;
-                hdr_len -= 5;
-            }
-
-            /* Decode HPACK headers */
-            int final = (flags & 0x04) ? 1 : 0; /* END_HEADERS flag */
-            const uint8_t *hdr_pos = hdr_data;
-            size_t hdr_remaining = hdr_len;
-
-            DEBUG_H2("Decoding %u bytes of HPACK, final=%d", hdr_len, final);
-
-            while (hdr_remaining > 0) {
-                nghttp2_nv nv;
-                int inflate_flags = 0;
-
-                ssize_t consumed = nghttp2_hd_inflate_hd2(conn->response_inflater,
-                                                          &nv, &inflate_flags,
-                                                          hdr_pos, hdr_remaining,
-                                                          final);
-                if (consumed < 0) {
-                    DEBUG_H2("HPACK inflate error: %zd (%s)",
-                             consumed, nghttp2_strerror((int)consumed));
-
-                    conn->hpack_error_count++;
-                    conn->hpack_success_count = 0;
-
-                    /* Mark stream so we can display partial info */
-                    stream->hpack_decode_failed = true;
-
-                    /* Try fallback parser to extract partial info from raw data */
-                    hpack_fallback_parse(hdr_data, hdr_len, stream);
-
-                    /* End current header block properly */
-                    nghttp2_hd_inflate_end_headers(conn->response_inflater);
-
-                    /*
-                     * Mid-stream HPACK recovery strategy:
-                     * - First few errors: Just skip this header block, don't reset table
-                     *   (subsequent headers may decode fine if they don't need missing entries)
-                     * - Persistent errors (5+): Recreate inflater with fresh state
-                     *   This is the nuclear option for severely corrupted state
-                     *
-                     * This is better than the old approach which reset the table on every
-                     * error, corrupting state for subsequent decodes.
-                     */
-                    if (conn->hpack_error_count >= 5) {
-                        DEBUG_H2("Persistent HPACK errors, recreating inflater");
-                        nghttp2_hd_inflater *new_inflater = NULL;
-                        if (nghttp2_hd_inflate_new(&new_inflater) == 0) {
-                            nghttp2_hd_inflate_del(conn->response_inflater);
-                            conn->response_inflater = new_inflater;
-                            conn->hpack_error_count = 0;
-                            conn->mid_stream_joined = true;
-                        }
-                    }
-                    break;
-                }
-
-                hdr_pos += consumed;
-                hdr_remaining -= (size_t)consumed;
-
-                if (inflate_flags & NGHTTP2_HD_INFLATE_EMIT) {
-                    h2_process_response_header(stream, &nv);
-                    /* Successful decode - track for error recovery */
-                    conn->hpack_success_count++;
-                    if (conn->hpack_success_count >= 3) {
-                        /* Reset error count after consecutive successes */
-                        conn->hpack_error_count = 0;
-                    }
-                }
-
-                if (inflate_flags & NGHTTP2_HD_INFLATE_FINAL) {
-                    nghttp2_hd_inflate_end_headers(conn->response_inflater);
-                    break;
-                }
-
-                /* Prevent infinite loop if no progress */
-                if (consumed == 0 && !(inflate_flags & NGHTTP2_HD_INFLATE_EMIT)) {
-                    break;
-                }
-            }
-
-            /* Display response if END_HEADERS is set */
-            if (flags & 0x04) { /* END_HEADERS */
-                if (!stream->response_headers_done) {
-                    stream->response_headers_done = true;
-                    h2_display_response(stream);
-
-                    /* If END_STREAM also set, response is complete (no body) */
-                    if (flags & 0x01) { /* END_STREAM */
-                        stream->response_complete = true;
-                        printf("\n");
-                        fflush(stdout);
-                    }
-                }
-            }
-        }
-        break;
-
-    case 0x00: /* DATA */
-        {
-            h2_stream_t *stream = http2_get_stream(conn->pid, conn->ssl_ctx, stream_id, false);
-            if (stream && stream->body_buf) {
-                /* Skip padding if present */
-                const uint8_t *body_data = payload;
-                uint32_t body_len = payload_len;
-
-                if (flags & 0x08) { /* PADDED */
-                    if (body_len < 1) break;
-                    uint8_t pad_len = body_data[0];
-                    body_data++;
-                    body_len--;
-                    if (body_len < pad_len) break;
-                    body_len -= pad_len;
-                }
-
-                /* Accumulate body data */
-                size_t available = stream->body_buf_size - stream->body_len;
-                size_t to_copy = (body_len < available) ? body_len : available;
-
-                if (to_copy > 0) {
-                    memcpy(stream->body_buf + stream->body_len, body_data, to_copy);
-                    stream->body_len += to_copy;
-                }
-
-                /* Display body if END_STREAM */
-                if (flags & 0x01) { /* END_STREAM */
-                    stream->response_complete = true;
-                    h2_display_body(stream, DIR_RESPONSE);
-                }
-            }
-        }
-        break;
-
-    default:
-        /* Other frame types (SETTINGS, WINDOW_UPDATE, etc.) - ignore for response parsing */
-        break;
-    }
-}
-
 /* Check if a frame header looks valid (sanity check for mid-stream joins) */
 bool http2_is_valid_frame_header(const uint8_t *data, size_t len) {
     /* Need at least 9 bytes for frame header */
@@ -2269,232 +1171,6 @@ static size_t h2_find_frame_start(const uint8_t *buf, size_t len) {
     return len; /* No valid frame found, discard everything */
 }
 
-/* Process response frames with reassembly for fragmented data */
-static void h2_process_response_frame(h2_connection_t *conn, const uint8_t *data, int len,
-                                       const ssl_data_event_t *event) {
-    /* Sanity check: guard against corrupted buffer length (race condition defense) */
-    if (conn->response_buf_len > H2_REASSEMBLY_BUF_SIZE) {
-        DEBUG_H2("WARNING: response_buf_len=%zu exceeds buffer size, resetting",
-                 conn->response_buf_len);
-        conn->response_buf_len = 0;
-    }
-
-    /* Append incoming data to reassembly buffer */
-    size_t space_available = H2_REASSEMBLY_BUF_SIZE - conn->response_buf_len;
-    size_t to_copy = ((size_t)len < space_available) ? (size_t)len : space_available;
-
-    if (to_copy > 0) {
-        memcpy(conn->response_buf + conn->response_buf_len, data, to_copy);
-        conn->response_buf_len += to_copy;
-    }
-
-    if (to_copy < (size_t)len) {
-        DEBUG_H2("Response buffer overflow, dropped %zu bytes", (size_t)len - to_copy);
-    }
-
-    /* Process all complete frames in the buffer */
-    size_t pos = 0;
-    while (conn->response_buf_len - pos >= 9) {
-        const uint8_t *frame_start = conn->response_buf + pos;
-
-        /* Parse frame header to get length */
-        uint32_t frame_len = ((uint32_t)frame_start[0] << 16) |
-                             ((uint32_t)frame_start[1] << 8) |
-                             (uint32_t)frame_start[2];
-        size_t total_frame_size = 9 + frame_len;
-
-        /* Sanity check: validate frame header */
-        if (!http2_is_valid_frame_header(frame_start, conn->response_buf_len - pos)) {
-            DEBUG_H2("Invalid frame header detected (len=%u type=%d), attempting recovery",
-                     frame_len, frame_start[3]);
-
-            /* Try to find next valid frame in remaining buffer */
-            /* Safety: ensure we have at least 1 byte to skip past */
-            if (conn->response_buf_len <= pos + 1) {
-                DEBUG_H2("No bytes to scan for recovery, discarding buffer");
-                conn->response_buf_len = 0;
-                return;
-            }
-            size_t remaining = conn->response_buf_len - pos - 1;
-            size_t skip = h2_find_frame_start(conn->response_buf + pos + 1, remaining);
-            if (skip > 0 && skip < remaining) {
-                DEBUG_H2("Recovered: skipping %zu bytes to next valid frame", skip + 1);
-                pos += skip + 1;
-                continue;
-            } else {
-                /* No valid frame found, discard entire buffer */
-                DEBUG_H2("Recovery failed, discarding %zu bytes", conn->response_buf_len - pos);
-                conn->response_buf_len = 0;
-                return;
-            }
-        }
-
-        /* Check if we have complete frame */
-        if (conn->response_buf_len - pos < total_frame_size) {
-            DEBUG_H2("Incomplete frame: need %zu, have %zu (buffering)",
-                     total_frame_size, conn->response_buf_len - pos);
-            break;
-        }
-
-        /* Process the complete frame */
-        h2_process_complete_response_frame(conn, frame_start, total_frame_size, event);
-
-        /* Move to next frame */
-        pos += total_frame_size;
-    }
-
-    /* Move remaining data to beginning of buffer */
-    if (pos > 0) {
-        size_t remaining = conn->response_buf_len - pos;
-        if (remaining > 0) {
-            memmove(conn->response_buf, conn->response_buf + pos, remaining);
-        }
-        conn->response_buf_len = remaining;
-    }
-}
-
-void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *event) {
-    if (!g_h2_initialized) {
-        if (http2_init() != 0) {
-            DEBUG_H2("http2_init() failed");
-            return;
-        }
-    }
-
-    /* DEBUG: Always log frame processing for troubleshooting */
-    if (len >= 9) {
-        uint32_t flen = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | (uint32_t)data[2];
-        uint8_t ftype = data[3];
-        uint32_t sid = ((uint32_t)(data[5] & 0x7f) << 24) | ((uint32_t)data[6] << 16) |
-                       ((uint32_t)data[7] << 8) | (uint32_t)data[8];
-        if (g_config.debug_mode && ftype <= 9 && flen <= 65536) {
-            fprintf(stderr, "[H2-FRAME] %s: type=%s stream=%u len=%u (total=%d)\n",
-                    event->event_type == EVENT_SSL_WRITE ? "WRITE" : "READ",
-                    http2_frame_name(ftype), sid, flen, len);
-        }
-    }
-
-    DEBUG_H2("process_frame: PID=%u type=%s len=%d",
-             event->pid, event->event_type == EVENT_SSL_WRITE ? "WRITE" : "READ", len);
-
-    /* Get or create connection for this (PID, ssl_ctx) */
-    h2_connection_t *conn = get_h2_connection(event->pid, event->ssl_ctx, true);
-    if (!conn) {
-        DEBUG_H2("get_h2_connection failed for PID %u ssl_ctx=0x%llx",
-                 event->pid, (unsigned long long)event->ssl_ctx);
-        return;
-    }
-
-    /* Resolve actual process name (not thread name) */
-    if (!conn->comm[0]) {
-        h2_get_process_name(event->pid, conn->comm, sizeof(conn->comm));
-        /* Fall back to event comm if resolution failed */
-        if (!conn->comm[0] && event->comm[0]) {
-            safe_strcpy(conn->comm, sizeof(conn->comm), event->comm);
-        }
-    }
-
-    /* Debug: print potential frame header for WRITE events only
-     * (READ events may be partial frame payloads that get buffered,
-     * so printing raw data as frame header would be misleading) */
-#ifdef DEBUG
-    if (len >= 9 && event->event_type == EVENT_SSL_WRITE) {
-        uint32_t frame_len = ((uint32_t)data[0] << 16) | ((uint32_t)data[1] << 8) | (uint32_t)data[2];
-        uint8_t frame_type = data[3];
-        uint8_t flags = data[4];
-        uint32_t stream_id = ((uint32_t)(data[5] & 0x7f) << 24) | ((uint32_t)data[6] << 16) |
-                             ((uint32_t)data[7] << 8) | (uint32_t)data[8];
-        /* Only log if it looks like a valid frame header */
-        if (frame_type <= 9 && frame_len <= 65536) {
-            DEBUG_H2("Frame header: len=%u type=%s(%d) flags=0x%02x stream=%u",
-                     frame_len, http2_frame_name(frame_type), frame_type, flags, stream_id);
-        }
-    }
-#endif
-
-    if (event->event_type == EVENT_SSL_WRITE) {
-        /* Client writing = request data going to server */
-        /* Use nghttp2 server session for parsing requests */
-        if (conn->server_ctx) conn->server_ctx->event = event;
-
-        /*
-         * Filter out SETTINGS ACK frames before feeding to server session.
-         * The client sends SETTINGS ACK in response to the real server's SETTINGS,
-         * not our session's SETTINGS. Feeding it causes protocol errors.
-         * SETTINGS ACK is a 9-byte frame with type=4, flags=1, len=0.
-         *
-         * Also validate frames before feeding to prevent session corruption
-         * when joining mid-stream.
-         */
-        const uint8_t *feed_data = data;
-        int feed_len = len;
-
-        while (feed_len >= 9) {
-            uint32_t frame_len = ((uint32_t)feed_data[0] << 16) |
-                                 ((uint32_t)feed_data[1] << 8) |
-                                 (uint32_t)feed_data[2];
-            uint8_t frame_type = feed_data[3];
-            uint8_t flags = feed_data[4];
-
-            size_t total_frame_size = 9 + frame_len;
-
-            /* Sanity check: validate frame before feeding to nghttp2 */
-            if (!http2_is_valid_frame_header(feed_data, (size_t)feed_len)) {
-                DEBUG_H2("Invalid request frame header (len=%u type=%d), skipping %d bytes",
-                         frame_len, frame_type, feed_len);
-                /* Try to find next valid frame */
-                size_t skip = h2_find_frame_start(feed_data + 1, (size_t)(feed_len - 1));
-                if (skip > 0 && skip < (size_t)(feed_len - 1)) {
-                    DEBUG_H2("Recovered request: skipping %zu bytes", skip + 1);
-                    feed_data += skip + 1;
-                    feed_len -= (int)(skip + 1);
-                    continue;
-                }
-                /* No valid frame found, skip all data */
-                break;
-            }
-
-            /* Check if we have complete frame */
-            if ((int)total_frame_size > feed_len) {
-                break; /* Incomplete frame, discard partial (we don't buffer requests) */
-            }
-
-            /* Skip SETTINGS ACK (type=4, flags=1, len=0) */
-            if (frame_type == 0x04 && flags == 0x01 && frame_len == 0) {
-                DEBUG_H2("Skipping SETTINGS ACK for server session");
-                feed_data += total_frame_size;
-                feed_len -= (int)total_frame_size;
-                continue;
-            }
-
-            /* Feed this frame */
-            ssize_t rv = nghttp2_session_mem_recv(conn->server_session, feed_data, total_frame_size);
-            if (rv < 0) {
-                DEBUG_H2("nghttp2_session_mem_recv error: %zd (%s)",
-                         rv, nghttp2_strerror((int)rv));
-                /* On error, session might be corrupted - skip remaining data */
-                break;
-            }
-
-            /* Drain send buffer after each frame */
-            for (;;) {
-                const uint8_t *send_data;
-                ssize_t send_len = nghttp2_session_mem_send(conn->server_session, &send_data);
-                if (send_len <= 0) break;
-            }
-
-            feed_data += total_frame_size;
-            feed_len -= (int)total_frame_size;
-        }
-
-        if (conn->server_ctx) conn->server_ctx->event = NULL;
-    } else {
-        /* Client reading = response data from server */
-        /* Parse manually with HPACK inflater to avoid session state issues */
-        h2_process_response_frame(conn, data, len, event);
-    }
-}
-
 void http2_process_frame_flow(const uint8_t *data, int len,
                               const ssl_data_event_t *event,
                               flow_context_t *flow_ctx) {
@@ -2509,6 +1185,31 @@ void http2_process_frame_flow(const uint8_t *data, int len,
     if (flow_ctx && flow_ctx->parser.h2.hpack_corrupted) {
         DEBUG_H2("HPACK corrupted, skipping frame processing");
         return;
+    }
+
+    /*
+     * Lazy session initialization (Phase 3.6)
+     *
+     * If we have a flow_ctx with proto=HTTP2 but no session yet,
+     * initialize it now. This handles:
+     * - Preface detection setting proto before session init
+     * - Mid-connection attach where ALPN already set proto
+     * - ALPN event arriving before first data
+     */
+    if (flow_ctx && flow_ctx->proto == FLOW_PROTO_HTTP2 &&
+        flow_ctx->parser.h2.session == NULL) {
+        nghttp2_session_callbacks *cbs = http2_get_callbacks();
+        if (cbs) {
+            void *cb_ctx = http2_create_callback_ctx(flow_ctx);
+            if (cb_ctx) {
+                flow_ctx->parser.h2.callback_ctx = cb_ctx;
+                if (flow_h2_session_init(flow_ctx, cbs, cb_ctx) != 0) {
+                    DEBUG_H2("Failed to init H2 session for flow");
+                    http2_free_callback_ctx(cb_ctx);
+                    flow_ctx->parser.h2.callback_ctx = NULL;
+                }
+            }
+        }
     }
 
     /*
@@ -2591,34 +1292,181 @@ void http2_process_frame_flow(const uint8_t *data, int len,
         return;
     }
 
-    /*
-     * Legacy path: No flow context or not initialized
-     *
-     * Fall back to global pool processing for backward compatibility.
-     * This path is used for single-threaded mode or when flow_ctx
-     * is not available.
-     */
-    h2_connection_t *conn = get_h2_connection(event->pid, event->ssl_ctx, true);
-    if (!conn) {
-        DEBUG_H2("get_h2_connection failed for PID %u ssl_ctx=0x%llx",
-                 event->pid, (unsigned long long)event->ssl_ctx);
-        return;
-    }
-
-    /* Set flow_ctx in callback context for dual-write if available */
-    if (conn->server_ctx && flow_ctx) {
-        conn->server_ctx->flow_ctx = flow_ctx;
-        conn->server_ctx->event = event;
-    }
-
-    /* Delegate to global pool processing */
-    http2_process_frame(data, len, event);
-
-    /* Clear flow_ctx */
-    if (conn->server_ctx) {
-        conn->server_ctx->flow_ctx = NULL;
-    }
+    /* No valid flow context - cannot process */
+    DEBUG_H2("No flow_ctx or session for PID %u ssl_ctx=0x%llx, skipping",
+             event->pid, (unsigned long long)event->ssl_ctx);
 }
+
+#ifdef HAVE_THREADING
+/**
+ * @brief Unified HTTP/2 event processing entry point
+ *
+ * Single entry point for all HTTP/2 processing from main.c.
+ * Handles detection, session initialization, frame processing,
+ * and noise suppression. Keeps all HTTP/2 logic in http2.c.
+ *
+ * @param[in] data       Raw data buffer
+ * @param[in] len        Data length
+ * @param[in] event      Worker event with full context
+ * @param[in] worker     Worker context for output
+ *
+ * @return true if data was processed as HTTP/2, false to try other protocols
+ */
+bool http2_try_process_event(const uint8_t *data, size_t len,
+                             worker_event_t *event,
+                             worker_ctx_t *worker) {
+    if (!data || len == 0 || !event || !worker) {
+        return false;
+    }
+
+    worker_state_t *state = &worker->state;
+
+    /* Check for existing HTTP/2 session (per-worker) */
+    h2_connection_local_t *h2_conn = worker_get_h2_connection(state,
+                                        event->pid, event->ssl_ctx, false);
+    if (h2_conn && h2_conn->active) {
+        /* Process HTTP/2 frame with per-worker session */
+        ssl_data_event_t bpf_event = {
+            .timestamp_ns = event->timestamp_ns,
+            .delta_ns = event->delta_ns,
+            .ssl_ctx = event->ssl_ctx,
+            .pid = event->pid,
+            .tid = event->tid,
+            .uid = event->uid,
+            .event_type = event->event_type,
+            .buf_filled = event->data_len,
+        };
+        memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+        memcpy(bpf_event.data, event->data, event->data_len);
+
+        /* Use flow-aware processing when flow_ctx available */
+        http2_process_frame_flow(data, len, &bpf_event, event->flow_ctx);
+        return true;
+    }
+
+    /* Check for HTTP/2 connection preface */
+    if (http2_is_preface(data, len)) {
+        output_write(worker, "%s[HTTP/2 connection]%s PID %u (%s)\n",
+                    display_color(C_YELLOW), display_color(C_RESET),
+                    event->pid, event->comm);
+
+        /* Set proto for flow context (handles ALPN timing issues) */
+        if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_UNKNOWN) {
+            event->flow_ctx->proto = FLOW_PROTO_HTTP2;
+            /* Session initialization is handled lazily in http2_process_frame_flow() */
+        }
+
+        /* Create per-worker H2 connection */
+        h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
+        if (h2_conn) {
+            h2_conn->client_preface_seen = true;
+            safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
+        }
+
+        /* Process frames after preface */
+        if (len > 24) {
+            ssl_data_event_t bpf_event = {
+                .timestamp_ns = event->timestamp_ns,
+                .delta_ns = event->delta_ns,
+                .ssl_ctx = event->ssl_ctx,
+                .pid = event->pid,
+                .tid = event->tid,
+                .uid = event->uid,
+                .event_type = event->event_type,
+                .buf_filled = len - 24,
+            };
+            memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+            memcpy(bpf_event.data, data + 24, len - 24);
+            http2_process_frame_flow(data + 24, len - 24, &bpf_event, event->flow_ctx);
+        }
+        return true;
+    }
+
+    /* Check for HTTP/2 frames (mid-connection attach) */
+    if (len >= 9) {
+        uint32_t frame_len = ((uint32_t)data[0] << 16) |
+                             ((uint32_t)data[1] << 8) |
+                             (uint32_t)data[2];
+        uint8_t frame_type = data[3];
+        uint32_t stream_id = ((uint32_t)(data[5] & 0x7f) << 24) |
+                             ((uint32_t)data[6] << 16) |
+                             ((uint32_t)data[7] << 8) |
+                             (uint32_t)data[8];
+
+        if (frame_type <= 0x09 && frame_len <= 16384) {
+            bool is_valid_h2 = false;
+            if (frame_type == H2_FRAME_SETTINGS && stream_id == 0) is_valid_h2 = true;
+            else if (frame_type == H2_FRAME_HEADERS && (stream_id & 1) != 0) is_valid_h2 = true;
+            else if (frame_type == H2_FRAME_WINDOW_UPDATE && stream_id == 0) is_valid_h2 = true;
+            else if (frame_type == H2_FRAME_DATA && (stream_id & 1) != 0 && frame_len > 0) is_valid_h2 = true;
+
+            if (is_valid_h2 && (9 + frame_len) <= len) {
+                output_write(worker, "%s[HTTP/2 connection]%s PID %u (%s)\n",
+                            display_color(C_YELLOW), display_color(C_RESET),
+                            event->pid, event->comm);
+
+                /* Mid-connection attach: Set proto for pre-seeded connections */
+                if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_UNKNOWN) {
+                    event->flow_ctx->proto = FLOW_PROTO_HTTP2;
+                }
+
+                h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
+                if (h2_conn) {
+                    safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
+                }
+
+                ssl_data_event_t bpf_event = {
+                    .timestamp_ns = event->timestamp_ns,
+                    .delta_ns = event->delta_ns,
+                    .ssl_ctx = event->ssl_ctx,
+                    .pid = event->pid,
+                    .tid = event->tid,
+                    .uid = event->uid,
+                    .event_type = event->event_type,
+                    .buf_filled = len,
+                };
+                memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+                memcpy(bpf_event.data, data, len);
+                http2_process_frame_flow(data, len, &bpf_event, event->flow_ctx);
+                return true;
+            }
+        }
+    }
+
+    /* HTTP/2 noise suppression in non-debug mode */
+    if (!g_config.debug_mode) {
+        /* HTTP/2 control frames (types 0x02-0x08) in small packets */
+        if (len >= 9 && len <= 32) {
+            uint8_t frame_type = data[3];
+            if (frame_type >= 0x02 && frame_type <= 0x08) {
+                return true;  /* Suppress - treat as handled */
+            }
+        }
+
+        /* Small writes (<= 13 bytes) are likely HTTP/2 control frames */
+        if (len <= 13 && event->event_type == EVENT_SSL_WRITE) {
+            h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, false);
+            if (h2_conn) {
+                return true;  /* Known H2 connection - suppress noise */
+            }
+            /* Also suppress small writes that look like H2 frames */
+            if (len == 4 || len == 8 || len == 9 || len == 13) {
+                return true;  /* Common H2 control frame sizes */
+            }
+        }
+
+        /* Small reads on active H2 connections are partial frames */
+        if (len <= 9 && event->event_type == EVENT_SSL_READ) {
+            h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, false);
+            if (h2_conn && h2_conn->active) {
+                return true;
+            }
+        }
+    }
+
+    return false;  /* Not HTTP/2 - let caller try other protocols */
+}
+#endif /* HAVE_THREADING */
 
 #else /* !HAVE_NGHTTP2 */
 
@@ -2647,48 +1495,6 @@ bool http2_is_preface(const uint8_t *data, size_t len) {
     return len >= 24 && memcmp(data, preface, 24) == 0;
 }
 
-bool http2_has_session(uint32_t pid, uint64_t ssl_ctx) {
-    (void)pid;
-    (void)ssl_ctx;
-    return false;
-}
-
-void http2_set_alpn(uint32_t pid, uint64_t ssl_ctx, const char *alpn) {
-    (void)pid;
-    (void)ssl_ctx;
-    (void)alpn;
-}
-
-void http2_set_flow_info(uint32_t pid, uint64_t ssl_ctx,
-                         uint32_t src_ip, uint32_t dst_ip,
-                         uint16_t src_port, uint16_t dst_port,
-                         uint8_t ip_ver, uint8_t direction,
-                         uint8_t category, const char *ifname) {
-    (void)pid;
-    (void)ssl_ctx;
-    (void)src_ip;
-    (void)dst_ip;
-    (void)src_port;
-    (void)dst_port;
-    (void)ip_ver;
-    (void)direction;
-    (void)category;
-    (void)ifname;
-}
-
-const char *http2_get_alpn(uint32_t pid, uint64_t ssl_ctx) {
-    (void)pid;
-    (void)ssl_ctx;
-    return "";
-}
-
-void http2_process_frame(const uint8_t *data, int len, const ssl_data_event_t *event) {
-    (void)data;
-    (void)len;
-    (void)event;
-    /* No-op without nghttp2 - HTTP/2 detection will just show connection message */
-}
-
 void http2_process_frame_flow(const uint8_t *data, int len,
                               const ssl_data_event_t *event,
                               flow_context_t *flow_ctx) {
@@ -2699,22 +1505,40 @@ void http2_process_frame_flow(const uint8_t *data, int len,
     /* No-op without nghttp2 */
 }
 
-h2_stream_t *http2_get_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id, bool create) {
-    (void)pid;
-    (void)ssl_ctx;
-    (void)stream_id;
-    (void)create;
+struct nghttp2_session_callbacks *http2_get_callbacks(void) {
     return NULL;
 }
 
-void http2_free_stream(uint32_t pid, uint64_t ssl_ctx, int32_t stream_id) {
-    (void)pid;
-    (void)ssl_ctx;
-    (void)stream_id;
+void *http2_create_callback_ctx(flow_context_t *flow_ctx) {
+    (void)flow_ctx;
+    return NULL;
 }
 
-void http2_cleanup_pid(uint32_t pid) {
-    (void)pid;
+void http2_free_callback_ctx(void *callback_ctx) {
+    (void)callback_ctx;
 }
+
+void http2_set_callback_event(void *callback_ctx, const ssl_data_event_t *event) {
+    (void)callback_ctx;
+    (void)event;
+}
+
+bool http2_is_valid_frame_header(const uint8_t *data, size_t len) {
+    (void)data;
+    (void)len;
+    return false;
+}
+
+#ifdef HAVE_THREADING
+bool http2_try_process_event(const uint8_t *data, size_t len,
+                             struct worker_event *event,
+                             struct worker_ctx *worker) {
+    (void)data;
+    (void)len;
+    (void)event;
+    (void)worker;
+    return false;  /* No HTTP/2 support without nghttp2 */
+}
+#endif /* HAVE_THREADING */
 
 #endif /* HAVE_NGHTTP2 */
