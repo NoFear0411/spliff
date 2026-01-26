@@ -553,25 +553,22 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
             if (ctx && atomic_load_explicit(&ctx->active, memory_order_acquire)) {
                 /*
                  * Verify the cookie-matched flow belongs to this connection.
-                 * This handles the case where SSL events get an incorrect cookie
-                 * (kernel socket cookie lazy initialization issue) that happens
-                 * to match a different XDP-tracked flow.
                  *
-                 * For SSL events (ssl_ctx != 0), the flow must ALSO have the
-                 * same ssl_ctx. XDP-only flows have ssl_ctx=0 and should not
-                 * be returned for SSL event lookups.
+                 * XDP-SSL Correlation: XDP events create flows with ssl_ctx=0.
+                 * When SSL events arrive with the same cookie, they should
+                 * MERGE into the XDP-created flow (filling in ssl_ctx and pid).
+                 *
+                 * Validation rules:
+                 * - XDP-only flow (ssl_ctx=0): Valid for SSL events (will be merged)
+                 * - SSL flow with matching ssl_ctx: Valid
+                 * - SSL flow with different ssl_ctx: Invalid (different connection)
+                 * - PID mismatch (both non-zero): Invalid (different process)
                  */
                 bool cookie_flow_valid = true;
 
-                if (ssl_ctx != 0) {
-                    /* SSL event lookup - flow must have matching ssl_ctx */
-                    if (ctx->ssl_ctx == 0) {
-                        /* XDP-only flow - not valid for SSL event */
-                        cookie_flow_valid = false;
-                    } else if (ctx->ssl_ctx != ssl_ctx) {
-                        /* Different SSL context - wrong connection */
-                        cookie_flow_valid = false;
-                    }
+                if (ssl_ctx != 0 && ctx->ssl_ctx != 0 && ctx->ssl_ctx != ssl_ctx) {
+                    /* Both have ssl_ctx but they don't match - different connection */
+                    cookie_flow_valid = false;
                 }
 
                 if (pid != 0 && ctx->pid != 0 && ctx->pid != pid) {
@@ -580,6 +577,21 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
                 }
 
                 if (cookie_flow_valid) {
+                    /* Merge SSL data into XDP-only flow if needed */
+                    if (ctx->ssl_ctx == 0 && ssl_ctx != 0) {
+                        ctx->ssl_ctx = ssl_ctx;
+                        ctx->flags |= FLOW_FLAG_HAS_SSL;
+
+                        /* Add to shadow_index for future SSL lookups */
+                        if (pid != 0 && !(ctx->flags & FLOW_FLAG_IN_SHADOW)) {
+                            if (shadow_index_insert(&mgr->shadow_idx, pid, ssl_ctx, id) == 0) {
+                                ctx->flags |= FLOW_FLAG_IN_SHADOW;
+                            }
+                        }
+                    }
+                    if (ctx->pid == 0 && pid != 0) {
+                        ctx->pid = pid;
+                    }
                     if (path_out) {
                         *path_out = FLOW_PATH_COOKIE;
                     }

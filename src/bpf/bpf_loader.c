@@ -90,6 +90,13 @@ int bpf_loader_load(bpf_loader_t *loader, const char *filename) {
     return 0;
 }
 
+/* Set BPF object from skeleton (embedded BPF) */
+void bpf_loader_set_object(bpf_loader_t *loader, struct bpf_object *obj) {
+    if (loader) {
+        loader->obj = obj;
+    }
+}
+
 /* Validate library name - only allow safe characters */
 static bool is_safe_library_name(const char *name) {
     if (!name || !*name) return false;
@@ -1112,19 +1119,23 @@ int bpf_loader_xdp_attach(bpf_loader_t *loader, const char *ifname,
         return -1;
     }
 
-    /* Try preferred mode first, fall back to SKB */
+    /* Try preferred mode first, fall back to SKB
+     * Suppress libbpf kernel error messages during native probe - they're
+     * expected on many drivers and we handle fallback gracefully */
     xdp_mode_t actual_mode = mode;
     __u32 xdp_flags = mode_to_xdp_flags(mode);
+    bool fell_back = false;
+
+    /* Suppress libbpf output during native mode probe */
+    libbpf_print_fn_t old_print = libbpf_set_print(NULL);
     int err = bpf_xdp_attach(ifindex, prog_fd, xdp_flags, NULL);
+    libbpf_set_print(old_print);
 
     if (err && mode != XDP_MODE_SKB) {
-        /* Fall back to SKB mode */
-        if (debug) {
-            printf("  [XDP] %s mode failed on %s, falling back to SKB mode\n",
-                   bpf_loader_xdp_mode_name(mode), ifname);
-        }
+        /* Fall back to SKB mode (generic XDP - works on all interfaces) */
         actual_mode = XDP_MODE_SKB;
         xdp_flags = XDP_FLAGS_SKB_MODE;
+        fell_back = true;
         err = bpf_xdp_attach(ifindex, prog_fd, xdp_flags, NULL);
     }
 
@@ -1144,9 +1155,13 @@ int bpf_loader_xdp_attach(bpf_loader_t *loader, const char *ifname,
     iface->attached = true;
     xdp->interface_count++;
 
+    /* Debug: show per-interface attachment with fallback info */
     if (debug) {
-        printf("  [XDP] Attached to %s (idx=%u) in %s mode\n",
-               ifname, ifindex, bpf_loader_xdp_mode_name(actual_mode));
+        if (fell_back) {
+            printf("  [XDP] %s: skb mode (native unsupported)\n", ifname);
+        } else {
+            printf("  [XDP] %s: %s mode\n", ifname, bpf_loader_xdp_mode_name(actual_mode));
+        }
     }
 
     return (int)actual_mode;
@@ -1167,17 +1182,34 @@ int bpf_loader_xdp_attach_all(bpf_loader_t *loader, bool debug) {
     }
 
     int attached = 0;
+    int native_count = 0;
+    int skb_count = 0;
+
+    /* Track results for summary output */
+    struct { char name[IFNAMSIZ]; xdp_mode_t mode; } results[MAX_XDP_INTERFACES];
+
     for (int i = 0; i < count; i++) {
         /* Try native mode first (best performance), auto-fallback to SKB */
-        if (bpf_loader_xdp_attach(loader, ifaces[i].name,
-                                   XDP_MODE_NATIVE, debug, NULL) >= 0) {
+        int mode = bpf_loader_xdp_attach(loader, ifaces[i].name,
+                                          XDP_MODE_NATIVE, debug, NULL);
+        if (mode >= 0) {
+            strncpy(results[attached].name, ifaces[i].name, IFNAMSIZ - 1);
+            results[attached].name[IFNAMSIZ - 1] = '\0';
+            results[attached].mode = (xdp_mode_t)mode;
+
+            if (mode == XDP_MODE_NATIVE) {
+                native_count++;
+            } else {
+                skb_count++;
+            }
             attached++;
         }
     }
 
-    if (debug) {
-        printf("  [XDP] Attached to %d of %d discovered interfaces\n",
-               attached, count);
+    /* Debug mode: show summary with counts */
+    if (debug && attached > 0) {
+        printf("  [XDP] Attached to %d interface%s (%d native, %d skb)\n",
+               attached, attached > 1 ? "s" : "", native_count, skb_count);
     }
 
     return attached;

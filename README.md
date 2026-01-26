@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.9.5-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.6-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -631,7 +631,7 @@ spliff/
 | v0.6.x | Multi-threaded event processing | ✅ Complete |
 | v0.7.x | BPF-level IPC filtering + Unified display | ✅ Complete |
 | v0.8.x | XDP packet-level flow tracking + sock_ops | ✅ Complete |
-| v0.9.x | Dynamic process monitoring + Shared Pool + Modular Protocol Architecture | ✅ **Current (v0.9.5)** |
+| v0.9.x | Dynamic process monitoring + Shared Pool + Modular Protocol Architecture + Embedded BPF | ✅ **Current (v0.9.6)** |
 | v0.10.0 | BPF/XDP improvements + IPv6 correlation + Ring buffer expansion | 🔄 Next |
 | v0.11.0 | HTTP/3 + QUIC protocol support (ngtcp2/nghttp3) | Planned |
 | v1.0.0 | WebSocket support + Enhanced display | Planned |

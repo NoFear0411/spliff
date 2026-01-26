@@ -39,12 +39,16 @@
 #include "protocol/detector.h"
 #include "util/safe_str.h"
 
+/* BPF skeleton (generated at build time - embeds CO-RE BPF bytecode) */
+#include "spliff.skel.h"
+
 #ifdef HAVE_THREADING
 #include "threading/threading.h"
 #endif
 
 /* Global state */
 static volatile sig_atomic_t g_exiting = 0;
+static struct spliff_bpf *g_skel = NULL;  /* BPF skeleton (owns the BPF object) */
 static bpf_loader_t g_loader;
 static probe_handler_t g_handler;
 static bool g_modules_initialized = false;
@@ -547,10 +551,17 @@ static void cleanup_all_resources(void) {
         g_xdp_initialized = false;
     }
 
-    /* Cleanup BPF loader (detach probes, close object) */
+    /* Cleanup BPF loader (detach probes, but NOT the object - skeleton owns it) */
     if (g_bpf_initialized) {
+        g_loader.obj = NULL;  /* Prevent bpf_loader_cleanup from closing it */
         bpf_loader_cleanup(&g_loader);
         g_bpf_initialized = false;
+    }
+
+    /* Destroy BPF skeleton (this properly frees the embedded BPF object) */
+    if (g_skel) {
+        spliff_bpf__destroy(g_skel);
+        g_skel = NULL;
     }
 
     /* NOTE: Global pending_body cleanup removed - now handled per-worker */
@@ -1030,30 +1041,30 @@ int main(int argc, char **argv) {
     }
     g_bpf_initialized = true;
 
-    /* Load BPF program - try multiple paths */
-    static const char *bpf_paths[] = {
-        "build-release/spliff.bpf.o",   /* Makefile release build */
-        "build-debug/spliff.bpf.o",     /* Makefile debug build */
-        "build/spliff.bpf.o",           /* CMake build directory */
-        "spliff.bpf.o",                 /* Current directory */
-        "src/bpf/spliff.bpf.o",         /* Source directory (legacy) */
-        "/usr/lib/spliff/spliff.bpf.o", /* Installed path */
-        NULL
-    };
-    int bpf_loaded = 0;
-    for (const char **path = bpf_paths; *path; path++) {
-        if (bpf_loader_load(&g_loader, *path) == 0) {
-            if (debug_mode) {
-                printf("  [DEBUG] Loaded BPF program from %s\n", *path);
-            }
-            bpf_loaded = 1;
-            break;
-        }
-    }
-    if (!bpf_loaded) {
-        fprintf(stderr, "%sError:%s Cannot load BPF program\n",
+    /* Load BPF program from embedded skeleton (CO-RE enabled, strip-safe)
+     * The skeleton embeds BPF bytecode + BTF directly in the binary,
+     * eliminating external .bpf.o file dependencies and tampering risks. */
+    g_skel = spliff_bpf__open();
+    if (!g_skel) {
+        fprintf(stderr, "%sError:%s Failed to open embedded BPF program\n",
                 display_color(C_RED), display_color(C_RESET));
         return 1;
+    }
+
+    err = spliff_bpf__load(g_skel);
+    if (err) {
+        fprintf(stderr, "%sError:%s Failed to load BPF program: %s\n",
+                display_color(C_RED), display_color(C_RESET), strerror(-err));
+        spliff_bpf__destroy(g_skel);
+        g_skel = NULL;
+        return 1;
+    }
+
+    /* Connect skeleton's bpf_object to our loader for uprobe/XDP attachment */
+    bpf_loader_set_object(&g_loader, g_skel->obj);
+
+    if (debug_mode) {
+        printf("  [DEBUG] Loaded embedded BPF program (CO-RE skeleton)\n");
     }
 
     /* Initialize XDP subsystem (auto-attach to network interfaces) */
@@ -1079,9 +1090,16 @@ int main(int argc, char **argv) {
          * Attach regardless of callback status - provides packet visibility */
         int attached = bpf_loader_xdp_attach_all(&g_loader, debug_mode);
         if (attached > 0) {
-            printf("  %s✓%s XDP attached to %d interface%s\n",
-                   display_color(C_GREEN), display_color(C_RESET),
-                   attached, attached > 1 ? "s" : "");
+            /* Build compact interface list: "eth0 [native], wlan0 [skb], ..." */
+            xdp_interface_t ifaces[MAX_XDP_INTERFACES];
+            int iface_count = bpf_loader_xdp_get_attached_interfaces(&g_loader, ifaces, MAX_XDP_INTERFACES);
+
+            printf("  %s✓%s XDP: ", display_color(C_GREEN), display_color(C_RESET));
+            for (int i = 0; i < iface_count; i++) {
+                const char *mode_str = (ifaces[i].mode == XDP_MODE_NATIVE) ? "native" : "skb";
+                printf("%s [%s]%s", ifaces[i].name, mode_str,
+                       (i < iface_count - 1) ? ", " : "\n");
+            }
 
             /* Attach sock_ops for socket cookie caching (the "Golden Thread")
              * sock_ops runs at TCP connection establishment and caches cookies

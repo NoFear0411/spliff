@@ -172,8 +172,7 @@ int proto_detector_init(void) {
         return -1;
     }
 
-    fprintf(stderr, "[DETECTOR] Initialized with %s (O(n) NFA engine)\n",
-            proto_detector_engine_name());
+    /* Success - no output in release mode (engine name available via proto_detector_engine_name()) */
     return 0;
 }
 

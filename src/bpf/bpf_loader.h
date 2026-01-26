@@ -105,6 +105,11 @@ typedef struct {
 /* Load BPF object from file - returns 0 on success, negative on failure */
 [[nodiscard]] int bpf_loader_load(bpf_loader_t *loader, const char *filename);
 
+/* Set BPF object from skeleton (for embedded BPF via libbpf skeleton)
+ * The loader takes ownership of the object - do NOT destroy it separately.
+ * Use this with bpftool-generated skeletons for CO-RE and strip-safe builds. */
+void bpf_loader_set_object(bpf_loader_t *loader, struct bpf_object *obj);
+
 /* Find a library path by name (static paths) - returns 0 on success, -1 if not found */
 int bpf_loader_find_library(const char *name, char *path, size_t size);
 
