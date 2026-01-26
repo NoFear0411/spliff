@@ -2,6 +2,130 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.5] - 2026-01-26
+
+### Added
+- **Vectorscan Protocol Detection**: High-performance pattern matching for HTTP protocol identification
+  - `src/protocol/detector.c`: Vectorscan-based protocol detector with O(n) NFA matching
+  - Integrated zlib-ng (native mode) for SIMD-accelerated compression
+  - Fallback to PCRE2-JIT when vectorscan unavailable
+
+- **Modular Protocol Architecture**: Enterprise-grade separation of concerns
+  - `http1_try_process_event()`: Unified HTTP/1 entry point in http1.c
+  - `http2_try_process_event()`: Unified HTTP/2 entry point in http2.c
+  - main.c reduced to clean orchestration code (~190 lines moved to protocol modules)
+  - Each protocol handler returns `true` if processed, enabling clean fallback chain
+
+- **HTTP/1.1 Parser Direction Switching**: Automatic request↔response detection
+  - llhttp parser reinitializes with correct type when direction changes
+  - Fixes `HPE_INVALID_METHOD` errors when parsing responses after requests
+  - Persistent parser state maintained per-flow
+
+- **HTTP/1.1 Body Display**: Proper body output on message completion
+  - `h1_display_body_flow()`: Displays body when message_complete callback fires
+  - Consistent with HTTP/2 body display architecture
+  - Respects `-b` flag for body display control
+
+- **HTTP/1.1 Request URL Preservation**: Response display shows original request URL
+  - `last_request_host`, `last_request_path`, `last_request_method` fields in `h1_parser_ctx_t`
+  - Saved before parser reset on new message
+
+- **HTTP/2 Response Body Display**: Fixed body accumulation and display
+  - DATA frame handler now allocates body buffer on first use
+  - `flow_txn_append_body()` called when `g_config.show_body` is set
+  - Body displayed when END_STREAM flag received
+
+- **HTTP/2 Lazy Session Initialization**: Sessions created on-demand in protocol module
+  - `http2_process_frame_flow()` initializes session when proto=HTTP2 but session=NULL
+  - Eliminates need for session init code in main.c
+  - Handles timing races between ALPN events and first data packets
+
+### Changed
+- **Worker Cache Locality**: Atomic re-homing for nghttp2 thread safety
+  - `home_worker_id` atomic CAS for flow ownership transfer
+  - Dispatcher routes to flow's home worker when available
+  - Prevents concurrent access to nghttp2 sessions (NOT thread-safe per docs)
+
+- **Dispatcher Routing**: Home-worker-aware event routing
+  - Flow lookup performed BEFORE worker ID calculation
+  - Existing flows route to their home worker for cache locality
+  - New/unclaimed flows use hash-based routing
+
+- **Build System**: Updated dependencies
+  - zlib-ng 2.3.2 in native mode (zng_ prefix)
+  - vectorscan for O(n) pattern matching
+  - jemalloc 5.3.0 memory allocator
+
+- **Code Organization**: Protocol logic moved to dedicated modules
+  - HTTP/1 detection, parsing, display → `src/protocol/http1.c`
+  - HTTP/2 preface, frames, sessions, noise suppression → `src/protocol/http2.c`
+  - main.c now handles: orchestration, special events (ALPN, handshake), fallback display
+
+### Fixed
+- **HTTP/2 Session Initialization**: Late init for misrouted events
+  - Parser initialization now works when events arrive before flow is claimed
+  - `[Worker N] Late H2 init for flow_id=X` debug output
+
+- **HTTP/2 Body Accumulation**: DATA frames now properly accumulate body
+  - Bug: `if (txn && txn->body_buf)` required body_buf to already exist
+  - Fix: `if (txn)` + conditional `flow_txn_append_body()` call
+
+### Removed
+- **Legacy Flow Cache**: Deleted `src/correlation/flow_cache.c` and `flow_cache.h` (751 lines)
+- **Per-Worker State**: Removed `src/threading/state.c` (296 lines) - state now in flow_context
+- **HTTP/2 Global Pools**: Removed legacy `g_h2_streams[]`, `g_h2_connections[]`
+- **HTTP/2 Duplicate Code**: Consolidated 2074 lines → 800 lines in http2.c
+
+### Architecture
+```
+main.c (orchestration only, ~50 lines of protocol routing)
+    │
+    ├── http1_try_process_event() ──► http1.c (all HTTP/1 logic)
+    │       └── Detection, parser init, direction switching, body display
+    │
+    ├── http2_try_process_event() ──► http2.c (all HTTP/2 logic)
+    │       └── Preface, mid-connection, session mgmt, noise suppression
+    │
+    └── Fallback: vectorscan detection, signature detection, raw display
+```
+- Both llhttp (HTTP/1.1) and nghttp2 (HTTP/2) are NOT thread-safe per-instance
+- Flow `home_worker_id` ensures single-writer access per parser
+- Dual-index correlation (cookie + shadow) provides fallback correlation
+
+### Statistics
+- **23 files changed**, 2,748 insertions(+), 3,923 deletions(-)
+- **Net reduction**: ~1,175 lines of code
+- **main.c**: 642 lines removed (protocol logic moved to modules)
+- **http2.c**: Consolidated from 2074 lines to ~800 lines
+
+## [0.9.4] - 2026-01-25
+
+### Removed
+- **Phase 5 Complete**: Legacy code removal (~3,400 lines deleted)
+  - Deleted `src/correlation/flow_cache.c` and `flow_cache.h` (751 lines)
+  - Removed HTTP/2 global pools: `g_h2_streams[]`, `g_h2_connections[]`
+  - Removed per-worker caches: `alpn_cache[]`, `pending_bodies[]`, `h1_request_cache[]`
+  - Removed legacy HTTP/1 fallback parser in main.c (~287 lines)
+  - Removed dual-path XDP/SSL correlation code from dispatcher
+  - Removed deprecated functions: `http2_set_flow_info()`, `http2_has_session()`, `http2_get_stream()`, `http2_free_stream()`
+  - Removed worker cache functions: `worker_get_alpn()`, `worker_set_alpn()`, `worker_find_pending_body()`, etc.
+
+### Changed
+- **Single Source of Truth**: Shared Pool (`flow_context_t`) is now the exclusive correlation mechanism
+  - All HTTP/1 parsing uses `http1_parse_flow()` with flow context
+  - All HTTP/2 parsing uses `http2_process_frame_flow()` with flow context
+  - ALPN stored in `flow_ctx->alpn` only (no worker cache fallback)
+  - Body accumulation uses `flow_ctx->body` only
+
+- **Simplified Worker Event Structure**
+  - Removed `flow_info` field (was legacy XDP cache pointer)
+  - `needs_cookie_retry` now based on `FLOW_FLAG_HAS_XDP` status
+
+### Architecture
+- Completed migration from per-worker + global pools to unified Shared Pool
+- Flow lifecycle fully managed by `flow_manager_t` with dual-index lookup
+- Worker threads operate exclusively on `flow_context_t` instances
+
 ## [0.9.3] - 2026-01-24
 
 ### Added

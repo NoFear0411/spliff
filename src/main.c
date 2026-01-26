@@ -36,6 +36,7 @@
 #include "content/signatures.h"
 #include "protocol/http1.h"
 #include "protocol/http2.h"
+#include "protocol/detector.h"
 #include "util/safe_str.h"
 
 #ifdef HAVE_THREADING
@@ -556,6 +557,7 @@ static void cleanup_all_resources(void) {
 
     /* Cleanup modules in reverse order of initialization */
     if (g_modules_initialized) {
+        proto_detector_cleanup();
         http2_cleanup();
         http1_cleanup();
         decompressor_cleanup();
@@ -619,7 +621,6 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
             }
         }
         worker_cleanup_h2_streams_for_connection(state, event->pid, 0);
-        worker_cleanup_pending_bodies_pid(state, event->pid);
         return;
     }
 
@@ -653,10 +654,7 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
             char alpn_proto[256] = {0};
             memcpy(alpn_proto, event->data, event->data_len);
 
-            /* Store in per-worker cache (legacy) */
-            worker_set_alpn(state, event->pid, event->ssl_ctx, alpn_proto);
-
-            /* Also store in Shared Pool flow_context and initialize parser */
+            /* Store in Shared Pool flow_context and initialize parser */
             if (event->flow_ctx) {
                 flow_init_parser(event->flow_ctx, alpn_proto);
                 event->flow_ctx->flags |= FLOW_FLAG_HAS_SSL;
@@ -670,592 +668,64 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
     const uint8_t *data = event->data;
     size_t len = event->data_len;
 
-    /* Try HTTP/1.1 parsing first */
-    if (http1_is_request(data, len) || http1_is_response(data, len)) {
-        /*
-         * Flow-based HTTP/1 parsing (Phase 3.6)
-         *
-         * When flow_ctx is available with HTTP/1 protocol, use the persistent
-         * flow-based parser. This handles:
-         * - Headers split across TCP segments
-         * - HTTP/1.1 keep-alive with on_reset callback
-         * - Chunked transfer encoding (automatic via llhttp)
-         *
-         * The parser displays output via callbacks (on_headers_complete_flow).
-         */
-        if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_HTTP1) {
-            /* Build ssl_data_event_t for flow-based parser */
-            ssl_data_event_t bpf_event = {
-                .timestamp_ns = event->timestamp_ns,
-                .delta_ns = event->delta_ns,
-                .ssl_ctx = event->ssl_ctx,
-                .pid = event->pid,
-                .tid = event->tid,
-                .uid = event->uid,
-                .event_type = event->event_type,
-                .buf_filled = (int32_t)event->data_len,
-            };
-            memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+    /*
+     * === Golden Thread Protocol Detection (v0.9.5) ===
+     *
+     * Use vectorscan O(n) pattern matching when protocol is unknown.
+     * This handles cases where ALPN event didn't arrive or arrived late.
+     *
+     * Detection flow:
+     * 1. flow_ctx exists but proto == UNKNOWN → run vectorscan detection
+     * 2. Set proto based on detection result
+     * 3. Initialize parser if needed (deferred to ensure single-writer)
+     */
+    if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_UNKNOWN) {
+        proto_detect_result_t detected = proto_detect(data, len);
 
-            /* Parse using persistent flow-based parser */
-            int result = http1_parse_flow(event->flow_ctx, data, len, &bpf_event);
-            if (result >= 0) {
-                return;  /* Successfully parsed - display handled in callbacks */
+        if (detected == PROTO_DETECT_HTTP1_REQ || detected == PROTO_DETECT_HTTP1_RSP) {
+            event->flow_ctx->proto = FLOW_PROTO_HTTP1;
+            /* Initialize H1 parser if not already done */
+            if (!event->flow_ctx->parser.h1.initialized) {
+                llhttp_settings_t *settings = http1_get_flow_settings();
+                flow_h1_parser_init(event->flow_ctx, settings);
             }
-            /* Fall through to legacy parsing on error */
+        } else if (detected == PROTO_DETECT_HTTP2) {
+            event->flow_ctx->proto = FLOW_PROTO_HTTP2;
+            /* H2 session init deferred to home worker for thread safety */
         }
+        /* TLS/WebSocket/Unknown left as FLOW_PROTO_UNKNOWN */
+    }
 
-        /*
-         * LEGACY HTTP/1 PARSING - DEPRECATED
-         *
-         * This fallback path uses worker caches (h1_request_entry_t,
-         * pending_body_entry_t) instead of flow_context_t. It's only
-         * reached when:
-         * 1. flow_ctx is not available (pool exhaustion)
-         * 2. flow_ctx->proto != FLOW_PROTO_HTTP1 (protocol not detected)
-         * 3. http1_parse_flow() returns an error
-         *
-         * TODO: Once flow-based parsing is fully validated, this entire
-         * block (through the matching closing brace) can be removed along
-         * with the worker_*_h1_request and worker_*_pending_body functions.
-         */
-        pending_body_entry_t *old_pending = worker_find_pending_body(state,
-                                                event->pid, event->ssl_ctx);
-        if (old_pending) {
-            worker_clear_pending_body(state, old_pending);
-        }
+    /*
+     * === Modular Protocol Processing (v0.9.5) ===
+     *
+     * Protocol handlers are now encapsulated in their respective modules.
+     * Each handler returns true if data was processed, false to try next.
+     * This keeps main.c as clean orchestration code only.
+     */
 
-        http_message_t msg = {0};
-        size_t body_len = 0;
-
-        /* Use per-worker body buffer */
-        uint8_t *body_buf = g_config.show_body ? state->body_buf : NULL;
-        size_t body_buf_size = g_config.show_body ? state->body_buf_size : 0;
-
-        int result = http1_parse(data, len, &msg, body_buf, body_buf_size, &body_len);
-
-        if (result < 0) {
-            goto show_raw;
-        }
-
-        /* Set metadata */
-        msg.pid = event->pid;
-        msg.timestamp_ns = event->timestamp_ns;
-        msg.delta_ns = event->delta_ns;
-
-        char proc_name[TASK_COMM_LEN] = {0};
-        get_process_name(event->pid, proc_name, sizeof(proc_name));
-        safe_strcpy(msg.comm, sizeof(msg.comm),
-                   proc_name[0] ? proc_name : event->comm);
-
-        /* Get ALPN - prefer Shared Pool, fall back to per-worker cache */
-        const char *alpn = NULL;
-        if (event->flow_ctx && event->flow_ctx->alpn[0]) {
-            alpn = event->flow_ctx->alpn;
-        } else {
-            alpn = worker_get_alpn(state, event->pid, event->ssl_ctx);
-        }
-        if (alpn && alpn[0]) {
-            safe_strcpy(msg.alpn_proto, sizeof(msg.alpn_proto), alpn);
-        }
-
-        /* Populate XDP flow correlation info ("Golden Thread" double-view) */
-        if (event->flow_info) {
-            msg.has_flow_info = true;
-            msg.flow_src_ip = event->flow_info->flow.saddr;
-            msg.flow_dst_ip = event->flow_info->flow.daddr;
-            msg.flow_src_port = event->flow_info->flow.sport;
-            msg.flow_dst_port = event->flow_info->flow.dport;
-            msg.flow_ip_version = event->flow_info->flow.ip_version;
-            msg.flow_direction = event->flow_info->direction;
-            msg.flow_category = event->flow_info->category;
-            memcpy(msg.flow_ifname, event->flow_info->ifname, sizeof(msg.flow_ifname));
-        }
-
-        /* Format output through output thread - unified with display_http_* functions */
-        char ts[32];
-        display_get_timestamp(ts, sizeof(ts));
-
-        /* Determine ALPN protocol string */
-        const char *alpn_str = alpn ? alpn : "http/1.1";
-
-        if (msg.direction == DIR_REQUEST) {
-            /* Extract Host header for URL display and store for response correlation */
-            const char *host = NULL;
-            for (int i = 0; i < msg.header_count; i++) {
-                if (strcasecmp(msg.headers[i].name, "Host") == 0) {
-                    host = msg.headers[i].value;
-                    break;
-                }
-            }
-            /* Store request for response correlation */
-            worker_set_h1_request(state, event->pid, event->ssl_ctx,
-                                  msg.method, msg.path, host);
-
-            /* Build full URI with safe truncation for display
-             * Buffer: 2560, "https://" = 8, null = 1, available = 2551
-             * Host max: 500 (domains are short), Path max: 2048 */
-            char full_uri[2560];
-            if (host && host[0]) {
-                snprintf(full_uri, sizeof(full_uri), "https://%.500s%.2048s", host, msg.path);
-            } else {
-                snprintf(full_uri, sizeof(full_uri), "%.2048s", msg.path);
-            }
-
-            /* Format: <timestamp> -> <METHOD> <full URI> ALPN:<protocol> <process> (<PID>) [latency] */
-            output_write(worker, "%s%s%s %s\xe2\x86\x92%s %s%s%s %s %sALPN:%s%s %s%s%s %s(%u)%s",
-                        display_color(C_DIM), ts, display_color(C_RESET),
-                        display_color(C_GREEN), display_color(C_RESET),
-                        display_color(C_BOLD), msg.method, display_color(C_RESET),
-                        full_uri,
-                        display_color(C_DIM), alpn_str, display_color(C_RESET),
-                        display_color(C_CYAN), msg.comm, display_color(C_RESET),
-                        display_color(C_DIM), msg.pid, display_color(C_RESET));
-            if (msg.delta_ns > 0) {
-                char lat[32];
-                display_format_latency(msg.delta_ns, lat, sizeof(lat));
-                output_write(worker, " %s[%s]%s",
-                            display_color(C_YELLOW), lat, display_color(C_RESET));
-            }
-            output_write(worker, "\n");
-
-            /**
-             * @brief Show XDP flow correlation info ("Golden Thread" double-view)
-             *
-             * Normalizes display based on HTTP direction:
-             * - Request: local_client:port → remote_server:port
-             * - Response: remote_server:port → local_client:port
-             */
-            if (msg.has_flow_info) {
-                char ip1[INET6_ADDRSTRLEN], ip2[INET6_ADDRSTRLEN];
-                inet_ntop(AF_INET, &msg.flow_src_ip, ip1, sizeof(ip1));
-                inet_ntop(AF_INET, &msg.flow_dst_ip, ip2, sizeof(ip2));
-                uint16_t port1 = ntohs(msg.flow_src_port);
-                uint16_t port2 = ntohs(msg.flow_dst_port);
-
-                /* Normalize based on flow_direction and HTTP direction */
-                const char *left_ip, *right_ip;
-                uint16_t left_port, right_port;
-                if (msg.flow_direction == 1) {
-                    /* Packet was client→server: saddr=client, daddr=server */
-                    left_ip = ip1; left_port = port1;
-                    right_ip = ip2; right_port = port2;
-                } else {
-                    /* Packet was server→client: saddr=server, daddr=client */
-                    /* For request, swap to show client → server */
-                    left_ip = ip2; left_port = port2;
-                    right_ip = ip1; right_port = port1;
-                }
-
-                const char *cat_name = (msg.flow_category == XDP_CAT_TLS_TCP) ? "TLS" :
-                                       (msg.flow_category == XDP_CAT_QUIC) ? "QUIC" :
-                                       (msg.flow_category == XDP_CAT_PLAIN_HTTP) ? "HTTP" :
-                                       (msg.flow_category == XDP_CAT_H2_PREFACE) ? "H2" :
-                                       (msg.flow_category == XDP_CAT_OTHER) ? "Other" : "?";
-                output_write(worker, "              %s|-%s %s%s:%u → %s:%u%s %s[%s]%s",
-                            display_color(C_DIM), display_color(C_RESET),
-                            display_color(C_DIM), left_ip, left_port,
-                            right_ip, right_port, display_color(C_RESET),
-                            display_color(C_CYAN), cat_name, display_color(C_RESET));
-                if (msg.flow_ifname[0]) {
-                    output_write(worker, " %s(%s)%s", display_color(C_DIM),
-                                msg.flow_ifname, display_color(C_RESET));
-                }
-                output_write(worker, "\n");
-            }
-        } else {
-            /* Look up cached request for URL correlation */
-            h1_request_entry_t *cached_req = worker_find_h1_request(state, event->pid, event->ssl_ctx);
-
-            /* Format: <timestamp> <- <STATUS> <URL> ALPN:<protocol> <content-type> (<size>) <process> (<PID>) [latency] */
-            const char *status_color = (msg.status_code >= 200 && msg.status_code < 300) ?
-                                       C_GREEN : (msg.status_code >= 400) ? C_RED : C_YELLOW;
-            output_write(worker, "%s%s%s %s\xe2\x86\x90%s %s%d%s",
-                        display_color(C_DIM), ts, display_color(C_RESET),
-                        display_color(C_BLUE), display_color(C_RESET),
-                        display_color(status_color), msg.status_code, display_color(C_RESET));
-            /* Show URL from cached request for correlation */
-            if (cached_req && cached_req->host[0]) {
-                output_write(worker, " https://%s%s", cached_req->host, cached_req->path);
-            }
-            /* Show ALPN after URL */
-            output_write(worker, " %sALPN:%s%s",
-                        display_color(C_DIM), alpn_str, display_color(C_RESET));
-            if (msg.content_type[0]) {
-                output_write(worker, " %s%s%s",
-                            display_color(C_DIM), msg.content_type, display_color(C_RESET));
-            }
-            if (msg.content_length > 0) {
-                output_write(worker, " %s(%zu bytes)%s",
-                            display_color(C_DIM), msg.content_length, display_color(C_RESET));
-            }
-            output_write(worker, " %s%s%s %s(%u)%s",
-                        display_color(C_CYAN), msg.comm, display_color(C_RESET),
-                        display_color(C_DIM), msg.pid, display_color(C_RESET));
-            if (msg.delta_ns > 0) {
-                char lat[32];
-                display_format_latency(msg.delta_ns, lat, sizeof(lat));
-                output_write(worker, " %s[%s]%s",
-                            display_color(C_YELLOW), lat, display_color(C_RESET));
-            }
-            output_write(worker, "\n");
-
-            /**
-             * @brief Show XDP flow correlation info ("Golden Thread" double-view)
-             *
-             * Normalizes display based on HTTP direction:
-             * - Response: remote_server:port → local_client:port
-             */
-            if (msg.has_flow_info) {
-                char ip1[INET6_ADDRSTRLEN], ip2[INET6_ADDRSTRLEN];
-                inet_ntop(AF_INET, &msg.flow_src_ip, ip1, sizeof(ip1));
-                inet_ntop(AF_INET, &msg.flow_dst_ip, ip2, sizeof(ip2));
-                uint16_t port1 = ntohs(msg.flow_src_port);
-                uint16_t port2 = ntohs(msg.flow_dst_port);
-
-                /* Normalize: response shows server → client */
-                const char *left_ip, *right_ip;
-                uint16_t left_port, right_port;
-                if (msg.flow_direction == 2) {
-                    /* Packet was server→client: saddr=server, daddr=client */
-                    left_ip = ip1; left_port = port1;
-                    right_ip = ip2; right_port = port2;
-                } else {
-                    /* Packet was client→server: saddr=client, daddr=server */
-                    /* For response, swap to show server → client */
-                    left_ip = ip2; left_port = port2;
-                    right_ip = ip1; right_port = port1;
-                }
-
-                const char *cat_name = (msg.flow_category == XDP_CAT_TLS_TCP) ? "TLS" :
-                                       (msg.flow_category == XDP_CAT_QUIC) ? "QUIC" :
-                                       (msg.flow_category == XDP_CAT_PLAIN_HTTP) ? "HTTP" :
-                                       (msg.flow_category == XDP_CAT_H2_PREFACE) ? "H2" :
-                                       (msg.flow_category == XDP_CAT_OTHER) ? "Other" : "?";
-                output_write(worker, "              %s|-%s %s%s:%u → %s:%u%s %s[%s]%s",
-                            display_color(C_DIM), display_color(C_RESET),
-                            display_color(C_DIM), left_ip, left_port,
-                            right_ip, right_port, display_color(C_RESET),
-                            display_color(C_CYAN), cat_name, display_color(C_RESET));
-                if (msg.flow_ifname[0]) {
-                    output_write(worker, " %s(%s)%s", display_color(C_DIM),
-                                msg.flow_ifname, display_color(C_RESET));
-                }
-                output_write(worker, "\n");
-            }
-        }
-
-        /* Show headers unless compact mode */
-        if (!g_config.compact_mode && msg.header_count > 0) {
-            for (int i = 0; i < msg.header_count; i++) {
-                output_write(worker, "  %s%s:%s %s\n",
-                            display_color(C_DIM),
-                            msg.headers[i].name, display_color(C_RESET),
-                            msg.headers[i].value);
-            }
-        }
-
-        /* Show body if present */
-        if (g_config.show_body && body_len > 0) {
-            const uint8_t *body_data = body_buf;
-            size_t display_len = body_len;
-
-            /* Use per-worker decompression buffer */
-            if (msg.content_encoding[0]) {
-                int decomp_len = decompress_body(body_data, body_len,
-                                                msg.content_encoding,
-                                                state->decomp_buf,
-                                                state->decomp_buf_size);
-                if (decomp_len > 0) {
-                    body_data = state->decomp_buf;
-                    display_len = decomp_len;
-                }
-            }
-
-            output_write(worker, "%s─── Body (%zu bytes) ───%s\n",
-                        display_color(C_DIM), display_len, display_color(C_RESET));
-
-            /* Output body (truncate if too long for output buffer) */
-            output_msg_t *body_msg = output_alloc(worker);
-            if (body_msg) {
-                size_t copy_len = (display_len < OUTPUT_MSG_MAX_SIZE - 1) ?
-                                  display_len : OUTPUT_MSG_MAX_SIZE - 1;
-                memcpy(body_msg->data, body_data, copy_len);
-                body_msg->len = copy_len;
-                output_enqueue(worker, body_msg);
-            }
-            output_write(worker, "\n%s────────────%s\n",
-                        display_color(C_DIM), display_color(C_RESET));
-        } else if (g_config.show_body && msg.direction == DIR_RESPONSE &&
-                   (msg.content_length > 0 || msg.is_chunked)) {
-            /* Body will arrive in next event - track with per-worker state */
-            worker_create_pending_body(state, event->pid, event->ssl_ctx,
-                                       msg.content_length > 0 ? msg.content_length : 0,
-                                       msg.content_type, msg.content_encoding);
-        }
-
-        output_write(worker, "\n");
+    /* Try HTTP/1.1 protocol handler */
+    if (http1_try_process_event(data, len, event, worker)) {
         return;
     }
 
-    /* Check for existing HTTP/2 session (per-worker) */
-    h2_connection_local_t *h2_conn = worker_get_h2_connection(state,
-                                        event->pid, event->ssl_ctx, false);
-    if (h2_conn && h2_conn->active) {
-        /* Process HTTP/2 frame with per-worker session */
-        /* NOTE: XDP flow info is in event->flow_ctx->flow (Phase 3.6) */
-
-        ssl_data_event_t bpf_event = {
-            .timestamp_ns = event->timestamp_ns,
-            .delta_ns = event->delta_ns,
-            .ssl_ctx = event->ssl_ctx,
-            .pid = event->pid,
-            .tid = event->tid,
-            .uid = event->uid,
-            .event_type = event->event_type,
-            .buf_filled = event->data_len,
-        };
-        memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
-        memcpy(bpf_event.data, event->data, event->data_len);
-
-        /* Use flow-aware processing when flow_ctx available (Phase 3.6) */
-        http2_process_frame_flow(data, len, &bpf_event, event->flow_ctx);
+    /* Try HTTP/2 protocol handler */
+    if (http2_try_process_event(data, len, event, worker)) {
         return;
     }
 
-    /* Check for HTTP/2 connection preface */
-    if (http2_is_preface(data, len)) {
-        output_write(worker, "%s[HTTP/2 connection]%s PID %u (%s)\n",
-                    display_color(C_YELLOW), display_color(C_RESET),
-                    event->pid, event->comm);
-
-        /* Create per-worker H2 connection */
-        h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
-        if (h2_conn) {
-            h2_conn->client_preface_seen = true;
-            safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
-        }
-
-        /* Set XDP flow correlation info if available ("Golden Thread" double-view) */
-        if (event->flow_info) {
-            http2_set_flow_info(event->pid, event->ssl_ctx,
-                               event->flow_info->flow.saddr,
-                               event->flow_info->flow.daddr,
-                               event->flow_info->flow.sport,
-                               event->flow_info->flow.dport,
-                               event->flow_info->flow.ip_version,
-                               event->flow_info->direction,
-                               event->flow_info->category,
-                               event->flow_info->ifname);
-        }
-
-        /* Process frames after preface */
-        if (len > 24) {
-            ssl_data_event_t bpf_event = {
-                .timestamp_ns = event->timestamp_ns,
-                .delta_ns = event->delta_ns,
-                .ssl_ctx = event->ssl_ctx,
-                .pid = event->pid,
-                .tid = event->tid,
-                .uid = event->uid,
-                .event_type = event->event_type,
-                .buf_filled = len - 24,
-            };
-            memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
-            memcpy(bpf_event.data, data + 24, len - 24);
-            /* Use flow-aware processing when flow_ctx available (Phase 3.6) */
-            http2_process_frame_flow(data + 24, len - 24, &bpf_event, event->flow_ctx);
-        }
-        return;
-    }
-
-    /* Check for HTTP/2 frames (mid-connection attach) */
-    if (len >= 9) {
-        uint32_t frame_len = ((uint32_t)data[0] << 16) |
-                             ((uint32_t)data[1] << 8) |
-                             (uint32_t)data[2];
-        uint8_t frame_type = data[3];
-        uint32_t stream_id = ((uint32_t)(data[5] & 0x7f) << 24) |
-                             ((uint32_t)data[6] << 16) |
-                             ((uint32_t)data[7] << 8) |
-                             (uint32_t)data[8];
-
-        if (frame_type <= 0x09 && frame_len <= 16384) {
-            bool is_valid_h2 = false;
-            if (frame_type == H2_FRAME_SETTINGS && stream_id == 0) is_valid_h2 = true;
-            else if (frame_type == H2_FRAME_HEADERS && (stream_id & 1) != 0) is_valid_h2 = true;
-            else if (frame_type == H2_FRAME_WINDOW_UPDATE && stream_id == 0) is_valid_h2 = true;
-            else if (frame_type == H2_FRAME_DATA && (stream_id & 1) != 0 && frame_len > 0) is_valid_h2 = true;
-
-            if (is_valid_h2 && (9 + frame_len) <= len) {
-                output_write(worker, "%s[HTTP/2 connection]%s PID %u (%s)\n",
-                            display_color(C_YELLOW), display_color(C_RESET),
-                            event->pid, event->comm);
-
-                h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
-                if (h2_conn) {
-                    safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
-                }
-
-                /* Set XDP flow correlation info if available */
-                if (event->flow_info) {
-                    http2_set_flow_info(event->pid, event->ssl_ctx,
-                                       event->flow_info->flow.saddr,
-                                       event->flow_info->flow.daddr,
-                                       event->flow_info->flow.sport,
-                                       event->flow_info->flow.dport,
-                                       event->flow_info->flow.ip_version,
-                                       event->flow_info->direction,
-                                       event->flow_info->category,
-                                       event->flow_info->ifname);
-                }
-
-                ssl_data_event_t bpf_event = {
-                    .timestamp_ns = event->timestamp_ns,
-                    .delta_ns = event->delta_ns,
-                    .ssl_ctx = event->ssl_ctx,
-                    .pid = event->pid,
-                    .tid = event->tid,
-                    .uid = event->uid,
-                    .event_type = event->event_type,
-                    .buf_filled = len,
-                };
-                memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
-                memcpy(bpf_event.data, data, len);
-                /* Use flow-aware processing when flow_ctx available (Phase 3.6) */
-                http2_process_frame_flow(data, len, &bpf_event, event->flow_ctx);
-                return;
-            }
-        }
-    }
-
-    /* Check for pending body data (per-worker) */
-    if (g_config.show_body) {
-        pending_body_entry_t *pending = worker_find_pending_body(state,
-                                            event->pid, event->ssl_ctx);
-        if (pending && pending->active) {
-            pending->received_len += len;
-
-            if (pending->needs_decompression && pending->accum_buf) {
-                if (pending->accum_len + len <= pending->accum_capacity) {
-                    memcpy(pending->accum_buf + pending->accum_len, data, len);
-                    pending->accum_len += len;
-                }
-                if (pending->expected_len > 0 &&
-                    pending->received_len >= pending->expected_len) {
-                    /* Decompress and output */
-                    int decomp_len = decompress_body(pending->accum_buf,
-                                                    pending->accum_len,
-                                                    pending->content_encoding,
-                                                    state->decomp_buf,
-                                                    state->decomp_buf_size);
-                    if (decomp_len > 0) {
-                        if (!pending->header_printed) {
-                            output_write(worker, "%s─── Body ───%s\n",
-                                        display_color(C_DIM), display_color(C_RESET));
-                        }
-                        output_msg_t *body_msg = output_alloc(worker);
-                        if (body_msg) {
-                            size_t copy_len = (decomp_len < OUTPUT_MSG_MAX_SIZE - 1) ?
-                                              decomp_len : OUTPUT_MSG_MAX_SIZE - 1;
-                            memcpy(body_msg->data, state->decomp_buf, copy_len);
-                            body_msg->len = copy_len;
-                            output_enqueue(worker, body_msg);
-                        }
-                        output_write(worker, "\n%s────────────%s\n\n",
-                                    display_color(C_DIM), display_color(C_RESET));
-                    }
-                    worker_clear_pending_body(state, pending);
-                }
-                return;
-            }
-
-            /* Non-compressed: stream directly */
-            if (!pending->header_printed) {
-                output_write(worker, "%s─── Body ───%s\n",
-                            display_color(C_DIM), display_color(C_RESET));
-                pending->header_printed = true;
-            }
-
-            bool is_text = (strstr(pending->content_type, "text/") != NULL ||
-                           strstr(pending->content_type, "json") != NULL ||
-                           strstr(pending->content_type, "xml") != NULL);
-
-            if (is_text) {
-                output_msg_t *body_msg = output_alloc(worker);
-                if (body_msg) {
-                    size_t copy_len = (len < OUTPUT_MSG_MAX_SIZE - 1) ?
-                                      len : OUTPUT_MSG_MAX_SIZE - 1;
-                    memcpy(body_msg->data, data, copy_len);
-                    body_msg->len = copy_len;
-                    output_enqueue(worker, body_msg);
-                }
-            } else {
-                output_write(worker, "[binary chunk: %zu bytes]\n", len);
-            }
-
-            if (pending->expected_len > 0 &&
-                pending->received_len >= pending->expected_len) {
-                output_write(worker, "%s────────────%s\n\n",
-                            display_color(C_DIM), display_color(C_RESET));
-                worker_clear_pending_body(state, pending);
-            }
-            return;
-        }
-    }
-
-show_raw:
-    /* Unknown/binary data */
-    ;
-
+    /* === Fallback: Unknown/binary data display === */
     const char *sig = signature_detect(data, len);
     if (signature_is_local_file(sig)) {
         return;
     }
 
-    /* Suppress HTTP/2 control frames and noise in non-debug mode */
-    if (!g_config.debug_mode) {
-        /* HTTP/2 control frames (types 0x02-0x08) in small packets */
-        if (len >= 9 && len <= 32) {
-            uint8_t frame_type = data[3];
-            if (frame_type >= 0x02 && frame_type <= 0x08) {
-                return;
-            }
-        }
-
-        /* Small writes (<= 13 bytes) are likely HTTP/2 control frames:
-         * - 9 bytes: frame header only (e.g., SETTINGS ACK)
-         * - 13 bytes: frame header + 4 byte payload (e.g., WINDOW_UPDATE)
-         * - 8 bytes: partial frame or GOAWAY body
-         * - 4 bytes: partial WINDOW_UPDATE payload
-         * Suppress these when event looks like it could be HTTP/2 traffic */
-        if (len <= 13 && event->event_type == EVENT_SSL_WRITE) {
-            /* Check if this process has any H2 activity */
-            h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, false);
-            if (h2_conn) {
-                return;  /* Known H2 connection - suppress noise */
-            }
-            /* Also suppress small writes that look like H2 frames */
-            if (len == 4 || len == 8 || len == 9 || len == 13) {
-                return;  /* Common H2 control frame sizes */
-            }
-        }
-
-        /* Small reads on active H2 connections are partial frames */
-        if (len <= 9 && event->event_type == EVENT_SSL_READ) {
-            h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, false);
-            if (h2_conn && h2_conn->active) {
-                return;
-            }
-        }
-
-        /* Block-sized reads without signatures are likely file I/O (when IPC filter on) */
-        if (g_config.filter_ipc && !sig) {
-            /* Common block sizes: 4096, 8192, 16384, 32768 */
-            if (len == 4096 || len == 8192 || len == 16384 || len == 32768 ||
-                len == 32 || len == 64 || len == 128 || len == 256) {
-                return;
-            }
+    /* Block-sized reads without signatures are likely file I/O */
+    if (!g_config.debug_mode && g_config.filter_ipc && !sig) {
+        /* Common block sizes: 4096, 8192, 16384, 32768 */
+        if (len == 4096 || len == 8192 || len == 16384 || len == 32768 ||
+            len == 32 || len == 64 || len == 128 || len == 256) {
+            return;
         }
     }
 
@@ -1458,6 +928,13 @@ int main(int argc, char **argv) {
     decompressor_init();
     http1_init();
     http2_init();
+
+    /* Initialize protocol detector (vectorscan O(n) matching) */
+    if (proto_detector_init() != 0) {
+        fprintf(stderr, "Warning: Failed to initialize protocol detector\n");
+        /* Continue anyway - will fall back to manual detection */
+    }
+
     g_modules_initialized = true;
 
     printf("\n%s╔════════════════════════════════════════╗%s\n",
@@ -1988,19 +1465,6 @@ int main(int argc, char **argv) {
                g_threading.num_workers,
                num_threads == 0 ? " (auto)" : "");
 
-        /* Warm-up userspace flow_cache with existing flows from BPF.
-         * This fixes correlation for pre-existing connections that don't
-         * trigger XDP FLOW_NEW events (already classified in BPF).
-         * Uses real socket cookies from BPF flow_states map. */
-        int flow_states_fd = bpf_loader_get_flow_states_fd(&g_loader);
-        if (flow_states_fd >= 0) {
-            int warmed_cache = flow_cache_warmup_from_bpf(
-                &g_threading.dispatcher.flow_cache, flow_states_fd, debug_mode);
-            if (debug_mode && warmed_cache > 0) {
-                printf("  %s[DEBUG]%s Warmed up flow_cache with %d BPF flows\n",
-                       display_color(C_DIM), display_color(C_RESET), warmed_cache);
-            }
-        }
     } else {
         fprintf(stderr, "%sError:%s Failed to initialize threading\n",
                 display_color(C_RED), display_color(C_RESET));

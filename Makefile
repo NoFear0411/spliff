@@ -9,7 +9,7 @@
 #   make tests    Build and run tests
 #   make clean    Remove all build artifacts and configuration
 
-.PHONY: all release debug tests test clean distclean install \
+.PHONY: all release debug relsan sanitize tests test clean distclean install \
         coverage coverage-html coverage-clean \
         package-deb package-rpm docs clean-docs help
 
@@ -59,6 +59,18 @@ relsan:
 	@cmake --build $(BUILD_DIR_DEBUG) --parallel $(JOBS)
 	@ln -sf $(BUILD_DIR_DEBUG)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_DEBUG)/spliff spliff
 	@echo "==> RelWithSan build complete: ./spliff"
+
+# Sanitize build (optimized for maximum ASan/UBSan accuracy with -O1)
+sanitize:
+	@echo "==> Configuring sanitize build (ASan/UBSan optimized)..."
+	@cmake -B $(BUILD_DIR_DEBUG) \
+		-DCMAKE_BUILD_TYPE=Sanitize \
+		-DENABLE_SANITIZERS=ON
+	@echo "==> Building sanitize..."
+	@cmake --build $(BUILD_DIR_DEBUG) --parallel $(JOBS)
+	@ln -sf $(BUILD_DIR_DEBUG)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_DEBUG)/spliff spliff
+	@echo "==> Sanitize build complete: ./spliff"
+	@echo "    Run with: ASAN_OPTIONS=check_initialization_order=1 ./spliff"
 
 # ============================================================================
 # Test Targets
@@ -193,6 +205,7 @@ help:
 	@echo "  make / make release   Build optimized, stripped binary (default)"
 	@echo "  make debug            Build with debug symbols and sanitizers"
 	@echo "  make relsan           Build optimized with sanitizers"
+	@echo "  make sanitize         Build for ASan/UBSan accuracy (-O1, frame pointers)"
 	@echo "  make tests            Build and run all tests"
 	@echo "  make clean            Remove all build artifacts and configuration"
 	@echo "  make install          Install to /usr/local/bin (requires sudo)"
@@ -215,15 +228,20 @@ help:
 	@echo "  build-debug/          Debug builds (make debug, make tests)"
 	@echo ""
 	@echo "Required dependencies:"
-	@echo "  Fedora:   libbpf-devel elfutils-libelf-devel zlib-devel"
+	@echo "  Fedora:   libbpf-devel elfutils-libelf-devel zlib-ng-devel"
 	@echo "            libzstd-devel brotli-devel llhttp-devel"
 	@echo "            libnghttp2-devel ck-devel libxdp-devel"
-	@echo "            userspace-rcu-devel jemalloc-devel pcre2-devel"
+	@echo "            userspace-rcu-devel jemalloc-devel vectorscan-devel"
 	@echo "            clang llvm"
 	@echo ""
-	@echo "  Debian:   libbpf-dev libelf-dev zlib1g-dev libzstd-dev"
+	@echo "  Debian:   libbpf-dev libelf-dev zlib1g-ng-dev libzstd-dev"
 	@echo "            libbrotli-dev libllhttp-dev libnghttp2-dev"
 	@echo "            libck-dev libxdp-dev liburcu-dev libjemalloc-dev"
-	@echo "            libpcre2-dev clang llvm"
+	@echo "            libhyperscan-dev clang llvm"
+	@echo ""
+	@echo "Optional performance libraries (v0.9.5+):"
+	@echo "  zlib-ng:     SIMD-accelerated compression (auto-detected)"
+	@echo "  vectorscan:  O(n) protocol detection (auto-detected)"
+	@echo "  mimalloc:    Low-latency allocator (cmake -DUSE_MIMALLOC=ON)"
 	@echo ""
 	@echo "Architectures supported: x86_64, aarch64"

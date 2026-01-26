@@ -40,6 +40,10 @@
 #include "../util/safe_str.h"
 #include "../correlation/flow_context.h"
 #include "../output/display.h"
+#include "../content/decompressor.h"
+#ifdef HAVE_THREADING
+#include "../threading/threading.h"
+#endif
 #include <llhttp.h>
 #include <string.h>
 #include <strings.h>
@@ -650,15 +654,27 @@ typedef struct {
     const struct ssl_data_event *event; /**< Current SSL event */
 } h1_flow_cb_ctx_t;
 
-/* Forward declaration */
+/* Forward declarations */
 static void h1_display_message_flow(struct flow_context *flow_ctx,
                                      const struct ssl_data_event *event);
+static void h1_display_body_flow(struct flow_context *flow_ctx);
 
 /*--- Flow-based llhttp callbacks using persistent state ---*/
 
 static int on_message_begin_flow(llhttp_t *parser) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+
+    /*
+     * Save request URL info before resetting for response display.
+     * HTTP/1 is request-response, so if the previous message was a request,
+     * save its URL for correlation with the upcoming response.
+     */
+    if (h1->txn.direction == DIR_REQUEST && h1->txn.host[0]) {
+        safe_strcpy(h1->last_request_host, sizeof(h1->last_request_host), h1->txn.host);
+        safe_strcpy(h1->last_request_path, sizeof(h1->last_request_path), h1->txn.path);
+        safe_strcpy(h1->last_request_method, sizeof(h1->last_request_method), h1->txn.method);
+    }
 
     /* Reset persistent parsing state for new message */
     h1->header_name_len = 0;
@@ -758,6 +774,15 @@ static int on_header_value_flow(llhttp_t *parser, const char *at, size_t len) {
         size_t to_copy = len < 31 ? len : 31;
         memcpy(len_str, at, to_copy);
         txn->content_length = strtoull(len_str, NULL, 10);
+    } else if (strcasecmp(h1->current_header_name, "Content-Encoding") == 0) {
+        size_t cur = strlen(txn->encoding);
+        size_t space = sizeof(txn->encoding) - cur - 1;
+        size_t to_copy = len < space ? len : space;
+        if (to_copy > 0) {
+            memcpy(txn->encoding + cur, at, to_copy);
+            txn->encoding[cur + to_copy] = '\0';
+            txn->flags |= TXN_FLAG_COMPRESSED;
+        }
     }
 
     return 0;
@@ -806,8 +831,10 @@ static int on_body_flow(llhttp_t *parser, const char *at, size_t len) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     flow_transaction_t *txn = &cb->flow_ctx->parser.h1.txn;
 
-    /* Append body data using flow helper (handles buffer allocation) */
-    flow_txn_append_body(txn, (const uint8_t *)at, len);
+    /* Only accumulate body if body display is enabled (-b flag) */
+    if (g_config.show_body) {
+        flow_txn_append_body(txn, (const uint8_t *)at, len);
+    }
 
     return 0;
 }
@@ -818,6 +845,15 @@ static int on_message_complete_flow(llhttp_t *parser) {
 
     h1->message_complete = true;
     h1->txn.state = TXN_STATE_CLOSED;
+
+    /*
+     * Display body now that message is complete.
+     * Headers were displayed in on_headers_complete for immediate feedback.
+     * This mirrors h2_display_body_flow() pattern for consistent architecture.
+     */
+    if (g_config.show_body) {
+        h1_display_body_flow(cb->flow_ctx);
+    }
 
     /*
      * Check keep-alive status per llhttp docs:
@@ -896,6 +932,7 @@ llhttp_settings_t *http1_get_flow_settings(void) {
 static void h1_display_message_flow(struct flow_context *flow_ctx,
                                      const struct ssl_data_event *event) {
     flow_transaction_t *txn = &flow_ctx->parser.h1.txn;
+    h1_parser_ctx_t *h1 = &flow_ctx->parser.h1;
     http_message_t msg = {0};
 
     msg.protocol = PROTO_HTTP1;
@@ -905,12 +942,20 @@ static void h1_display_message_flow(struct flow_context *flow_ctx,
     msg.delta_ns = event ? event->delta_ns : 0;
 
     safe_strcpy(msg.method, sizeof(msg.method), txn->method);
-    safe_strcpy(msg.path, sizeof(msg.path), txn->path);
-    safe_strcpy(msg.authority, sizeof(msg.authority), txn->host);
-    msg.status_code = txn->status_code;
     safe_strcpy(msg.content_type, sizeof(msg.content_type), txn->content_type);
     msg.content_length = txn->content_length;
     safe_strcpy(msg.comm, sizeof(msg.comm), flow_ctx->comm);
+
+    if (txn->direction == DIR_REQUEST) {
+        /* Request: use current transaction's URL info */
+        safe_strcpy(msg.path, sizeof(msg.path), txn->path);
+        safe_strcpy(msg.authority, sizeof(msg.authority), txn->host);
+    } else {
+        /* Response: use saved request URL info for correlation */
+        safe_strcpy(msg.path, sizeof(msg.path), h1->last_request_path);
+        safe_strcpy(msg.authority, sizeof(msg.authority), h1->last_request_host);
+    }
+    msg.status_code = txn->status_code;
 
     /* Add ALPN protocol if negotiated */
     if (flow_ctx->alpn[0]) {
@@ -925,6 +970,7 @@ static void h1_display_message_flow(struct flow_context *flow_ctx,
         msg.flow_src_port = flow_ctx->flow.sport;
         msg.flow_dst_port = flow_ctx->flow.dport;
         msg.flow_ip_version = flow_ctx->flow.ip_version;
+        msg.flow_category = flow_ctx->xdp_category;
     }
 
     if (txn->direction == DIR_REQUEST) {
@@ -934,6 +980,55 @@ static void h1_display_message_flow(struct flow_context *flow_ctx,
     }
     printf("\n");
     fflush(stdout);
+}
+
+/**
+ * @brief Display HTTP/1 body content from flow transaction
+ *
+ * Called from on_message_complete when body is fully accumulated.
+ * Mirrors h2_display_body_flow() for consistent architecture.
+ *
+ * @param flow_ctx  Flow context containing transaction
+ */
+static void h1_display_body_flow(struct flow_context *flow_ctx) {
+    flow_transaction_t *txn = &flow_ctx->parser.h1.txn;
+
+    if (!txn->body_buf || txn->body_len == 0) {
+        return;
+    }
+
+    const uint8_t *display_data = txn->body_buf;
+    size_t display_len = txn->body_len;
+
+    /* Decompress if Content-Encoding present */
+    uint8_t *decomp_buf = NULL;
+    if (txn->encoding[0] != '\0') {
+        /* Smart buffer allocation based on compressed size:
+         * - Estimate 10x compression ratio (typical for text content)
+         * - Minimum 8KB for small payloads
+         * - Maximum 10MB to prevent memory bombs
+         */
+        size_t est_size = txn->body_len * 10;
+        if (est_size < 8 * 1024) est_size = 8 * 1024;
+        if (est_size > 10 * 1024 * 1024) est_size = 10 * 1024 * 1024;
+
+        decomp_buf = malloc(est_size);
+        if (decomp_buf) {
+            int decomp_len = decompress_body(txn->body_buf, (int)txn->body_len,
+                                             txn->encoding, decomp_buf, (int)est_size);
+            if (decomp_len > 0) {
+                display_data = decomp_buf;
+                display_len = (size_t)decomp_len;
+            }
+        }
+    }
+
+    display_body(display_data, display_len, txn->content_type);
+    fflush(stdout);
+
+    if (decomp_buf) {
+        free(decomp_buf);
+    }
 }
 
 int http1_parse_flow(struct flow_context *flow_ctx, const uint8_t *data, size_t len,
@@ -949,6 +1044,38 @@ int http1_parse_flow(struct flow_context *flow_ctx, const uint8_t *data, size_t 
         llhttp_settings_t *settings = http1_get_flow_settings();
         if (flow_h1_parser_init(flow_ctx, settings) != 0) {
             return -1;
+        }
+    }
+
+    /*
+     * Direction detection for bidirectional sniffing.
+     *
+     * llhttp's HTTP_BOTH mode auto-detects the FIRST message type, then
+     * expects all subsequent messages to be the same type. For traffic
+     * sniffing where we see both requests (SSL_write) and responses
+     * (SSL_read), we need to reset the parser when direction changes.
+     */
+    bool is_response = http1_is_response(data, len);
+    bool is_request = http1_is_request(data, len);
+    llhttp_type_t current_type = h1->parser.type;
+
+    if (is_response && (current_type == HTTP_REQUEST || current_type == HTTP_BOTH)) {
+        /* Parser expects request but got response - reinit for response */
+        llhttp_init(&h1->parser, HTTP_RESPONSE, &h1->settings);
+        h1->headers_complete = false;
+        h1->message_complete = false;
+        if (g_config.debug_mode) {
+            fprintf(stderr, "[DEBUG] H1 parser reinit: %s -> RESPONSE\n",
+                    current_type == HTTP_REQUEST ? "REQUEST" : "BOTH");
+        }
+    } else if (is_request && (current_type == HTTP_RESPONSE || current_type == HTTP_BOTH)) {
+        /* Parser expects response but got request - reinit for request */
+        llhttp_init(&h1->parser, HTTP_REQUEST, &h1->settings);
+        h1->headers_complete = false;
+        h1->message_complete = false;
+        if (g_config.debug_mode) {
+            fprintf(stderr, "[DEBUG] H1 parser reinit: %s -> REQUEST\n",
+                    current_type == HTTP_RESPONSE ? "RESPONSE" : "BOTH");
         }
     }
 
@@ -981,6 +1108,13 @@ int http1_parse_flow(struct flow_context *flow_ctx, const uint8_t *data, size_t 
     const char *error_pos = llhttp_get_error_pos(&h1->parser);
     size_t parsed = error_pos ? (size_t)(error_pos - (const char *)data) : 0;
 
+    /* Debug: show parse error details */
+    if (g_config.debug_mode) {
+        fprintf(stderr, "[DEBUG] H1 parse error: %s (%s), headers_complete=%d, parsed=%zu/%zu\n",
+                llhttp_errno_name(err), llhttp_get_error_reason(&h1->parser),
+                h1->headers_complete, parsed, len);
+    }
+
     if (!h1->headers_complete) {
         /* Headers incomplete - real error */
         return -1;
@@ -993,3 +1127,89 @@ int http1_parse_flow(struct flow_context *flow_ctx, const uint8_t *data, size_t 
      */
     return (int)(parsed > 0 ? parsed : len);
 }
+
+#ifdef HAVE_THREADING
+/**
+ * @brief Unified HTTP/1 event processing entry point
+ *
+ * Single entry point for all HTTP/1 processing from main.c.
+ * Handles detection, parser initialization, and parsing.
+ * Keeps all HTTP/1 logic in http1.c.
+ *
+ * @param[in] data       Raw data buffer
+ * @param[in] len        Data length
+ * @param[in] event      Worker event with full context
+ * @param[in] worker     Worker context for output
+ *
+ * @return true if data was processed as HTTP/1, false to try other protocols
+ */
+bool http1_try_process_event(const uint8_t *data, size_t len,
+                             worker_event_t *event,
+                             worker_ctx_t *worker) {
+    if (!data || len == 0 || !event || !worker) {
+        return false;
+    }
+
+    (void)worker;  /* Output handled via callbacks for now */
+
+    /* Check if this is a known HTTP/1 flow or looks like HTTP/1 */
+    bool is_known_http1_flow = event->flow_ctx &&
+                               event->flow_ctx->proto == FLOW_PROTO_HTTP1;
+    bool looks_like_http1 = http1_is_request(data, len) || http1_is_response(data, len);
+
+    /* Debug: trace HTTP/1.1 parsing path */
+    if (g_config.debug_mode) {
+        fprintf(stderr, "[DEBUG] H1 check: flow_ctx=%p, proto=%d (H1=%d), looks_h1=%d, is_known_h1=%d, len=%zu\n",
+                (void*)event->flow_ctx,
+                event->flow_ctx ? (int)event->flow_ctx->proto : -1,
+                (int)FLOW_PROTO_HTTP1,
+                looks_like_http1, is_known_http1_flow, len);
+        if (len >= 16) {
+            fprintf(stderr, "[DEBUG] H1 data prefix: %.16s\n", data);
+        }
+    }
+
+    if (!looks_like_http1 && !is_known_http1_flow) {
+        return false;  /* Not HTTP/1 */
+    }
+
+    /* Set proto if manual detection succeeds but vectorscan missed it */
+    if (looks_like_http1 && event->flow_ctx &&
+        event->flow_ctx->proto == FLOW_PROTO_UNKNOWN) {
+        event->flow_ctx->proto = FLOW_PROTO_HTTP1;
+        /* Initialize parser for late-detected HTTP/1 */
+        if (!event->flow_ctx->parser.h1.initialized) {
+            llhttp_settings_t *settings = http1_get_flow_settings();
+            flow_h1_parser_init(event->flow_ctx, settings);
+        }
+    }
+
+    if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_HTTP1) {
+        /* Build ssl_data_event_t for flow-based parser */
+        ssl_data_event_t bpf_event = {
+            .timestamp_ns = event->timestamp_ns,
+            .delta_ns = event->delta_ns,
+            .ssl_ctx = event->ssl_ctx,
+            .pid = event->pid,
+            .tid = event->tid,
+            .uid = event->uid,
+            .event_type = event->event_type,
+            .buf_filled = (int32_t)event->data_len,
+        };
+        memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
+
+        /* Parse using persistent flow-based parser */
+        int result = http1_parse_flow(event->flow_ctx, data, len, &bpf_event);
+        if (g_config.debug_mode) {
+            fprintf(stderr, "[DEBUG] H1 parse result=%d for flow_id=%u\n",
+                    result, event->flow_ctx->self_id);
+        }
+        if (result >= 0) {
+            return true;  /* Successfully parsed - display handled in callbacks */
+        }
+        /* Flow-based parser error - fall through to let caller try other handlers */
+    }
+
+    return false;  /* No flow context or flow-based parser failed */
+}
+#endif /* HAVE_THREADING */

@@ -42,7 +42,23 @@
 #include "decompressor.h"
 #include <string.h>
 #include <strings.h>
+
+/*----------------------------------------------------------------------------
+ * zlib-ng Native API Support
+ *
+ * zlib-ng in native mode uses zng_ prefixed functions to avoid symbol
+ * collisions with system zlib. These macros provide a unified interface.
+ *----------------------------------------------------------------------------*/
+#ifdef HAVE_ZLIB_NG
+#include <zlib-ng.h>
+/* Native zlib-ng API uses zng_ prefix */
+#define z_stream        zng_stream
+#define inflateInit2    zng_inflateInit2
+#define inflate         zng_inflate
+#define inflateEnd      zng_inflateEnd
+#else
 #include <zlib.h>
+#endif
 
 #ifdef HAVE_ZSTD
 #include <zstd.h>

@@ -18,7 +18,6 @@
  */
 
 #include "probe_handler.h"
-#include "../protocol/http2.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -280,13 +279,8 @@ static bool should_display(probe_handler_t *handler, const ssl_data_event_t *e) 
     /* Check for known internal thread patterns */
     if (is_internal_thread(e->comm)) return false;
 
-    /* Content-based IPC detection for all traffic.
-     * Skip if this connection has an active HTTP/2 session (definitely web traffic) */
-    bool has_h2 = http2_has_session(e->pid, e->ssl_ctx);
-    if (!has_h2) {
-        /* Check if data looks like IPC rather than HTTP */
-        if (is_ipc_traffic(e)) return false;
-    }
+    /* Content-based IPC detection for all traffic */
+    if (is_ipc_traffic(e)) return false;
 
     return true;
 }
