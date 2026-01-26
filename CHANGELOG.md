@@ -72,9 +72,8 @@ All notable changes to spliff will be documented in this file.
 
 ### Removed
 - **Legacy Flow Cache**: Deleted `src/correlation/flow_cache.c` and `flow_cache.h` (751 lines)
-- **Per-Worker State**: Removed `src/threading/state.c` (296 lines) - state now in flow_context
 - **HTTP/2 Global Pools**: Removed legacy `g_h2_streams[]`, `g_h2_connections[]`
-- **HTTP/2 Duplicate Code**: Consolidated 2074 lines → 800 lines in http2.c
+- **HTTP/2 Duplicate Code**: Consolidated from 2074 lines to ~800 lines in http2.c
 
 ### Architecture
 ```
