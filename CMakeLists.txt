@@ -561,7 +561,18 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(bpf_object ALL DEPENDS ${BPF_OBJECT})
+# Generate BPF skeleton header (embeds BPF bytecode + BTF for CO-RE)
+# This allows stripping the final binary while keeping BPF functional
+set(BPF_SKELETON ${CMAKE_BINARY_DIR}/spliff.skel.h)
+add_custom_command(
+    OUTPUT ${BPF_SKELETON}
+    COMMAND bpftool gen skeleton ${BPF_OBJECT} > ${BPF_SKELETON}
+    DEPENDS ${BPF_OBJECT}
+    COMMENT "Generating BPF skeleton (CO-RE enabled, strip-safe)..."
+    VERBATIM
+)
+
+add_custom_target(bpf_skeleton ALL DEPENDS ${BPF_SKELETON})
 
 # ============================================================================
 # Main Executable
@@ -569,12 +580,13 @@ add_custom_target(bpf_object ALL DEPENDS ${BPF_OBJECT})
 
 add_executable(spliff ${SPLIFF_SOURCES})
 
-# Add dependency on BPF object
-add_dependencies(spliff bpf_object)
+# Add dependency on BPF skeleton (which depends on BPF object)
+add_dependencies(spliff bpf_skeleton)
 
-# Include directories
+# Include directories (add build dir for generated skeleton header)
 target_include_directories(spliff PRIVATE
     ${CMAKE_SOURCE_DIR}/src/include
+    ${CMAKE_BINARY_DIR}
 )
 
 # Link all required libraries

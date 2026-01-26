@@ -2,6 +2,44 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.6] - 2026-01-26
+
+### Added
+- **Embedded BPF Skeleton**: BPF bytecode now embedded in binary via libbpf skeleton pattern
+  - Eliminates security risk of external `.bpf.o` file replacement
+  - CO-RE compliant - works with stripped production binaries
+  - Uses `bpftool gen skeleton` during build for embedded bytecode + BTF
+  - No more "failed to open spliff.bpf.o: -ENOENT" errors when running from different directories
+
+- **XDP Interface Status Display**: Clear per-interface mode reporting
+  - Shows each interface name with actual mode: `eth0 [native]`, `lo [skb]`
+  - Suppresses confusing libbpf kernel error messages during mode probing
+  - Graceful native → SKB fallback with accurate status reporting
+
+### Fixed
+- **XDP-SSL Correlation**: Critical bug where XDP metadata was missing from HTTP output
+  - Root cause: `flow_lookup_ex()` rejected XDP-only flows (ssl_ctx=0) for SSL events
+  - Fix: Allow XDP-created flows to merge with SSL events via FLOW_FLAG_HAS_SSL
+  - Fix: Add merged flows to shadow_index for bidirectional lookup
+  - HTTP output now shows IP:port info (e.g., `192.168.50.235:40772 → 142.250.202.10:443`)
+
+- **Vectorscan Thread Memory Leak**: Thread-local scratch space now properly cleaned up
+  - Added `proto_detector_thread_cleanup()` called by worker thread cleanup
+  - Prevents memory growth in long-running sessions with multiple worker threads
+
+- **Release Mode Output**: Removed spurious `[DETECTOR] Initialized with vectorscan` message
+
+### Changed
+- **BPF Loading Architecture**: Migrated from file-based to skeleton-based loading
+  - `bpf_loader_set_object()` accepts skeleton-owned bpf_object
+  - Cleanup sequence prevents double-free (skeleton owns the object)
+  - Build system generates `spliff.skel.h` header automatically
+
+### Technical Details
+- New files: `spliff.skel.h` (generated at build time)
+- Modified: `CMakeLists.txt`, `bpf_loader.c/h`, `main.c`, `flow_context.c`, `detector.c`
+- Binary size: ~460KB (includes embedded BPF bytecode + BTF)
+
 ## [0.9.5] - 2026-01-26
 
 ### Added
