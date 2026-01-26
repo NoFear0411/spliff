@@ -325,7 +325,7 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │  │  │   │  [ctx][ctx][ctx]...         cookie → id      (pid,ssl) → id         │ │    │    │
 │  │  │   └─────────────────────────────────────────────────────────────────────┘ │    │    │
 │  │  │   • Dual-index lookup: cookie_index (fast) or shadow_index (fallback)     │    │    │
-│  │  │   • flow_get_or_create() allocates slot, flow_promote_cookie() on link    │    │    │
+│  │  │   • XDP+SSL merge: flows gain HAS_XDP/HAS_SSL flags as events arrive      │    │    │
 │  │  │   • Connection affinity: hash(pid, ssl_ctx) routes to consistent worker   │    │    │
 │  │  └───────────┬───────────────────────────────────────────────────────────────┘    │    │
 │  │              │ event + flow_context_t*                                            │    │
@@ -339,11 +339,30 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
 │  │  └───┬───┘└───┬───┘└───┬───┘    └───┬───┘                                         │    │
 │  │      │        │        │            │                                             │    │
 │  │      └────────┴────────┴─────┬──────┘                                             │    │
-│  │                              │        Per-FLOW state (flow_context_t):            │    │
-│  │                              │        • nghttp2 session + HPACK inflater          │    │
-│  │                              │        • streams[64] with O(1) free-list           │    │
-│  │                              │        • llhttp parser + current transaction       │    │
-│  │                              │        • ALPN, body buffers, hpack_corrupted       │    │
+│  │                              │                                                    │    │
+│  │                              ▼                                                    │    │
+│  │  ┌───────────────────────────────────────────────────────────────────────────┐    │    │
+│  │  │   Protocol Detection & Routing (v0.9.5+)                                  │    │    │
+│  │  │                                                                           │    │    │
+│  │  │   ┌─────────────────┐                                                     │    │    │
+│  │  │   │   Vectorscan    │  O(n) NFA pattern matching                          │    │    │
+│  │  │   │   (proto_detect)│  HTTP/1, HTTP/2, TLS, WebSocket patterns            │    │    │
+│  │  │   └────────┬────────┘                                                     │    │    │
+│  │  │            │                                                              │    │    │
+│  │  │            ▼                                                              │    │    │
+│  │  │   ┌────────────────────────────────────────────────────────────────┐      │    │    │
+│  │  │   │  if (http1_try_process_event()) return;  ──► http1.c           │      │    │    │
+│  │  │   │  if (http2_try_process_event()) return;  ──► http2.c           │      │    │    │
+│  │  │   │  fallback: signature detection, raw display                    │      │    │    │
+│  │  │   └────────────────────────────────────────────────────────────────┘      │    │    │
+│  │  │                                                                           │    │    │
+│  │  │   Per-FLOW state (flow_context_t):                                        │    │    │
+│  │  │   • flags: HAS_XDP, HAS_SSL, IN_COOKIE, IN_SHADOW                         │    │    │
+│  │  │   • nghttp2 session + HPACK inflater + streams[64]                        │    │    │
+│  │  │   • llhttp parser + current transaction                                   │    │    │
+│  │  │   • ALPN, body buffers, hpack_corrupted                                   │    │    │
+│  │  └───────────────────────────────────────────────────────────────────────────┘    │    │
+│  │                              │                                                    │    │
 │  │                              ▼                                                    │    │
 │  │              ┌───────────────────────────┐                                        │    │
 │  │              │      Output Thread        │  Serialized stdout/file                │    │
@@ -465,6 +484,7 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
            │  │  ┌────────────────────────────────────────┐  │  │
            │  │  │           flow_context_t               │  │  │
            │  │  │  • socket_cookie, pid, ssl_ctx         │  │  │
+           │  │  │  • flags: HAS_XDP | HAS_SSL | IN_*     │  │  │
            │  │  │  • home_worker_id (atomic ownership)   │  │  │
            │  │  │  • parser.h2 (nghttp2 + streams[64])   │  │  │
            │  │  │  • parser.h1 (llhttp + transaction)    │  │  │
@@ -478,13 +498,13 @@ sudo ./spliff --show-libs                # Show discovered SSL libraries
                     │   UNIFIED PER-FLOW VIEW     │
                     │                             │
                     │  Packet  +  Socket  +  TLS  │
-                    │  metadata   state    data   │
+                    │  (HAS_XDP)        (HAS_SSL) │
                     │                             │
                     │  → Complete L7 visibility   │
-                    │  → PID + process name       │
+                    │  → IP:port from XDP         │
+                    │  → Decrypted TLS content    │
                     │  → Request/response corr.   │
                     │  → Per-flow HTTP/2 streams  │
-                    │  → Single-writer guarantee  │
                     └─────────────────────────────┘
 ```
 
@@ -527,7 +547,8 @@ connection from which process.
 │  Per-Flow State (flow_context_t):                                    │
 │  ┌────────────────────────────────────────────────────────────────┐  │
 │  │ • socket_cookie, pid, ssl_ctx      │ • alpn[16]                │  │
-│  │ • home_worker_id (atomic CAS)      │ • last_activity_ms        │  │
+│  │ • flags: HAS_XDP, HAS_SSL, IN_*    │ • last_activity_ms        │  │
+│  │ • home_worker_id (atomic CAS)      │ • proto (detected)        │  │
 │  │ • parser.h2.session (nghttp2)      │ • parser.h2.streams[64]   │  │
 │  │ • parser.h2.hpack_corrupted        │ • parser.h2.free_head     │  │
 │  │ • parser.h1.llhttp + current_txn   │ • parser.h1.settings      │  │
