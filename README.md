@@ -200,6 +200,7 @@ cmake --build build
 |--------|---------|-------------|
 | `USE_VECTORSCAN` | ON | Use vectorscan for O(n) protocol detection |
 | `USE_ZLIB_NG` | ON | Use zlib-ng for SIMD-accelerated compression |
+| `ENABLE_LTO` | ON | Link Time Optimization (5-10% faster, smaller binary) |
 | `ENABLE_ZSTD` | ON | Enable zstd decompression |
 | `ENABLE_BROTLI` | ON | Enable brotli decompression |
 | `ENABLE_SANITIZERS` | OFF | Enable AddressSanitizer/UBSan (debug builds) |
