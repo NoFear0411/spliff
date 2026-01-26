@@ -66,6 +66,9 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
+# LTO (Link Time Optimization) - 5-10% performance improvement
+option(ENABLE_LTO "Enable Link Time Optimization for Release builds" ON)
+
 # Define RelWithSan build type (Release + Sanitizers)
 set(CMAKE_C_FLAGS_RELWITHSAN "-O2 -g -DNDEBUG" CACHE STRING
     "Flags used by the C compiler during RelWithSan builds." FORCE)
@@ -82,6 +85,18 @@ set(CMAKE_EXE_LINKER_FLAGS_SANITIZE "" CACHE STRING
 # Debug-specific flags
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_definitions(DEBUG)
+endif()
+
+# LTO support for Release builds
+if(ENABLE_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
+    if(LTO_SUPPORTED)
+        message(STATUS "LTO (Link Time Optimization): enabled")
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    else()
+        message(STATUS "LTO not supported: ${LTO_ERROR}")
+    endif()
 endif()
 
 # Sanitizer support for Debug, RelWithSan, and Sanitize builds
@@ -887,6 +902,7 @@ message(STATUS "")
 message(STATUS "Build Options:")
 message(STATUS "  Sanitizers:     ${ENABLE_SANITIZERS}")
 message(STATUS "  Coverage:       ${ENABLE_COVERAGE}")
+message(STATUS "  LTO:            ${CMAKE_INTERPROCEDURAL_OPTIMIZATION}")
 message(STATUS "  USE_VECTORSCAN: ${USE_VECTORSCAN}")
 message(STATUS "  USE_ZLIB_NG:    ${USE_ZLIB_NG}")
 message(STATUS "  USE_MIMALLOC:   ${USE_MIMALLOC}")
