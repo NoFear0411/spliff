@@ -68,10 +68,21 @@ int proto_detector_init(void);
  *
  * Frees vectorscan database. Call once at shutdown.
  *
- * @note Thread-local scratch is freed automatically on thread exit
+ * @note Also calls proto_detector_thread_cleanup() for main thread
  * @note Safe to call even if init was never called
  */
 void proto_detector_cleanup(void);
+
+/**
+ * @brief Cleanup thread-local scratch space
+ *
+ * Frees the calling thread's vectorscan scratch space. Worker threads
+ * must call this before exiting to prevent memory leaks.
+ *
+ * @note Safe to call multiple times or if scratch was never allocated
+ * @note Called automatically by proto_detector_cleanup() for main thread
+ */
+void proto_detector_thread_cleanup(void);
 
 /**
  * @brief Detect protocol from packet data

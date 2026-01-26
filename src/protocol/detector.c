@@ -178,15 +178,20 @@ int proto_detector_init(void) {
 }
 
 void proto_detector_cleanup(void) {
-    /* Thread-local scratch is cleaned up when threads exit */
-    if (tls_scratch) {
-        hs_free_scratch(tls_scratch);
-        tls_scratch = NULL;
-    }
+    /* Clean up main thread's scratch (if any) */
+    proto_detector_thread_cleanup();
 
     if (g_proto_db) {
         hs_free_database(g_proto_db);
         g_proto_db = NULL;
+    }
+}
+
+void proto_detector_thread_cleanup(void) {
+    /* Free this thread's scratch space */
+    if (tls_scratch) {
+        hs_free_scratch(tls_scratch);
+        tls_scratch = NULL;
     }
 }
 
@@ -292,6 +297,13 @@ int proto_detector_init(void) {
  * @brief Fallback cleanup (no-op)
  */
 void proto_detector_cleanup(void) {
+    /* Nothing to clean up in fallback mode */
+}
+
+/**
+ * @brief Fallback thread cleanup (no-op)
+ */
+void proto_detector_thread_cleanup(void) {
     /* Nothing to clean up in fallback mode */
 }
 

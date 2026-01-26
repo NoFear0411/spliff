@@ -780,6 +780,9 @@ void *worker_thread_main(void *arg) {
     /* Drain remaining events before exit */
     worker_drain_queues(ctx);
 
+    /* Clean up thread-local resources */
+    proto_detector_thread_cleanup();
+
     /* Clear thread-local state */
     set_current_worker_state(NULL);
 
