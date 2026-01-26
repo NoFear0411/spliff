@@ -141,7 +141,9 @@ enum txn_flags {
     TXN_FLAG_DISPLAYED        = (1 << 4),  /**< Already printed to output */
     TXN_FLAG_CHUNKED          = (1 << 5),  /**< Transfer-Encoding: chunked */
     TXN_FLAG_COMPRESSED       = (1 << 6),  /**< Content-Encoding present */
-    TXN_FLAG_KEEP_ALIVE       = (1 << 7)   /**< HTTP/1.1 Connection: keep-alive */
+    TXN_FLAG_KEEP_ALIVE       = (1 << 7),  /**< HTTP/1.1 Connection: keep-alive */
+    TXN_FLAG_REQ_HEADERS_DONE = (1 << 8),  /**< Request headers displayed */
+    TXN_FLAG_RSP_HEADERS_DONE = (1 << 9)   /**< Response headers displayed */
 };
 
 /**
@@ -177,10 +179,11 @@ typedef struct flow_transaction {
     char path[256];                 /**< Request path/URI */
     char host[128];                 /**< Host header value */
 
-    /*=== Response Info (24 bytes) ===*/
+    /*=== Response Info (56 bytes) ===*/
     int status_code;                /**< HTTP status (200, 404, etc.) */
     size_t content_length;          /**< Content-Length or 0 if chunked */
     char content_type[64];          /**< Content-Type for body parsing */
+    char encoding[32];              /**< Content-Encoding (gzip, br, etc.) */
 
     /*=== Body Buffer (dynamically allocated, 24 bytes) ===*/
     uint8_t *body_buf;              /**< Body data (NULL if not capturing) */
@@ -225,6 +228,11 @@ typedef struct {
     bool in_header_value;           /**< true if parsing header value */
     bool headers_complete;          /**< true when headers section done */
     bool message_complete;          /**< true when full message parsed */
+
+    /*=== Last Request URL (for response display) ===*/
+    char last_request_host[128];    /**< Host from last request */
+    char last_request_path[256];    /**< Path from last request */
+    char last_request_method[16];   /**< Method from last request */
 
     /*=== Transaction Support ===*/
     flow_transaction_t txn;         /**< Single transaction (HTTP/1 is sequential) */

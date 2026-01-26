@@ -251,6 +251,26 @@ struct llhttp_settings_s *http1_get_flow_settings(void);
 int http1_parse_flow(struct flow_context *flow_ctx, const uint8_t *data, size_t len,
                      const struct ssl_data_event *event);
 
+/**
+ * @brief Unified HTTP/1 event processing entry point
+ *
+ * Single entry point for all HTTP/1 processing from main.c.
+ * Handles detection, parser initialization, and parsing.
+ * Keeps all HTTP/1 logic in http1.c.
+ *
+ * @param[in] data       Raw data buffer
+ * @param[in] len        Data length
+ * @param[in] event      Worker event with full context
+ * @param[in] worker     Worker context for output
+ *
+ * @return true if data was processed as HTTP/1, false to try other protocols
+ */
+struct worker_event;
+struct worker_ctx;
+bool http1_try_process_event(const uint8_t *data, size_t len,
+                             struct worker_event *event,
+                             struct worker_ctx *worker);
+
 /** @} */ /* End of http1_flow group */
 
 /** @} */ /* End of http1 group */

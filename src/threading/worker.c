@@ -52,6 +52,7 @@
 #include "threading.h"
 #include "../protocol/http1.h"
 #include "../protocol/http2.h"
+#include "../protocol/detector.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -207,18 +208,9 @@ static int process_deferred_batch(worker_ctx_t *ctx) {
         deferred_event_t *def = &ctx->deferred_slots[slot];
         worker_event_t *event = def->event;
 
-        /* Retry lookup in both legacy cache and Shared Pool */
+        /* Retry lookup in Shared Pool */
         threading_mgr_t *mgr = threading_get_manager();
         if (mgr && event->socket_cookie != 0) {
-            /* Legacy: lookup in flow_cache */
-            flow_info_t *info = flow_cache_lookup(
-                &mgr->dispatcher.flow_cache, event->socket_cookie);
-
-            /* Identity check: verify same flow, not reused cache slot */
-            if (info && info->socket_cookie == def->original_cookie) {
-                event->flow_info = info;
-            }
-
             /* Shared Pool: lookup by cookie or (pid, ssl_ctx) */
             flow_context_t *flow_ctx = flow_lookup(&mgr->dispatcher.flow_mgr,
                                                     event->socket_cookie,
@@ -232,9 +224,8 @@ static int process_deferred_batch(worker_ctx_t *ctx) {
 
         def->retry_count++;
 
-        /* Success if either legacy flow_info OR new flow_ctx found */
-        bool correlation_success = (event->flow_info != NULL) ||
-                                    (event->flow_ctx != NULL);
+        /* Success if flow_ctx found */
+        bool correlation_success = (event->flow_ctx != NULL);
 
         if (correlation_success) {
             /* Success! Clear slot and process */
@@ -504,7 +495,7 @@ static void worker_loop(worker_ctx_t *ctx) {
                ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, &event)) {
 
             /* Check if cookie retry needed */
-            if (event->needs_cookie_retry && event->flow_info == NULL) {
+            if (event->needs_cookie_retry && event->flow_ctx == NULL) {
                 if (defer_event_for_retry(ctx, event) == 0) {
                     /* Successfully deferred - don't count against budget */
                     continue;
@@ -595,17 +586,126 @@ static void worker_loop(worker_ctx_t *ctx) {
                 } else {
                     /* Flow already owned - check if we are the owner */
                     uint32_t home = atomic_load(&event->flow_ctx->home_worker_id);
-                    if (home != my_id && home != WORKER_ID_NONE) {
+                    if (home == my_id) {
+                        /*
+                         * We own this flow - check for late parser initialization.
+                         *
+                         * This handles the case where:
+                         * 1. SSL data arrived first → claimed flow with proto=UNKNOWN
+                         * 2. ALPN event arrived later → set proto but CAS failed
+                         * 3. Parser needs initialization now that proto is known
+                         *
+                         * This is the "Golden Thread" fix for ALPN timing issues.
+                         */
+                        if (event->flow_ctx->proto == FLOW_PROTO_HTTP2 &&
+                            event->flow_ctx->parser.h2.session == NULL) {
+                            nghttp2_session_callbacks *cbs = http2_get_callbacks();
+                            if (cbs) {
+                                void *cb_ctx = http2_create_callback_ctx(event->flow_ctx);
+                                if (cb_ctx) {
+                                    event->flow_ctx->parser.h2.callback_ctx = cb_ctx;
+                                    int rv = flow_h2_session_init(event->flow_ctx, cbs, cb_ctx);
+                                    if (rv == 0 && g_config.debug_mode) {
+                                        fprintf(stderr, "[Worker %u] Late H2 init for flow_id=%u\n",
+                                                my_id, event->flow_ctx->self_id);
+                                    }
+                                }
+                            }
+                        } else if (event->flow_ctx->proto == FLOW_PROTO_HTTP1 &&
+                                   !event->flow_ctx->parser.h1.initialized) {
+                            llhttp_settings_t *settings = http1_get_flow_settings();
+                            int rv = flow_h1_parser_init(event->flow_ctx, settings);
+                            if (rv == 0 && g_config.debug_mode) {
+                                fprintf(stderr, "[Worker %u] Late H1 init for flow_id=%u\n",
+                                        my_id, event->flow_ctx->self_id);
+                            }
+                        }
+                    } else if (home != WORKER_ID_NONE) {
                         /*
                          * Misrouted event: we are not the home worker.
-                         * TODO: Implement forwarding to worker 'home'.
-                         * For now, process locally but log the mismatch.
+                         *
+                         * nghttp2 sessions are NOT thread-safe, so we cannot have
+                         * multiple workers accessing the same session. If parser
+                         * initialization is needed, we must atomically re-home the
+                         * flow to this worker before initializing.
+                         *
+                         * Re-homing strategy:
+                         * 1. If proto is known but parser not initialized, try to
+                         *    atomically claim ownership (CAS home_worker_id)
+                         * 2. If CAS succeeds: we own the flow now, initialize parser
+                         * 3. If CAS fails: another worker beat us, defer event
                          */
                         atomic_fetch_add(&ctx->events_misrouted, 1);
-                        if (g_config.debug_mode) {
-                            fprintf(stderr, "[Worker %u] Misrouted event for flow_id=%u "
-                                    "(home=%u) - processing locally\n",
-                                    my_id, event->flow_ctx->self_id, home);
+
+                        bool needs_parser_init = false;
+                        if (event->flow_ctx->proto == FLOW_PROTO_HTTP2 &&
+                            event->flow_ctx->parser.h2.session == NULL) {
+                            needs_parser_init = true;
+                        } else if (event->flow_ctx->proto == FLOW_PROTO_HTTP1 &&
+                                   !event->flow_ctx->parser.h1.initialized) {
+                            needs_parser_init = true;
+                        }
+
+                        if (needs_parser_init) {
+                            /*
+                             * Atomically try to re-home this flow to current worker.
+                             * This ensures single-writer ownership of parser state.
+                             */
+                            uint32_t expected = home;
+                            if (atomic_compare_exchange_strong(&event->flow_ctx->home_worker_id,
+                                                               &expected, my_id)) {
+                                /* Successfully re-homed - we now own this flow */
+                                if (g_config.debug_mode) {
+                                    fprintf(stderr, "[Worker %u] Re-homed flow_id=%u from worker %u\n",
+                                            my_id, event->flow_ctx->self_id, home);
+                                }
+
+                                /* Initialize parser as the new owner */
+                                if (event->flow_ctx->proto == FLOW_PROTO_HTTP2) {
+                                    nghttp2_session_callbacks *cbs = http2_get_callbacks();
+                                    if (cbs) {
+                                        void *cb_ctx = http2_create_callback_ctx(event->flow_ctx);
+                                        if (cb_ctx) {
+                                            event->flow_ctx->parser.h2.callback_ctx = cb_ctx;
+                                            int rv = flow_h2_session_init(event->flow_ctx, cbs, cb_ctx);
+                                            if (rv == 0 && g_config.debug_mode) {
+                                                fprintf(stderr, "[Worker %u] Initialized H2 session after re-home for flow_id=%u\n",
+                                                        my_id, event->flow_ctx->self_id);
+                                            }
+                                        }
+                                    }
+                                } else if (event->flow_ctx->proto == FLOW_PROTO_HTTP1) {
+                                    llhttp_settings_t *settings = http1_get_flow_settings();
+                                    int rv = flow_h1_parser_init(event->flow_ctx, settings);
+                                    if (rv == 0 && g_config.debug_mode) {
+                                        fprintf(stderr, "[Worker %u] Initialized H1 parser after re-home for flow_id=%u\n",
+                                                my_id, event->flow_ctx->self_id);
+                                    }
+                                }
+                            } else {
+                                /*
+                                 * CAS failed - another worker changed ownership.
+                                 * Defer this event for retry.
+                                 */
+                                if (g_config.debug_mode) {
+                                    fprintf(stderr, "[Worker %u] Re-home CAS failed for flow_id=%u, deferring\n",
+                                            my_id, event->flow_ctx->self_id);
+                                }
+                                if (defer_event_for_retry(ctx, event) == 0) {
+                                    continue; /* Skip process_worker_event, will retry later */
+                                }
+                                /* Defer failed (queue full), process anyway */
+                            }
+                        } else {
+                            /*
+                             * Parser already initialized - misrouted but can process.
+                             * This should be rare (transient routing during setup).
+                             */
+                            if (g_config.debug_mode) {
+                                fprintf(stderr, "[Worker %u] Misrouted event for flow_id=%u "
+                                        "(home=%u) - processing locally\n",
+                                        my_id, event->flow_ctx->self_id, home);
+                            }
                         }
                     }
                 }

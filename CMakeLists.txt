@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(spliff
-    VERSION 0.9.2
+    VERSION 0.9.5
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C
@@ -16,6 +16,11 @@ project(spliff
 
 option(ENABLE_SANITIZERS "Enable AddressSanitizer and UBSan in Debug builds" ON)
 option(ENABLE_COVERAGE "Enable code coverage instrumentation (gcov)" OFF)
+
+# Performance library options (v0.9.5 Golden Thread optimizations)
+option(USE_VECTORSCAN "Use vectorscan/hyperscan for O(n) protocol detection" ON)
+option(USE_ZLIB_NG "Use zlib-ng for SIMD-accelerated decompression" ON)
+option(USE_MIMALLOC "Use mimalloc instead of jemalloc (lower latency)" OFF)
 
 # ============================================================================
 # C23 Standard Configuration
@@ -67,13 +72,22 @@ set(CMAKE_C_FLAGS_RELWITHSAN "-O2 -g -DNDEBUG" CACHE STRING
 set(CMAKE_EXE_LINKER_FLAGS_RELWITHSAN "" CACHE STRING
     "Flags used by the linker during RelWithSan builds." FORCE)
 
+# Define Sanitize build type (optimized for maximum sanitizer accuracy)
+# -O1 preserves function calls for better stack traces
+set(CMAKE_C_FLAGS_SANITIZE "-O1 -g -fno-omit-frame-pointer" CACHE STRING
+    "Flags for Sanitize builds (ASan/UBSan optimized)." FORCE)
+set(CMAKE_EXE_LINKER_FLAGS_SANITIZE "" CACHE STRING
+    "Linker flags for Sanitize builds." FORCE)
+
 # Debug-specific flags
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_definitions(DEBUG)
 endif()
 
-# Sanitizer support for Debug and RelWithSan builds
-if(ENABLE_SANITIZERS AND (CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "RelWithSan"))
+# Sanitizer support for Debug, RelWithSan, and Sanitize builds
+if(ENABLE_SANITIZERS AND (CMAKE_BUILD_TYPE STREQUAL "Debug" OR
+                          CMAKE_BUILD_TYPE STREQUAL "RelWithSan" OR
+                          CMAKE_BUILD_TYPE STREQUAL "Sanitize"))
     # Check if sanitizer libraries are available by trying to compile+link
     include(CheckCSourceCompiles)
 
@@ -190,8 +204,37 @@ pkg_check_modules(LIBELF REQUIRED IMPORTED_TARGET libelf)
 message(STATUS "Found libelf: ${LIBELF_VERSION}")
 
 # --- Compression dependencies ---
-pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
-message(STATUS "Found zlib: ${ZLIB_VERSION}")
+# zlib-ng provides SIMD-accelerated decompression (2-3x faster)
+# API-compatible with zlib, just link different library
+if(USE_ZLIB_NG)
+    pkg_check_modules(ZLIB_NG IMPORTED_TARGET zlib-ng)
+    if(ZLIB_NG_FOUND)
+        message(STATUS "Found zlib-ng: ${ZLIB_NG_VERSION} (SIMD-accelerated)")
+        set(ZLIB_TARGET PkgConfig::ZLIB_NG)
+        set(HAVE_ZLIB_NG TRUE)
+    else()
+        # Try direct search for zlib-ng
+        find_path(ZLIB_NG_INCLUDE_DIR zlib.h PATH_SUFFIXES zlib-ng)
+        find_library(ZLIB_NG_LIBRARY NAMES z-ng zlib-ng)
+        if(ZLIB_NG_INCLUDE_DIR AND ZLIB_NG_LIBRARY)
+            message(STATUS "Found zlib-ng via direct search (SIMD-accelerated)")
+            add_library(ZLIB_NG_TARGET INTERFACE IMPORTED)
+            target_include_directories(ZLIB_NG_TARGET INTERFACE ${ZLIB_NG_INCLUDE_DIR})
+            target_link_libraries(ZLIB_NG_TARGET INTERFACE ${ZLIB_NG_LIBRARY})
+            set(ZLIB_TARGET ZLIB_NG_TARGET)
+            set(HAVE_ZLIB_NG TRUE)
+        else()
+            message(STATUS "zlib-ng not found, falling back to standard zlib")
+            set(USE_ZLIB_NG OFF)
+        endif()
+    endif()
+endif()
+
+if(NOT USE_ZLIB_NG OR NOT HAVE_ZLIB_NG)
+    pkg_check_modules(ZLIB REQUIRED IMPORTED_TARGET zlib)
+    message(STATUS "Found zlib: ${ZLIB_VERSION}")
+    set(ZLIB_TARGET PkgConfig::ZLIB)
+endif()
 
 pkg_check_modules(ZSTD IMPORTED_TARGET libzstd)
 if(NOT ZSTD_FOUND)
@@ -310,23 +353,110 @@ endif()
 message(STATUS "Found liburcu: ${LIBURCU_VERSION}")
 
 # --- Memory allocator ---
-pkg_check_modules(JEMALLOC IMPORTED_TARGET jemalloc)
-if(NOT JEMALLOC_FOUND)
-    find_path(JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h)
-    find_library(JEMALLOC_LIBRARY NAMES jemalloc)
-    if(JEMALLOC_INCLUDE_DIR AND JEMALLOC_LIBRARY)
-        message(STATUS "Found jemalloc via direct search")
-        set(JEMALLOC_FOUND TRUE)
-        add_library(PkgConfig::JEMALLOC INTERFACE IMPORTED)
-        target_include_directories(PkgConfig::JEMALLOC INTERFACE ${JEMALLOC_INCLUDE_DIR})
-        target_link_libraries(PkgConfig::JEMALLOC INTERFACE ${JEMALLOC_LIBRARY})
+# mimalloc provides lower latency for multi-threaded workloads
+# jemalloc is still excellent, mimalloc is optional
+if(USE_MIMALLOC)
+    pkg_check_modules(MIMALLOC IMPORTED_TARGET mimalloc)
+    if(NOT MIMALLOC_FOUND)
+        find_path(MIMALLOC_INCLUDE_DIR mimalloc.h PATH_SUFFIXES mimalloc)
+        find_library(MIMALLOC_LIBRARY NAMES mimalloc)
+        if(MIMALLOC_INCLUDE_DIR AND MIMALLOC_LIBRARY)
+            message(STATUS "Found mimalloc via direct search")
+            set(MIMALLOC_FOUND TRUE)
+            add_library(PkgConfig::MIMALLOC INTERFACE IMPORTED)
+            target_include_directories(PkgConfig::MIMALLOC INTERFACE ${MIMALLOC_INCLUDE_DIR})
+            target_link_libraries(PkgConfig::MIMALLOC INTERFACE ${MIMALLOC_LIBRARY})
+        endif()
+    endif()
+    if(MIMALLOC_FOUND)
+        message(STATUS "Found mimalloc: ${MIMALLOC_VERSION} (low-latency allocator)")
+        set(ALLOCATOR_TARGET PkgConfig::MIMALLOC)
+        set(HAVE_MIMALLOC TRUE)
+
+        # Enable MI_TRACK_ASAN for sanitizer builds
+        # This allows mimalloc to communicate with ASan runtime instead of conflicting
+        if(ENABLE_SANITIZERS AND (CMAKE_BUILD_TYPE STREQUAL "Debug" OR
+                                  CMAKE_BUILD_TYPE STREQUAL "RelWithSan" OR
+                                  CMAKE_BUILD_TYPE STREQUAL "Sanitize"))
+            message(STATUS "  -> MI_TRACK_ASAN enabled (mimalloc + ASan integration)")
+            add_compile_definitions(MI_TRACK_ASAN=1)
+            # MI_DEBUG=2 enables internal mimalloc consistency checks
+            add_compile_definitions(MI_DEBUG=2)
+        endif()
     else()
-        message(FATAL_ERROR "jemalloc not found. Install jemalloc-devel (Fedora) or libjemalloc-dev (Debian)")
+        message(STATUS "mimalloc not found, falling back to jemalloc")
+        set(USE_MIMALLOC OFF)
     endif()
 endif()
-message(STATUS "Found jemalloc: ${JEMALLOC_VERSION}")
 
-# --- Pattern matching ---
+if(NOT USE_MIMALLOC OR NOT HAVE_MIMALLOC)
+    pkg_check_modules(JEMALLOC IMPORTED_TARGET jemalloc)
+    if(NOT JEMALLOC_FOUND)
+        find_path(JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h)
+        find_library(JEMALLOC_LIBRARY NAMES jemalloc)
+        if(JEMALLOC_INCLUDE_DIR AND JEMALLOC_LIBRARY)
+            message(STATUS "Found jemalloc via direct search")
+            set(JEMALLOC_FOUND TRUE)
+            add_library(PkgConfig::JEMALLOC INTERFACE IMPORTED)
+            target_include_directories(PkgConfig::JEMALLOC INTERFACE ${JEMALLOC_INCLUDE_DIR})
+            target_link_libraries(PkgConfig::JEMALLOC INTERFACE ${JEMALLOC_LIBRARY})
+        else()
+            message(FATAL_ERROR "No memory allocator found. Install jemalloc-devel or mimalloc-devel")
+        endif()
+    endif()
+    message(STATUS "Found jemalloc: ${JEMALLOC_VERSION}")
+    set(ALLOCATOR_TARGET PkgConfig::JEMALLOC)
+    set(HAVE_JEMALLOC TRUE)
+endif()
+
+# --- Pattern matching engine ---
+# vectorscan (portable hyperscan fork) provides O(n) linear-time matching
+# Falls back to hyperscan, then pcre2
+if(USE_VECTORSCAN)
+    # Try vectorscan first (portable, works without AVX-512)
+    pkg_check_modules(VECTORSCAN IMPORTED_TARGET vectorscan)
+    if(VECTORSCAN_FOUND)
+        message(STATUS "Found vectorscan: ${VECTORSCAN_VERSION} (O(n) NFA engine)")
+        set(PATTERN_TARGET PkgConfig::VECTORSCAN)
+        set(HAVE_VECTORSCAN TRUE)
+    else()
+        # Try direct search for vectorscan
+        find_path(VECTORSCAN_INCLUDE_DIR hs/hs.h PATH_SUFFIXES vectorscan)
+        find_library(VECTORSCAN_LIBRARY NAMES hs vectorscan)
+        if(VECTORSCAN_INCLUDE_DIR AND VECTORSCAN_LIBRARY)
+            message(STATUS "Found vectorscan via direct search (O(n) NFA engine)")
+            add_library(VECTORSCAN_TARGET INTERFACE IMPORTED)
+            target_include_directories(VECTORSCAN_TARGET INTERFACE ${VECTORSCAN_INCLUDE_DIR})
+            target_link_libraries(VECTORSCAN_TARGET INTERFACE ${VECTORSCAN_LIBRARY})
+            set(PATTERN_TARGET VECTORSCAN_TARGET)
+            set(HAVE_VECTORSCAN TRUE)
+        else()
+            # Try Intel hyperscan as fallback
+            pkg_check_modules(HYPERSCAN IMPORTED_TARGET hyperscan)
+            if(HYPERSCAN_FOUND)
+                message(STATUS "Found hyperscan: ${HYPERSCAN_VERSION} (O(n) NFA engine)")
+                set(PATTERN_TARGET PkgConfig::HYPERSCAN)
+                set(HAVE_HYPERSCAN TRUE)
+            else()
+                find_path(HYPERSCAN_INCLUDE_DIR hs/hs.h)
+                find_library(HYPERSCAN_LIBRARY NAMES hs hyperscan)
+                if(HYPERSCAN_INCLUDE_DIR AND HYPERSCAN_LIBRARY)
+                    message(STATUS "Found hyperscan via direct search (O(n) NFA engine)")
+                    add_library(HYPERSCAN_TARGET INTERFACE IMPORTED)
+                    target_include_directories(HYPERSCAN_TARGET INTERFACE ${HYPERSCAN_INCLUDE_DIR})
+                    target_link_libraries(HYPERSCAN_TARGET INTERFACE ${HYPERSCAN_LIBRARY})
+                    set(PATTERN_TARGET HYPERSCAN_TARGET)
+                    set(HAVE_HYPERSCAN TRUE)
+                else()
+                    message(STATUS "vectorscan/hyperscan not found, falling back to pcre2")
+                    set(USE_VECTORSCAN OFF)
+                endif()
+            endif()
+        endif()
+    endif()
+endif()
+
+# Fallback to pcre2 (still needed for some features, always required)
 pkg_check_modules(PCRE2 IMPORTED_TARGET libpcre2-8)
 if(NOT PCRE2_FOUND)
     find_path(PCRE2_INCLUDE_DIR pcre2.h)
@@ -342,6 +472,13 @@ if(NOT PCRE2_FOUND)
     endif()
 endif()
 message(STATUS "Found pcre2: ${PCRE2_VERSION}")
+
+# If no vectorscan/hyperscan, use pcre2 as pattern engine
+if(NOT HAVE_VECTORSCAN AND NOT HAVE_HYPERSCAN)
+    set(PATTERN_TARGET PkgConfig::PCRE2)
+    set(HAVE_PCRE2_PATTERNS TRUE)
+    message(STATUS "Using pcre2 for pattern matching (backtracking engine)")
+endif()
 
 # --- Build tools ---
 find_program(CLANG_EXECUTABLE clang REQUIRED)
@@ -359,16 +496,19 @@ set(SPLIFF_SOURCES
     src/util/safe_str.c
     src/content/signatures.c
     src/content/decompressor.c
+    # Protocol parsing and detection
     src/protocol/http1.c
     src/protocol/http2.c
+    src/protocol/detector.c      # Vectorscan-powered protocol detection (v0.9.5)
+    # BPF infrastructure
     src/bpf/bpf_loader.c
     src/bpf/binary_scanner.c
     src/bpf/probe_handler.c
+    # Output formatting
     src/output/display.c
-    # Correlation (XDP flow cache and unified flow context)
-    src/correlation/flow_cache.c
+    # Correlation (unified flow context with dual indexes)
     src/correlation/flow_context.c
-    # Threading sources (required)
+    # Threading subsystem
     src/threading/pool.c
     src/threading/state.c
     src/threading/worker.c
@@ -424,31 +564,49 @@ target_include_directories(spliff PRIVATE
 
 # Link all required libraries
 target_link_libraries(spliff PRIVATE
+    # Core BPF
     PkgConfig::LIBBPF
     PkgConfig::LIBELF
-    PkgConfig::ZLIB
+    # Compression (zlib-ng or zlib)
+    ${ZLIB_TARGET}
     PkgConfig::ZSTD
     PkgConfig::BROTLI
+    # HTTP parsing
     PkgConfig::LLHTTP
     PkgConfig::NGHTTP2
+    # Threading and concurrency
     PkgConfig::CK
     PkgConfig::LIBXDP
     PkgConfig::LIBURCU
-    PkgConfig::JEMALLOC
+    # Memory allocator (mimalloc or jemalloc)
+    ${ALLOCATOR_TARGET}
+    # Pattern matching (vectorscan, hyperscan, or pcre2)
+    ${PATTERN_TARGET}
     PkgConfig::PCRE2
+    # POSIX threads
     pthread
 )
 
 # Compile definitions for all features
 target_compile_definitions(spliff PRIVATE
+    # HTTP parsing
     HAVE_LLHTTP
     HAVE_NGHTTP2
+    # Compression
     HAVE_ZSTD
     HAVE_BROTLI
+    $<$<BOOL:${HAVE_ZLIB_NG}>:HAVE_ZLIB_NG>
+    # Threading
     HAVE_THREADING
     HAVE_XDP
     HAVE_LIBURCU
-    HAVE_JEMALLOC
+    # Memory allocator
+    $<$<BOOL:${HAVE_JEMALLOC}>:HAVE_JEMALLOC>
+    $<$<BOOL:${HAVE_MIMALLOC}>:HAVE_MIMALLOC>
+    # Pattern matching engine
+    $<$<BOOL:${HAVE_VECTORSCAN}>:HAVE_VECTORSCAN>
+    $<$<BOOL:${HAVE_HYPERSCAN}>:HAVE_HYPERSCAN>
+    $<$<BOOL:${HAVE_PCRE2_PATTERNS}>:HAVE_PCRE2_PATTERNS>
     HAVE_PCRE2
     PCRE2_CODE_UNIT_WIDTH=8
 )
@@ -487,7 +645,7 @@ target_include_directories(test_http1 PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_http1 PRIVATE
     PkgConfig::LLHTTP
     PkgConfig::NGHTTP2
-    PkgConfig::ZLIB
+    ${ZLIB_TARGET}
     PkgConfig::ZSTD
     PkgConfig::BROTLI
 )
@@ -506,7 +664,7 @@ target_include_directories(test_http2 PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_http2 PRIVATE
     PkgConfig::LLHTTP
     PkgConfig::NGHTTP2
-    PkgConfig::ZLIB
+    ${ZLIB_TARGET}
     PkgConfig::ZSTD
     PkgConfig::BROTLI
 )
@@ -695,31 +853,50 @@ message(STATUS "C standard:       C${CMAKE_C_STANDARD}")
 message(STATUS "Install prefix:   ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "Architecture:     ${MACHINE_ARCH} (BPF: ${BPF_ARCH})")
 message(STATUS "")
-message(STATUS "Required Dependencies (all found):")
+message(STATUS "Core Dependencies:")
 message(STATUS "  libbpf:         ${LIBBPF_VERSION}")
 message(STATUS "  libelf:         ${LIBELF_VERSION}")
-message(STATUS "  zlib:           ${ZLIB_VERSION}")
-message(STATUS "  zstd:           ${ZSTD_VERSION}")
-message(STATUS "  brotli:         ${BROTLI_VERSION}")
 message(STATUS "  llhttp:         ${LLHTTP_VERSION}")
 message(STATUS "  nghttp2:        ${NGHTTP2_VERSION}")
 message(STATUS "  ck:             ${CK_VERSION}")
 message(STATUS "  libxdp:         ${LIBXDP_VERSION}")
 message(STATUS "  liburcu:        ${LIBURCU_VERSION}")
-message(STATUS "  jemalloc:       ${JEMALLOC_VERSION}")
 message(STATUS "  pcre2:          ${PCRE2_VERSION}")
+message(STATUS "")
+message(STATUS "Performance Libraries (v0.9.5 Golden Thread):")
+if(HAVE_ZLIB_NG)
+    message(STATUS "  Compression:    zlib-ng ${ZLIB_NG_VERSION} (SIMD-accelerated)")
+else()
+    message(STATUS "  Compression:    zlib ${ZLIB_VERSION}")
+endif()
+message(STATUS "  + zstd:         ${ZSTD_VERSION}")
+message(STATUS "  + brotli:       ${BROTLI_VERSION}")
+if(HAVE_MIMALLOC)
+    message(STATUS "  Allocator:      mimalloc ${MIMALLOC_VERSION} (low-latency)")
+else()
+    message(STATUS "  Allocator:      jemalloc ${JEMALLOC_VERSION}")
+endif()
+if(HAVE_VECTORSCAN)
+    message(STATUS "  Pattern engine: vectorscan ${VECTORSCAN_VERSION} (O(n) NFA)")
+elseif(HAVE_HYPERSCAN)
+    message(STATUS "  Pattern engine: hyperscan ${HYPERSCAN_VERSION} (O(n) NFA)")
+else()
+    message(STATUS "  Pattern engine: pcre2 ${PCRE2_VERSION} (backtracking)")
+endif()
 message(STATUS "")
 message(STATUS "Build Options:")
 message(STATUS "  Sanitizers:     ${ENABLE_SANITIZERS}")
 message(STATUS "  Coverage:       ${ENABLE_COVERAGE}")
+message(STATUS "  USE_VECTORSCAN: ${USE_VECTORSCAN}")
+message(STATUS "  USE_ZLIB_NG:    ${USE_ZLIB_NG}")
+message(STATUS "  USE_MIMALLOC:   ${USE_MIMALLOC}")
 message(STATUS "")
-message(STATUS "Features (all enabled):")
+message(STATUS "Features:")
 message(STATUS "  HTTP/1.1:       ON (llhttp)")
 message(STATUS "  HTTP/2:         ON (nghttp2)")
-message(STATUS "  Compression:    ON (zlib, zstd, brotli)")
+message(STATUS "  Compression:    ON (zlib/zlib-ng, zstd, brotli)")
 message(STATUS "  Threading:      ON (ck)")
 message(STATUS "  XDP capture:    ON (libxdp)")
 message(STATUS "  RCU support:    ON (liburcu)")
-message(STATUS "  Memory alloc:   ON (jemalloc)")
-message(STATUS "  Pattern match:  ON (pcre2)")
+message(STATUS "  Protocol detect:ON (vectorscan/hyperscan/pcre2)")
 message(STATUS "")

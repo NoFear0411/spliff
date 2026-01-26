@@ -551,10 +551,41 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
         if (id != FLOW_ID_INVALID) {
             flow_context_t *ctx = flow_pool_get(&mgr->pool, id);
             if (ctx && atomic_load_explicit(&ctx->active, memory_order_acquire)) {
-                if (path_out) {
-                    *path_out = FLOW_PATH_COOKIE;
+                /*
+                 * Verify the cookie-matched flow belongs to this connection.
+                 * This handles the case where SSL events get an incorrect cookie
+                 * (kernel socket cookie lazy initialization issue) that happens
+                 * to match a different XDP-tracked flow.
+                 *
+                 * For SSL events (ssl_ctx != 0), the flow must ALSO have the
+                 * same ssl_ctx. XDP-only flows have ssl_ctx=0 and should not
+                 * be returned for SSL event lookups.
+                 */
+                bool cookie_flow_valid = true;
+
+                if (ssl_ctx != 0) {
+                    /* SSL event lookup - flow must have matching ssl_ctx */
+                    if (ctx->ssl_ctx == 0) {
+                        /* XDP-only flow - not valid for SSL event */
+                        cookie_flow_valid = false;
+                    } else if (ctx->ssl_ctx != ssl_ctx) {
+                        /* Different SSL context - wrong connection */
+                        cookie_flow_valid = false;
+                    }
                 }
-                return ctx;
+
+                if (pid != 0 && ctx->pid != 0 && ctx->pid != pid) {
+                    /* PID mismatch - this flow belongs to different process */
+                    cookie_flow_valid = false;
+                }
+
+                if (cookie_flow_valid) {
+                    if (path_out) {
+                        *path_out = FLOW_PATH_COOKIE;
+                    }
+                    return ctx;
+                }
+                /* Cookie matched but flow doesn't belong to us - fall through to shadow */
             }
         }
     }

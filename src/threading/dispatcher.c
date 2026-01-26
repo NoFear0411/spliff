@@ -89,70 +89,12 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
         return -1;
     }
 
-    /* Calculate worker ID using socket_cookie-first strategy for XDP correlation */
-    int worker_id = get_worker_id_ex(bpf_event->socket_cookie,
-                                      bpf_event->pid, bpf_event->ssl_ctx,
-                                      ctx->num_workers);
-    worker_ctx_t *worker = &ctx->workers[worker_id];
-
-    /* Allocate event from worker's pool */
-    worker_event_t *event = pool_alloc(&worker->event_pool);
-    if (!event) {
-        /* Pool empty - drop event */
-        atomic_fetch_add(&ctx->events_dropped, 1);
-        atomic_fetch_add(&worker->events_dropped, 1);
-        return -1;
-    }
-
-    /* Copy BPF event data */
-    event->timestamp_ns = bpf_event->timestamp_ns;
-    event->delta_ns = bpf_event->delta_ns;
-    event->ssl_ctx = bpf_event->ssl_ctx;
-    event->socket_cookie = bpf_event->socket_cookie;
-    event->pid = bpf_event->pid;
-    event->tid = bpf_event->tid;
-    event->uid = bpf_event->uid;
-    event->event_type = bpf_event->event_type;
-    event->buf_filled = bpf_event->buf_filled;
-    memcpy(event->comm, bpf_event->comm, TASK_COMM_LEN);
-
-    /* Pre-compute routing info */
-    event->worker_id = worker_id;
-    event->flow_hash = flow_hash(bpf_event->pid, bpf_event->ssl_ctx);
-
-    /* Lookup XDP flow info for correlation ("Golden Thread") */
-    event->needs_cookie_retry = false;
-    if (bpf_event->socket_cookie != 0) {
-        /* Legacy: lookup in flow_cache */
-        event->flow_info = flow_cache_lookup(&ctx->flow_cache,
-                                              bpf_event->socket_cookie);
-        if (event->flow_info == NULL) {
-            /*
-             * Cookie exists but flow_info not found - likely timing race
-             * where SSL event arrived before XDP event populated the cache.
-             * Mark for retry by worker's deferred queue.
-             */
-            event->needs_cookie_retry = true;
-        }
-        if (g_config.debug_mode) {
-            fprintf(stderr, "[DEBUG] SSL event cookie=%llu flow_info=%s retry=%s\n",
-                    (unsigned long long)bpf_event->socket_cookie,
-                    event->flow_info ? "FOUND" : "NOT_FOUND",
-                    event->needs_cookie_retry ? "YES" : "NO");
-        }
-    } else {
-        event->flow_info = NULL;
-        if (g_config.debug_mode) {
-            fprintf(stderr, "[DEBUG] SSL event has NO cookie (ssl_ctx=%llx)\n",
-                    (unsigned long long)bpf_event->ssl_ctx);
-        }
-    }
-
     /*
      * === Shared Pool: Dual-Index Correlation ===
      *
-     * SSL events always have (pid, ssl_ctx). Use shadow_index as fallback
-     * when cookie is unavailable or cookie_index lookup fails.
+     * Do flow lookup FIRST to determine proper routing.
+     * If flow exists, route to its home_worker_id for cache locality.
+     * This prevents misrouted events caused by cookie vs hash routing mismatch.
      *
      * Flow lifecycle:
      * 1. First SSL event (cookie=0): create via shadow_index
@@ -188,6 +130,66 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
             fprintf(stderr, "[DEBUG] SSL: %s lookup → flow_id=%u\n",
                     path_name, flow_ctx->self_id);
         }
+    }
+
+    /*
+     * Determine worker ID for routing.
+     *
+     * Cache locality strategy:
+     * - If flow exists and has a home_worker_id, route to that worker
+     * - Otherwise, use hash-based routing (which will claim the flow)
+     *
+     * This ensures all events for an existing flow go to the same worker,
+     * which is critical for nghttp2 session thread safety.
+     */
+    int worker_id;
+    if (flow_ctx) {
+        uint32_t home = atomic_load(&flow_ctx->home_worker_id);
+        if (home != WORKER_ID_NONE && home < (uint32_t)ctx->num_workers) {
+            /* Route to flow's home worker for cache locality */
+            worker_id = (int)home;
+        } else {
+            /* Flow exists but unclaimed - use hash routing (worker will claim) */
+            worker_id = get_worker_id_ex(bpf_event->socket_cookie,
+                                          bpf_event->pid, bpf_event->ssl_ctx,
+                                          ctx->num_workers);
+        }
+    } else {
+        /* No flow context - use hash routing */
+        worker_id = get_worker_id_ex(bpf_event->socket_cookie,
+                                      bpf_event->pid, bpf_event->ssl_ctx,
+                                      ctx->num_workers);
+    }
+
+    worker_ctx_t *worker = &ctx->workers[worker_id];
+
+    /* Allocate event from worker's pool */
+    worker_event_t *event = pool_alloc(&worker->event_pool);
+    if (!event) {
+        /* Pool empty - drop event */
+        atomic_fetch_add(&ctx->events_dropped, 1);
+        atomic_fetch_add(&worker->events_dropped, 1);
+        return -1;
+    }
+
+    /* Copy BPF event data */
+    event->timestamp_ns = bpf_event->timestamp_ns;
+    event->delta_ns = bpf_event->delta_ns;
+    event->ssl_ctx = bpf_event->ssl_ctx;
+    event->socket_cookie = bpf_event->socket_cookie;
+    event->pid = bpf_event->pid;
+    event->tid = bpf_event->tid;
+    event->uid = bpf_event->uid;
+    event->event_type = bpf_event->event_type;
+    event->buf_filled = bpf_event->buf_filled;
+    memcpy(event->comm, bpf_event->comm, TASK_COMM_LEN);
+
+    /* Pre-compute routing info */
+    event->worker_id = worker_id;
+    event->flow_hash = flow_hash(bpf_event->pid, bpf_event->ssl_ctx);
+
+    /* Flow context already looked up above - continue with existing logic */
+    if (flow_ctx && lookup_path != FLOW_PATH_CREATED) {
 
         /*
          * Flow exists. If this event has a cookie but the flow doesn't,
@@ -231,6 +233,13 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
     /* Populate Shared Pool correlation fields for worker */
     event->flow_id = flow_ctx ? flow_ctx->self_id : FLOW_ID_INVALID;
     event->flow_ctx = flow_ctx;  /* Worker will validate/resolve this */
+
+    /*
+     * Set retry flag if we have a cookie but XDP data hasn't arrived yet.
+     * Worker's deferred queue can retry later when XDP event populates the flow.
+     */
+    event->needs_cookie_retry = (bpf_event->socket_cookie != 0) &&
+                                 (!flow_ctx || !(flow_ctx->flags & FLOW_FLAG_HAS_XDP));
 
     /* Copy payload */
     event->data_len = (bpf_event->buf_filled > 0) ?
@@ -354,14 +363,8 @@ int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
     atomic_store(&ctx->events_dropped, 0);
     atomic_store(&ctx->running, false);
 
-    /* Initialize legacy XDP flow cache for correlation */
-    if (flow_cache_init(&ctx->flow_cache, FLOW_CACHE_SIZE) != 0) {
-        return -1;
-    }
-
-    /* Initialize new Shared Pool flow manager */
+    /* Initialize Shared Pool flow manager */
     if (flow_manager_init(&ctx->flow_mgr) != 0) {
-        flow_cache_cleanup(&ctx->flow_cache);
         return -1;
     }
 
@@ -382,11 +385,8 @@ void dispatcher_cleanup(dispatcher_ctx_t *ctx) {
         return;
     }
 
-    /* Cleanup new Shared Pool flow manager */
+    /* Cleanup Shared Pool flow manager */
     flow_manager_cleanup(&ctx->flow_mgr);
-
-    /* Cleanup legacy XDP flow cache */
-    flow_cache_cleanup(&ctx->flow_cache);
 
     g_dispatcher = NULL;
     ctx->handler = NULL;
@@ -439,26 +439,6 @@ void dispatcher_cleanup_pid(dispatcher_ctx_t *ctx, uint32_t pid) {
             h2_connection_local_t *conn = &state->h2_connections[j];
             if (conn->active && conn->pid == pid) {
                 worker_cleanup_h2_connection(state, conn);
-            }
-        }
-
-        /* Cleanup pending bodies for this PID */
-        worker_cleanup_pending_bodies_pid(state, pid);
-
-        /* Cleanup ALPN cache entries for this PID */
-        for (int j = 0; j < MAX_ALPN_CACHE_PER_WORKER; j++) {
-            if (state->alpn_cache[j].pid == pid) {
-                state->alpn_cache[j].pid = 0;
-                state->alpn_cache[j].ssl_ctx = 0;
-                state->alpn_cache[j].alpn_proto[0] = '\0';
-            }
-        }
-
-        /* Cleanup HTTP/1 request cache for this PID */
-        for (int j = 0; j < MAX_H1_REQUEST_CACHE_PER_WORKER; j++) {
-            if (state->h1_request_cache[j].pid == pid) {
-                state->h1_request_cache[j].pid = 0;
-                state->h1_request_cache[j].ssl_ctx = 0;
             }
         }
     }
@@ -516,15 +496,11 @@ void *dispatcher_thread_main(void *arg) {
         /* Flow janitor: evict stale flows periodically */
         uint64_t now = get_time_ns();
         if (now - last_janitor_run > FLOW_JANITOR_INTERVAL_NS) {
-            /* Evict from legacy flow cache */
-            int evicted_legacy = flow_cache_evict_stale(&ctx->flow_cache, now);
-
-            /* Evict from new Shared Pool */
+            /* Evict stale flows from Shared Pool */
             int evicted_pool = flow_evict_stale(&ctx->flow_mgr, now);
 
-            if ((evicted_legacy > 0 || evicted_pool > 0) && g_config.debug_mode) {
-                fprintf(stderr, "[Janitor] Evicted %d legacy + %d pool flows\n",
-                        evicted_legacy, evicted_pool);
+            if (evicted_pool > 0 && g_config.debug_mode) {
+                fprintf(stderr, "[Janitor] Evicted %d flows\n", evicted_pool);
             }
             last_janitor_run = now;
         }
@@ -710,10 +686,7 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
              */
             atomic_fetch_add(&dispatcher->xdp_flows_terminated, 1);
 
-            /* Remove from legacy flow cache */
-            flow_cache_terminate(&dispatcher->flow_cache, packet_evt->socket_cookie);
-
-            /* Also terminate from Shared Pool if present */
+            /* Terminate flow from Shared Pool if present */
             flow_context_t *flow_ctx = flow_lookup(&dispatcher->flow_mgr,
                                                     packet_evt->socket_cookie,
                                                     0, 0);
@@ -744,13 +717,8 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
              */
             atomic_fetch_add(&dispatcher->xdp_flows_discovered, 1);
 
-            /* Cache flow info in legacy flow cache for correlation */
-            int upsert_result = flow_cache_upsert(&dispatcher->flow_cache,
-                                                   packet_evt->socket_cookie,
-                                                   packet_evt);
-
             /*
-             * Also populate Shared Pool (new architecture)
+             * Populate Shared Pool with XDP metadata.
              * XDP events only have socket_cookie, no pid/ssl_ctx yet.
              * We create context with cookie only, SSL events will fill pid/ssl_ctx.
              */
@@ -764,12 +732,11 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
             }
 
             if (should_debug) {
-                fprintf(stderr, "[DEBUG] XDP FLOW_NEW: cookie=%llu sport=%u dport=%u cat=%s upsert=%d pool=%s\n",
+                fprintf(stderr, "[DEBUG] XDP FLOW_NEW: cookie=%llu sport=%u dport=%u cat=%s pool=%s\n",
                         (unsigned long long)packet_evt->socket_cookie,
                         ntohs(packet_evt->flow.sport),
                         ntohs(packet_evt->flow.dport),
                         xdp_category_name(packet_evt->category),
-                        upsert_result,
                         flow_ctx ? "OK" : "FULL");
                 char src_ip[16], dst_ip[16];
                 format_ipv4(packet_evt->flow.saddr, src_ip, sizeof(src_ip));
