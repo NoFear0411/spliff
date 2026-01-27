@@ -25,6 +25,12 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | HTTP/1.1 | llhttp  | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
 | HTTP/2   | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
 
+### Embedded BPF Skeleton (v0.9.6)
+- **Single Binary Deployment**: BPF bytecode embedded directly via `bpftool gen skeleton`
+- **No External Files**: No separate .bpf.o file needed - binary is self-contained
+- **Strip-Safe**: Debug symbols can be removed without breaking BPF loading
+- **Tamper-Resistant**: Embedded bytecode cannot be modified separately
+
 ### Modular Protocol Architecture (v0.9.5+)
 - **Unified Protocol Entry Points**: `http1_try_process_event()` and `http2_try_process_event()`
 - **Vectorscan Protocol Detection**: O(n) NFA-based pattern matching for HTTP identification
@@ -91,46 +97,36 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 
 | Library | Purpose | Package (Fedora) | Package (Debian/Ubuntu) |
 |---------|---------|------------------|-------------------------|
-| libbpf | eBPF loader | libbpf-devel | libbpf-dev |
+| libbpf | eBPF CO-RE loader | libbpf-devel | libbpf-dev |
 | libelf | ELF parsing | elfutils-libelf-devel | libelf-dev |
-| zlib | gzip decompression | zlib-devel | zlib1g-dev |
+| zlib-ng | SIMD gzip decompression | zlib-ng-devel | (build from source) |
 | llhttp | HTTP/1.1 parsing | llhttp-devel | libllhttp-dev |
 | nghttp2 | HTTP/2 parsing | nghttp2-devel | libnghttp2-dev |
 | ck | Lock-free data structures | ck-devel | libck-dev |
 | libxdp | XDP program loading | libxdp-devel | libxdp-dev |
 | liburcu | Read-Copy-Update | userspace-rcu-devel | liburcu-dev |
 | jemalloc | Memory allocator | jemalloc-devel | libjemalloc-dev |
-| pcre2 | Pattern matching | pcre2-devel | libpcre2-dev |
+| vectorscan | O(n) protocol detection | vectorscan-devel | (build from source) |
+| pcre2 | Pattern matching fallback | pcre2-devel | libpcre2-dev |
 | zstd | zstd decompression | libzstd-devel | libzstd-dev |
 | brotli | brotli decompression | brotli-devel | libbrotli-dev |
 
-#### Optional Performance Libraries (v0.9.5+)
-
-| Library | Purpose | Package (Fedora) | Package (Debian/Ubuntu) |
-|---------|---------|------------------|-------------------------|
-| vectorscan | O(n) protocol detection | vectorscan-devel | (build from source) |
-| zlib-ng | SIMD-accelerated compression | zlib-ng-devel | zlib1g-ng-dev |
-
 ### Quick Install (Fedora)
 ```bash
-# Required dependencies
-sudo dnf install libbpf-devel elfutils-libelf-devel zlib-devel \
+sudo dnf install libbpf-devel elfutils-libelf-devel zlib-ng-devel \
     llhttp-devel nghttp2-devel ck-devel libxdp-devel userspace-rcu-devel \
-    jemalloc-devel pcre2-devel libzstd-devel brotli-devel clang
-
-# Optional: Performance libraries (v0.9.5+)
-sudo dnf install vectorscan-devel zlib-ng-devel
+    jemalloc-devel vectorscan-devel pcre2-devel libzstd-devel brotli-devel clang
 ```
 
 ### Quick Install (Debian/Ubuntu)
 ```bash
-# Required dependencies
 sudo apt install libbpf-dev libelf-dev zlib1g-dev \
     libllhttp-dev libnghttp2-dev libck-dev libxdp-dev liburcu-dev \
     libjemalloc-dev libpcre2-dev libzstd-dev libbrotli-dev clang
 
-# Optional: zlib-ng for SIMD compression (vectorscan requires building from source)
-sudo apt install zlib1g-ng-dev
+# vectorscan and zlib-ng: check your distro repos first, otherwise build from source:
+# - https://github.com/VectorCamp/vectorscan
+# - https://github.com/zlib-ng/zlib-ng
 ```
 
 ## Installation
@@ -213,8 +209,9 @@ sudo ./spliff
 
 # Filter by process
 sudo ./spliff -p 1234                    # By PID
-sudo ./spliff --comm curl                # By process name
-sudo ./spliff --ppid 1234                # By parent PID (includes descendants)
+sudo ./spliff -p 1234,5678               # Multiple PIDs
+sudo ./spliff --comm curl                # By process name or path
+sudo ./spliff --ppid 1234                # By parent PID (captures all children)
 
 # Filter by SSL library
 sudo ./spliff --openssl                  # OpenSSL only
@@ -222,62 +219,69 @@ sudo ./spliff --gnutls                   # GnuTLS only
 sudo ./spliff --nss                      # NSS only
 
 # Output options
-sudo ./spliff -c                         # Compact mode (one line per request)
-sudo ./spliff -b                         # Show response bodies
+sudo ./spliff -b                         # Show request/response bodies
 sudo ./spliff -x                         # Hexdump body with file signatures
-sudo ./spliff -l                         # Show latency
-sudo ./spliff -H                         # Show TLS handshakes
-sudo ./spliff -C                         # Disable colors
+sudo ./spliff -c                         # Compact mode (hide headers)
+sudo ./spliff -l                         # Show latency (SSL operation time)
+sudo ./spliff -H                         # Show TLS handshake events
+sudo ./spliff -C                         # Disable colored output
 
 # Threading options
 sudo ./spliff -t 4                       # Use 4 worker threads
-sudo ./spliff --no-threading             # Single-threaded mode
+sudo ./spliff -t 0                       # Auto (default): max(1, CPUs-3), capped at 16
 
 # Browser-specific (IPC filtering is automatic)
 sudo ./spliff --comm firefox             # Firefox traffic
-sudo ./spliff --comm chrome              # Chrome traffic
+sudo ./spliff --nss --ppid 1234          # NSS traffic from Firefox children
 
 # Debugging
-sudo ./spliff -d                         # Debug mode (raw events)
-sudo ./spliff --show-libs                # Show discovered SSL libraries
+sudo ./spliff -d                         # Debug mode (verbose output)
+sudo ./spliff --show-libs                # Show all discovered SSL libraries
 ```
 
 ## Example Output
 
-### HTTP/2 Request/Response
+### HTTP/2 Request/Response (with XDP Correlation)
 ```
-15:11:59.346 → GET https://ifconfig.io/ ALPN:h2 curl (403410) [63.1us] [stream 1]
+15:11:59.346 → GET https://api.example.com/users ALPN:h2 192.0.2.10:48372 → 198.51.100.25:443 curl (403410) [63.1us] [stream 1]
   user-agent: curl/8.15.0
-  accept: */*
+  accept: application/json
 
-15:11:59.639 ← 200 https://ifconfig.io/ ALPN:h2 text/plain; charset=utf-8 (15 bytes) curl (403410) [294.29ms] [stream 1]
-  date: Mon, 12 Jan 2026 11:11:59 GMT
-  content-type: text/plain; charset=utf-8
-  content-length: 15
+15:11:59.639 ← 200 https://api.example.com/users ALPN:h2 application/json (1247 bytes) 192.0.2.10:48372 → 198.51.100.25:443 curl (403410) [294.29ms] [stream 1]
+  date: Mon, 27 Jan 2026 11:11:59 GMT
+  content-type: application/json
+  content-length: 1247
 ─── Body ───
-203.0.113.42
+{"users":[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]}
 ────────────
 ```
 
-### HTTP/1.1 Request/Response
+### HTTP/1.1 Request/Response (with XDP Correlation)
 ```
-15:12:05.592 → GET https://ifconfig.io/ ALPN:http/1.1 curl (403422) [31.9us]
-  Host: ifconfig.io
+15:12:05.592 → GET https://httpbin.org/get ALPN:http/1.1 192.0.2.10:52418 → 203.0.113.50:443 curl (403422) [31.9us]
+  Host: httpbin.org
   User-Agent: curl/8.15.0
   Accept: */*
 
-15:12:05.883 ← 200 https://ifconfig.io/ ALPN:http/1.1 text/plain; charset=utf-8 (15 bytes) curl (403422) [462.5us]
-  Date: Mon, 12 Jan 2026 11:12:05 GMT
-  Content-Type: text/plain; charset=utf-8
-  Content-Length: 15
-─── Body (15 bytes) ───
-203.0.113.42
+15:12:05.883 ← 200 https://httpbin.org/get ALPN:http/1.1 application/json (298 bytes) 192.0.2.10:52418 → 203.0.113.50:443 curl (403422) [291.3ms]
+  Date: Mon, 27 Jan 2026 11:12:05 GMT
+  Content-Type: application/json
+  Content-Length: 298
+─── Body (298 bytes) ───
+{"args":{},"headers":{"Accept":"*/*","Host":"httpbin.org"},"origin":"192.0.2.10","url":"https://httpbin.org/get"}
 ────────────
 ```
 
 ### TLS Handshake (with -H flag)
 ```
-15:12:05.100 🔒 TLS handshake complete [15.00ms] curl (403422)
+15:12:05.100 🔒 TLS handshake 192.0.2.10:52418 → 203.0.113.50:443 [12.45ms] curl (403422)
+```
+
+### XDP Attachment Status (startup)
+```
+[XDP] Attached to 2 interfaces (native: 1, SKB fallback: 1)
+  ✓ eth0 (native mode)
+  ✓ wlan0 (SKB mode - driver doesn't support native)
 ```
 
 ## Architecture
@@ -587,62 +591,69 @@ connection from which process.
 
 ```
 spliff/
-├── CMakeLists.txt              # CMake build configuration
+├── CMakeLists.txt              # CMake build configuration (C23, LTO, packaging)
 ├── Makefile                    # Convenience wrapper for CMake
 ├── Doxyfile                    # Doxygen documentation config
 ├── CHANGELOG.md                # Version history
+├── ISSUES.md                   # Known issues tracker
 ├── LICENSE                     # GPL-3.0 license
 ├── README.md                   # This file
-├── docs/                       # Generated documentation (make docs)
-│   ├── html/                   # HTML API documentation
-│   └── man/                    # Man pages
+├── docs/
+│   ├── CODE-MAP.md             # Comprehensive architecture reference
+│   └── EDR_XDR_ROADMAP.md      # Long-term EDR/XDR vision
 ├── src/
-│   ├── main.c                  # Entry point, CLI, orchestration (v0.9.5: protocol routing only)
+│   ├── main.c                  # Entry point, CLI, orchestration
 │   ├── include/
-│   │   └── spliff.h            # Public header, shared types, version info
+│   │   └── spliff.h            # Public header, shared types, version
 │   ├── bpf/
-│   │   ├── spliff.bpf.c        # eBPF programs (XDP, sock_ops, uprobes, tracepoints)
-│   │   ├── bpf_loader.c        # BPF program loader, XDP attach, library discovery
+│   │   ├── spliff.bpf.c        # eBPF programs (XDP, sock_ops, uprobes)
+│   │   ├── bpf_loader.c        # BPF loader, XDP attach, library discovery
 │   │   ├── bpf_loader.h        # BPF loader API
 │   │   ├── probe_handler.c     # Event filtering and callback dispatch
-│   │   ├── binary_scanner.c    # BoringSSL offset detection for stripped binaries
-│   │   ├── boringssl_offsets.h # Known BoringSSL function offsets by build ID
-│   │   └── vmlinux.h           # Kernel BTF type definitions
+│   │   ├── probe_handler.h     # Probe handler API
+│   │   ├── binary_scanner.c    # BoringSSL offset detection
+│   │   ├── binary_scanner.h    # Binary scanner API
+│   │   ├── boringssl_offsets.h # Known BoringSSL offsets by build ID
+│   │   └── vmlinux.h           # Kernel BTF type definitions (CO-RE)
 │   ├── protocol/
-│   │   ├── detector.c          # Vectorscan protocol detection (v0.9.5+)
+│   │   ├── detector.c          # Vectorscan protocol detection
 │   │   ├── detector.h          # Protocol detector API
-│   │   ├── http1.c             # HTTP/1.1 parser + unified entry point
-│   │   ├── http1.h             # HTTP/1.1 API + http1_try_process_event()
-│   │   ├── http2.c             # HTTP/2 parser + unified entry point
-│   │   ├── http2.h             # HTTP/2 API + http2_try_process_event()
-│   │   └── websocket.c         # WebSocket frame parser (planned)
+│   │   ├── http1.c             # HTTP/1.1 parser (llhttp)
+│   │   ├── http1.h             # HTTP/1.1 API
+│   │   ├── http2.c             # HTTP/2 parser (nghttp2)
+│   │   ├── http2.h             # HTTP/2 API
+│   │   ├── websocket.c         # WebSocket frame parser
+│   │   └── websocket.h         # WebSocket API
 │   ├── content/
-│   │   ├── decompressor.c      # gzip/brotli/zstd/deflate decompression
-│   │   └── signatures.c        # File magic detection (50+ formats)
+│   │   ├── decompressor.c      # gzip/brotli/zstd decompression
+│   │   ├── decompressor.h      # Decompressor API
+│   │   ├── signatures.c        # File magic detection (50+ formats)
+│   │   └── signatures.h        # Signatures API
 │   ├── output/
-│   │   └── display.c           # Terminal output formatting, colors
-│   ├── correlation/            # XDP-SSL correlation (v0.8.0+)
-│   │   ├── flow_context.c      # Per-flow context management, stream pools
-│   │   └── flow_context.h      # flow_context_t, flow_transaction_t types
-│   ├── threading/              # Multi-threaded event processing
-│   │   ├── threading.h         # Threading API, structures, constants
+│   │   ├── display.c           # Terminal output, colors
+│   │   └── display.h           # Display API
+│   ├── correlation/
+│   │   ├── flow_context.c      # Shared pool, dual-index lookup
+│   │   └── flow_context.h      # flow_context_t, pool types
+│   ├── threading/
+│   │   ├── threading.h         # Threading API, structures
 │   │   ├── dispatcher.c        # BPF ring consumer, worker routing
-│   │   ├── worker.c            # Worker thread with adaptive wait (spin/yield/sleep)
+│   │   ├── worker.c            # Worker thread main loop
 │   │   ├── output.c            # Output serialization thread
 │   │   ├── state.c             # Per-worker state management
 │   │   ├── pool.c              # Lock-free object pool
 │   │   └── manager.c           # Thread lifecycle management
 │   └── util/
-│       └── safe_str.c          # Safe string operations
-├── tests/
-│   ├── test_http1.c            # HTTP/1.1 parser tests
-│   └── test_http2.c            # HTTP/2 parser tests
-└── docs/
-    ├── SHARED_POOL_ARCHITECTURE.md         # Shared Pool implementation plan
-    ├── HTTP3_QUIC_IMPLEMENTATION_PLAN.md   # HTTP/3 planning
-    ├── XDP_INTEGRATION_PLAN.md             # XDP planning
-    └── EDR_XDR_ROADMAP.md                  # EDR/XDR roadmap
+│       ├── safe_str.c          # Safe string operations
+│       └── safe_str.h          # String API
+└── tests/
+    ├── test_common.c           # Shared test utilities
+    ├── test_http1.c            # HTTP/1.1 parser tests
+    ├── test_http2.c            # HTTP/2 parser tests
+    └── test_xdp.c              # XDP structure tests
 ```
+
+Build output goes to `build/` directory (gitignored). Run `make docs` to generate Doxygen HTML documentation in `build/docs/html/`.
 
 ## Roadmap
 
@@ -652,12 +663,13 @@ spliff/
 | v0.6.x | Multi-threaded event processing | ✅ Complete |
 | v0.7.x | BPF-level IPC filtering + Unified display | ✅ Complete |
 | v0.8.x | XDP packet-level flow tracking + sock_ops | ✅ Complete |
-| v0.9.x | Dynamic process monitoring + Shared Pool + Modular Protocol Architecture + Embedded BPF | ✅ **Current (v0.9.6)** |
-| v0.10.0 | BPF/XDP improvements + IPv6 correlation + Ring buffer expansion | 🔄 Next |
+| v0.9.0-0.9.4 | Dynamic process monitoring + Shared Pool Architecture | ✅ Complete |
+| v0.9.5 | Modular Protocol Architecture + Vectorscan detection | ✅ Complete |
+| v0.9.6 | Embedded BPF Skeleton + XDP-SSL correlation fix + Thread cleanup | ✅ **Current** |
+| v0.10.0 | Content-based protocol detection + Enhanced statistics | 🔄 Next |
 | v0.11.0 | HTTP/3 + QUIC protocol support (ngtcp2/nghttp3) | Planned |
-| v1.0.0 | WebSocket support + Enhanced display | Planned |
-| v1.1.0 | EDR agent mode + Event streaming (NATS/Kafka) | Planned |
-| v1.2.0 | Behavioral analysis + Threat detection | Planned |
+| v1.0.0 | WebSocket support + Production hardening | Planned |
+| v1.1.0+ | EDR agent mode + Event streaming | Planned |
 
 ### Near-Term Goals (v0.10.x - v1.0)
 - **BPF/XDP Improvements**: IPv6 correlation, expanded ring buffers, atomic state machine
@@ -676,22 +688,17 @@ See [docs/](docs/) for detailed implementation plans.
 
 ## Known Limitations
 
-- **⚠️ Chrome/Chromium Support (Experimental)**: Support for Chrome, Chromium, Brave, browsers is **experimental and may be flaky**. These browsers use statically-linked BoringSSL with stripped debug symbols, making function offset detection unreliable:
+- **⚠️ Chrome/Chromium Support (Experimental)**: Browsers using statically-linked BoringSSL are **experimental**:
   - Offsets vary between browser versions, builds, and distributions
-  - No stable ABI - Google frequently changes internal structures
-  - Detection relies on heuristic binary scanning that may fail or cause crashes
+  - Detection relies on heuristic binary scanning that may fail
   - Recommended: Use Firefox (NSS) for reliable browser traffic capture
-  - If Chrome capture is needed, expect occasional missed traffic or instability
 
-- **First Request Timing**: Initial HTTP request from each process may lack XDP correlation data. Subsequent requests correlate correctly. Under high traffic, some request/response pairs may miss correlation due to race between SSL event and sockops `flow_cookie_map` population.
-- **HTTP/2 Mid-Stream Capture**: Joining existing HTTP/2 connections may cause HPACK decode errors for first few responses (dynamic table not synchronized). Recovery is automatic; corrupted connections set `hpack_corrupted` flag per RFC 7540.
-- **HTTP/2 Stream Limits**: Each flow supports up to 64 concurrent HTTP/2 streams. Streams exceeding this limit are dropped. Ghost streams (inactive >10s) are automatically reaped.
-- **Multiple TLS Handshakes**: Some clients (e.g., curl) perform multiple TLS connections (initial + session resumption). Both handshakes are displayed when using `-H`.
-- **NSS Library Detection**: Firefox and other NSS applications may use multiple NSPR layers. BPF-level filtering ensures only SSL traffic is captured.
-- **Plain HTTP Capture**: Currently only captures TLS-encrypted traffic. Plain HTTP via XDP requires PCRE2-JIT classification (planned for v0.10.0).
+- **Protocol Detection Timing**: ALPN-based protocol detection may miss if the ALPN event arrives after data events. Content-based fallback detection is planned for v0.10.0.
+- **HTTP/2 Mid-Stream Capture**: Joining existing HTTP/2 connections may cause HPACK decode errors for first few responses. Recovery is automatic via `hpack_corrupted` flag per RFC 7540.
+- **HTTP/2 Stream Limits**: 64 concurrent streams per flow. Ghost streams (inactive >10s) are automatically reaped.
+- **XDP Native Mode**: Some network drivers don't support XDP native mode; spliff automatically falls back to SKB mode with a status message.
+- **Plain HTTP Capture**: Currently only captures TLS-encrypted traffic. Plain HTTP capture planned for future release.
 - **QUIC/HTTP/3**: Not yet supported (planned for v0.11.0)
-- **IPv6 XDP Correlation**: XDP flow tracking uses XOR-hashed IPv6 addresses; socket cookie correlation is optimized for IPv4.
-- **XDP Native Mode**: Some network drivers don't support XDP native mode; spliff automatically falls back to SKB mode.
 - **Kernel Requirements**: Requires Linux 5.x+ with BTF support (`CONFIG_DEBUG_INFO_BTF=y`)
 
 ## Troubleshooting
@@ -716,8 +723,18 @@ ls /sys/kernel/btf/vmlinux
 # Check if SSL libraries are found
 sudo ./spliff --show-libs
 
-# Try specific library flag
-sudo ./spliff --openssl -d
+# Try debug mode to see raw events
+sudo ./spliff -d
+```
+
+### No XDP correlation (missing IP addresses in output)
+```bash
+# Check XDP attachment status at startup
+sudo ./spliff -d 2>&1 | grep -i xdp
+
+# XDP requires CAP_NET_ADMIN - ensure running as root
+# Some drivers don't support XDP native mode, but SKB fallback should work
+# If XDP fails completely, traffic still works but without IP:port correlation
 ```
 
 ### Firefox shows no traffic
@@ -726,18 +743,22 @@ sudo ./spliff --openssl -d
 sudo ./spliff --comm firefox
 ```
 
-### High CPU usage
+### High memory usage
 ```bash
-# Use single-threaded mode for low-traffic scenarios
-sudo ./spliff --no-threading
-
-# Or limit worker threads
-sudo ./spliff -t 2
+# Flow pool is fixed at 8192 slots (pre-allocated at startup)
+# Check pool utilization in debug mode
+sudo ./spliff -d 2>&1 | grep -i pool
 ```
 
 ## Contributing
 
-Contributions are welcome! Please see the [CHANGELOG.md](CHANGELOG.md) for recent changes and coding style.
+Contributions are welcome! Before contributing:
+
+1. Review [docs/CODE-MAP.md](docs/CODE-MAP.md) for comprehensive architecture documentation
+2. Check [CHANGELOG.md](CHANGELOG.md) for recent changes and version history
+3. See [docs/EDR_XDR_ROADMAP.md](docs/EDR_XDR_ROADMAP.md) for long-term vision
+
+The codebase follows C23 standards with strict compiler warnings (`-Wall -Wextra -Wpedantic`).
 
 ## License
 
@@ -755,17 +776,16 @@ BPF code (`src/bpf/spliff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel r
 ### Protocol Parsing
 - [llhttp](https://github.com/nodejs/llhttp) - HTTP/1.1 parser from Node.js
 - [nghttp2](https://github.com/nghttp2/nghttp2) - HTTP/2 library with HPACK compression
-- [vectorscan](https://github.com/VectorCamp/vectorscan) - High-performance regex/pattern matching (Hyperscan fork)
-- [PCRE2](https://github.com/PCRE2Project/pcre2) - Perl Compatible Regular Expressions (fallback)
+- [vectorscan](https://github.com/VectorCamp/vectorscan) - O(n) pattern matching (Hyperscan fork)
+- [PCRE2](https://github.com/PCRE2Project/pcre2) - Perl Compatible Regular Expressions
 
 ### Concurrency & Memory
-- [Concurrency Kit](https://github.com/concurrencykit/ck) - Lock-free data structures (SPSC rings, spinlocks)
-- [liburcu](https://liburcu.org/) - Userspace Read-Copy-Update (optional)
-- [jemalloc](https://github.com/jemalloc/jemalloc) - Memory allocator (optional)
+- [Concurrency Kit](https://github.com/concurrencykit/ck) - Lock-free data structures (SPSC rings)
+- [liburcu](https://liburcu.org/) - Userspace Read-Copy-Update
+- [jemalloc](https://github.com/jemalloc/jemalloc) - Memory allocator
 
 ### Compression
-- [zlib](https://zlib.net/) - gzip/deflate decompression
-- [zlib-ng](https://github.com/zlib-ng/zlib-ng) - SIMD-optimized zlib replacement (optional)
+- [zlib-ng](https://github.com/zlib-ng/zlib-ng) - SIMD-optimized gzip/deflate decompression
 - [zstd](https://github.com/facebook/zstd) - Zstandard compression by Facebook
 - [brotli](https://github.com/google/brotli) - Brotli compression by Google
 
@@ -775,10 +795,8 @@ BPF code (`src/bpf/spliff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel r
 ### Technical Resources
 - [Linux kernel BPF documentation](https://docs.kernel.org/bpf/) - Official BPF docs
 - [XDP Tutorial](https://github.com/xdp-project/xdp-tutorial) - Hands-on XDP programming
-- [BPF Performance Tools](https://www.brendangregg.com/bpf-performance-tools-book.html) by Brendan Gregg
 - [RFC 7540](https://datatracker.ietf.org/doc/html/rfc7540) - HTTP/2 specification
 - [RFC 7541](https://datatracker.ietf.org/doc/html/rfc7541) - HPACK header compression
-- [RFC 8446](https://datatracker.ietf.org/doc/html/rfc8446) - TLS 1.3 specification
 
 ### Development
 - [Claude](https://www.anthropic.com/claude) by Anthropic - AI assistant that wrote this codebase
