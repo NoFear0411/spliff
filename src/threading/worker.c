@@ -258,27 +258,6 @@ static int process_deferred_batch(worker_ctx_t *ctx) {
  * @{
  */
 
-/**
- * @brief Initialize worker context
- *
- * Allocates and initializes all resources for a worker thread:
- * - eventfd for wakeup signaling
- * - epoll for efficient blocking
- * - Input ring buffer (dispatcher -> worker)
- * - Output ring buffer (worker -> output thread)
- * - Event object pool
- * - Output message object pool
- * - Per-worker protocol state
- * - Deferred event queue (cookie retry)
- *
- * @par Memory Alignment:
- * Ring buffers are 64-byte aligned for cache efficiency.
- *
- * @param[out] ctx       Worker context to initialize
- * @param[in]  worker_id Worker index (0 to num_workers-1)
- *
- * @return 0 on success, -1 on failure (partial cleanup performed)
- */
 int worker_init(worker_ctx_t *ctx, int worker_id) {
     if (!ctx) {
         return -1;
@@ -742,16 +721,6 @@ static void worker_loop(worker_ctx_t *ctx) {
     }
 }
 
-/**
- * @brief Worker thread entry point
- *
- * Thread entry point passed to pthread_create(). Sets up thread-local
- * state, runs the main loop, and drains remaining events on shutdown.
- *
- * @param[in] arg Pointer to worker_ctx_t
- *
- * @return NULL
- */
 void *worker_thread_main(void *arg) {
     worker_ctx_t *ctx = (worker_ctx_t *)arg;
     if (!ctx) {

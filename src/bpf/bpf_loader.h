@@ -35,10 +35,12 @@
 // XDP Types - Forward Declarations
 // =============================================================================
 
-/* XDP error information for diagnostics */
+/**
+ * @brief XDP error information for diagnostics
+ */
 typedef struct {
-    int code;                /* Error code (-ENOENT, -EACCES, etc.) */
-    char message[256];       /* Human-readable error message */
+    int code;                /**< Error code (-ENOENT, -EACCES, etc.) */
+    char message[256];       /**< Human-readable error message */
 } xdp_error_t;
 
 /* XDP event callback function type
@@ -61,42 +63,47 @@ typedef enum {
     XDP_MODE_OFFLOAD,    /* Hardware offload (requires NIC support) */
 } xdp_mode_t;
 
-/* XDP interface attachment state */
+/**
+ * @brief XDP interface attachment state
+ */
 typedef struct {
-    char name[32];       /* Interface name (e.g., "eth0") */
-    int ifindex;         /* Interface index */
-    int prog_fd;         /* XDP program fd attached to this interface */
-    xdp_mode_t mode;     /* Attachment mode used */
-    bool attached;       /* Whether XDP is attached */
+    char name[32];       /**< Interface name (e.g., "eth0") */
+    int ifindex;         /**< Interface index */
+    int prog_fd;         /**< XDP program fd attached to this interface */
+    xdp_mode_t mode;     /**< Attachment mode used */
+    bool attached;       /**< Whether XDP is attached */
 } xdp_interface_t;
 
-/* XDP loader state */
+/**
+ * @brief XDP loader state and resource management
+ */
 typedef struct {
-    struct bpf_program *xdp_prog;           /* XDP program from BPF object */
-    xdp_interface_t interfaces[MAX_XDP_INTERFACES];
-    int interface_count;                     /* Number of attached interfaces */
-    struct ring_buffer *xdp_rb;              /* XDP ring buffer (xdp_events) */
-    xdp_event_callback_t event_callback;    /* User event callback */
-    void *callback_ctx;                      /* User context for callback */
-    int xdp_events_fd;                       /* XDP ring buffer map fd */
-    int session_registry_fd;                 /* For userspace policy updates */
-    int flow_states_fd;                      /* For debugging/stats */
-    int xdp_stats_fd;                        /* XDP statistics map fd */
-    int cookie_to_ssl_fd;                   /* Cookie correlation map fd */
-    int flow_cookie_map_fd;                 /* Flow→cookie cache map fd */
-    xdp_error_t last_error;                 /* Last error for diagnostics */
-    bool enabled;                            /* Whether XDP is initialized */
-    /* sock_ops for socket cookie caching */
-    struct bpf_link *sockops_link;          /* sock_ops program link */
-    int cgroup_fd;                          /* Cgroup fd for sock_ops attachment */
+    struct bpf_program *xdp_prog;           /**< XDP program from BPF object */
+    xdp_interface_t interfaces[MAX_XDP_INTERFACES]; /**< Attached network interfaces */
+    int interface_count;                     /**< Number of attached interfaces */
+    struct ring_buffer *xdp_rb;              /**< XDP ring buffer (xdp_events) */
+    xdp_event_callback_t event_callback;    /**< User event callback */
+    void *callback_ctx;                      /**< User context for callback */
+    int xdp_events_fd;                       /**< XDP ring buffer map fd */
+    int session_registry_fd;                 /**< For userspace policy updates */
+    int flow_states_fd;                      /**< For debugging/stats */
+    int xdp_stats_fd;                        /**< XDP statistics map fd */
+    int cookie_to_ssl_fd;                   /**< Cookie correlation map fd */
+    int flow_cookie_map_fd;                 /**< Flow to cookie cache map fd */
+    xdp_error_t last_error;                 /**< Last error for diagnostics */
+    bool enabled;                            /**< Whether XDP is initialized */
+    struct bpf_link *sockops_link;          /**< sock_ops program link for socket cookie caching */
+    int cgroup_fd;                          /**< Cgroup fd for sock_ops attachment */
 } xdp_loader_t;
 
-/* BPF loader state */
+/**
+ * @brief BPF loader state and uprobe management
+ */
 typedef struct {
-    struct bpf_object *obj;
-    struct bpf_link *links[SPLIFF_MAX_LINKS];
-    int link_count;
-    xdp_loader_t xdp;                        /* XDP-specific state */
+    struct bpf_object *obj;                  /**< Loaded BPF object */
+    struct bpf_link *links[SPLIFF_MAX_LINKS]; /**< Attached probe links */
+    int link_count;                          /**< Number of attached probes */
+    xdp_loader_t xdp;                        /**< XDP-specific state */
 } bpf_loader_t;
 
 /* Initialize BPF loader - returns 0 on success, -1 on failure */
@@ -124,63 +131,63 @@ typedef enum {
     LIB_TYPE_COUNT
 } lib_type_t;
 
-/* Discovered library information */
+/**
+ * @brief Discovered SSL library information
+ */
 typedef struct {
-    char path[512];
-    lib_type_t type;
-    bool found;
-    int process_count;  /* Number of processes using this path */
+    char path[512];      /**< Full path to the library */
+    lib_type_t type;     /**< Library type (OpenSSL, GnuTLS, NSS, etc.) */
+    bool found;          /**< Whether this library was found */
+    int process_count;   /**< Number of processes using this path */
 } discovered_lib_t;
 
-/* Library paths for a single type (can have multiple paths) */
+/**
+ * @brief Library paths for a single type (can have multiple paths)
+ */
 typedef struct {
-    char paths[MAX_PATHS_PER_TYPE][512];
-    int path_count;
-    bool found;
+    char paths[MAX_PATHS_PER_TYPE][512]; /**< Array of discovered paths */
+    int path_count;                       /**< Number of paths found */
+    bool found;                           /**< Whether any path was found */
 } lib_paths_t;
 
 /* Maximum BoringSSL binaries to track */
 #define MAX_BORINGSSL_BINARIES 16
 
-/* Discovered BoringSSL binary - EDR-style detection result
+/**
+ * @brief Discovered BoringSSL binary - EDR-style detection result
+ *
  * This struct caches everything needed to attach probes, avoiding repeated lookups.
  * The detection is purely behavioral: any binary with BoringSSL signature and
  * known build ID gets probed, regardless of its name or path.
  */
 typedef struct {
-    char path[512];              /* Full path to binary (from /proc/PID/exe) */
-    char build_id[65];           /* ELF build ID hex string */
-    uint64_t binary_size;        /* Binary size in bytes */
-    int process_count;           /* Number of running processes using this binary */
-    bool offsets_known;          /* Build ID found in offset database */
-    /* Cached offsets from database lookup (avoids repeated lookups) */
-    uint64_t ssl_read_offset;    /* File offset of SSL_read */
-    uint64_t ssl_write_offset;   /* File offset of SSL_write */
-    uint64_t ssl_read_impl_offset;   /* Internal ssl_read_impl (Golden Hook) */
-    uint64_t ssl_write_impl_offset;  /* Internal DoPayloadWrite (Golden Hook) */
-    uint64_t do_payload_read_offset; /* DoPayloadRead - best hook point */
-    uint64_t socket_read_offset;     /* ReadIfReady - async I/O entry */
-    uint64_t on_read_ready_offset;   /* OnReadReady - async I/O completion */
-    const char *version_info;    /* Version string from database (or NULL) */
+    char path[512];              /**< Full path to binary (from /proc/PID/exe) */
+    char build_id[65];           /**< ELF build ID hex string */
+    uint64_t binary_size;        /**< Binary size in bytes */
+    int process_count;           /**< Number of running processes using this binary */
+    bool offsets_known;          /**< Build ID found in offset database */
+    uint64_t ssl_read_offset;    /**< File offset of SSL_read (cached from database) */
+    uint64_t ssl_write_offset;   /**< File offset of SSL_write (cached from database) */
+    uint64_t ssl_read_impl_offset;   /**< Internal ssl_read_impl (Golden Hook) */
+    uint64_t ssl_write_impl_offset;  /**< Internal DoPayloadWrite (Golden Hook) */
+    uint64_t do_payload_read_offset; /**< DoPayloadRead - best hook point */
+    uint64_t socket_read_offset;     /**< ReadIfReady - async I/O entry */
+    uint64_t on_read_ready_offset;   /**< OnReadReady - async I/O completion */
+    const char *version_info;    /**< Version string from database (or NULL) */
 } discovered_boringssl_t;
 
-/* Discovery result - holds multiple library paths per type */
+/**
+ * @brief Discovery result - holds multiple library paths per type
+ */
 typedef struct {
-    /* Quick lookup by type (first path found) - backward compatible */
-    discovered_lib_t libs[LIB_TYPE_COUNT];
-    int count;
-
-    /* Extended: all unique paths per type */
-    lib_paths_t extended[LIB_TYPE_COUNT];
-
-    /* BoringSSL binaries discovered from running processes (EDR-style) */
-    discovered_boringssl_t boringssl[MAX_BORINGSSL_BINARIES];
-    int boringssl_count;     /* Number of unique BoringSSL binaries found */
-
-    /* Statistics */
-    int processes_scanned;
-    int processes_with_ssl;
-    int total_unique_paths;
+    discovered_lib_t libs[LIB_TYPE_COUNT]; /**< Quick lookup by type (first path found) */
+    int count;                              /**< Number of library types found */
+    lib_paths_t extended[LIB_TYPE_COUNT];   /**< Extended: all unique paths per type */
+    discovered_boringssl_t boringssl[MAX_BORINGSSL_BINARIES]; /**< BoringSSL binaries (EDR-style) */
+    int boringssl_count;     /**< Number of unique BoringSSL binaries found */
+    int processes_scanned;   /**< Total processes scanned */
+    int processes_with_ssl;  /**< Processes with SSL libraries loaded */
+    int total_unique_paths;  /**< Total unique library paths found */
 } lib_discovery_result_t;
 
 /* Discover SSL libraries from running processes
@@ -303,29 +310,33 @@ void bpf_loader_cleanup(bpf_loader_t *loader);
                                       XDP_DISCOVER_SKIP_VIRTUAL | \
                                       XDP_DISCOVER_ONLY_UP)
 
-/* Extended interface info from discovery */
+/**
+ * @brief Extended interface info from discovery
+ */
 typedef struct {
-    char name[64];           /* Interface name (supports long VRF names) */
-    unsigned int ifindex;    /* Kernel interface index */
-    unsigned int mtu;        /* Maximum transmission unit */
-    unsigned int flags;      /* IFF_UP, IFF_LOOPBACK, etc. */
-    bool is_physical;        /* True if physical NIC (not virtual) */
+    char name[64];           /**< Interface name (supports long VRF names) */
+    unsigned int ifindex;    /**< Kernel interface index */
+    unsigned int mtu;        /**< Maximum transmission unit */
+    unsigned int flags;      /**< IFF_UP, IFF_LOOPBACK, etc. */
+    bool is_physical;        /**< True if physical NIC (not virtual) */
 } xdp_iface_info_t;
 
-/* XDP statistics with field documentation */
+/**
+ * @brief XDP statistics counters
+ */
 typedef struct {
-    uint64_t packets_total;      /* All packets processed by XDP */
-    uint64_t packets_tcp;        /* TCP packets (passed header parsing) */
-    uint64_t flows_created;      /* New flow_state entries created */
-    uint64_t flows_classified;   /* Successfully classified (TLS, HTTP, etc.) */
-    uint64_t flows_ambiguous;    /* Sent to userspace for PCRE2-JIT */
-    uint64_t flows_terminated;   /* FIN/RST seen (connection closed) */
-    uint64_t gatekeeper_hits;    /* Fast-path: silenced sessions skipped */
-    uint64_t cookie_failures;    /* Socket cookie lookup failed (IPv6, etc.) */
-    uint64_t ringbuf_drops;      /* Events dropped due to ringbuf full */
-    uint64_t sockops_active;     /* Sockops ACTIVE_ESTABLISHED events */
-    uint64_t sockops_passive;    /* Sockops PASSIVE_ESTABLISHED events */
-    uint64_t sockops_state;      /* Sockops STATE_CB events (cleanup) */
+    uint64_t packets_total;      /**< All packets processed by XDP */
+    uint64_t packets_tcp;        /**< TCP packets (passed header parsing) */
+    uint64_t flows_created;      /**< New flow_state entries created */
+    uint64_t flows_classified;   /**< Successfully classified (TLS, HTTP, etc.) */
+    uint64_t flows_ambiguous;    /**< Sent to userspace for PCRE2-JIT */
+    uint64_t flows_terminated;   /**< FIN/RST seen (connection closed) */
+    uint64_t gatekeeper_hits;    /**< Fast-path: silenced sessions skipped */
+    uint64_t cookie_failures;    /**< Socket cookie lookup failed (IPv6, etc.) */
+    uint64_t ringbuf_drops;      /**< Events dropped due to ringbuf full */
+    uint64_t sockops_active;     /**< Sockops ACTIVE_ESTABLISHED events */
+    uint64_t sockops_passive;    /**< Sockops PASSIVE_ESTABLISHED events */
+    uint64_t sockops_state;      /**< Sockops STATE_CB events (cleanup) */
 } xdp_stats_t;
 
 /**
@@ -562,7 +573,7 @@ typedef struct bpf_flow_info {
     uint8_t  category;        /**< XDP protocol category */
     uint8_t  direction;       /**< Traffic direction */
     uint8_t  ip_version;      /**< IP version (4 or 6) */
-    uint8_t  _pad;
+    uint8_t  _pad;            /**< Padding for alignment */
 } bpf_flow_info_t;
 
 /**

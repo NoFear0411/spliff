@@ -1399,11 +1399,17 @@ int bpf_loader_xdp_poll(bpf_loader_t *loader, int timeout_ms) {
     return ring_buffer__poll(loader->xdp.xdp_rb, timeout_ms);
 }
 
-/* Session policy structure for BPF map (matches BPF definition) */
+/**
+ * @brief Session policy structure for BPF map operations
+ * @internal
+ *
+ * Must match the BPF definition in spliff.bpf.c exactly for map
+ * update/lookup operations. Used by bpf_loader_xdp_update_policy().
+ */
 struct session_policy {
-    uint32_t proto_type;
-    uint8_t silenced;
-    uint8_t _pad[3];
+    uint32_t proto_type;  /**< Protocol type (PROTO_HTTP1, PROTO_HTTP2, PROTO_UNKNOWN) */
+    uint8_t silenced;     /**< 1 = stop sending payloads to ringbuf */
+    uint8_t _pad[3];      /**< Explicit padding for alignment */
 };
 
 /* Update session registry (the "Gatekeeper") */
@@ -1423,20 +1429,26 @@ int bpf_loader_xdp_update_policy(bpf_loader_t *loader, uint64_t cookie,
                                &cookie, &policy, BPF_ANY);
 }
 
-/* XDP stats structure (matches BPF definition in spliff.bpf.c) */
+/**
+ * @brief XDP stats structure for kernel map reading
+ * @internal
+ *
+ * Must match the BPF struct xdp_stats definition exactly.
+ * Used by bpf_loader_xdp_read_stats() to read per-CPU values.
+ */
 struct xdp_stats_kernel {
-    uint64_t packets_total;
-    uint64_t packets_tcp;
-    uint64_t flows_created;
-    uint64_t flows_classified;
-    uint64_t flows_ambiguous;
-    uint64_t flows_terminated;
-    uint64_t gatekeeper_hits;
-    uint64_t cookie_failures;
-    uint64_t ringbuf_drops;
-    uint64_t sockops_active;
-    uint64_t sockops_passive;
-    uint64_t sockops_state;
+    uint64_t packets_total;      /**< All packets seen by XDP */
+    uint64_t packets_tcp;        /**< TCP packets processed */
+    uint64_t flows_created;      /**< New flow_state entries created */
+    uint64_t flows_classified;   /**< Successful protocol classification */
+    uint64_t flows_ambiguous;    /**< Sent to userspace for PCRE2-JIT */
+    uint64_t flows_terminated;   /**< FIN/RST seen (connection end) */
+    uint64_t gatekeeper_hits;    /**< Silenced flows (fast-pass) */
+    uint64_t cookie_failures;    /**< Socket cookie lookup failures */
+    uint64_t ringbuf_drops;      /**< Ring buffer full errors */
+    uint64_t sockops_active;     /**< Sockops ACTIVE_ESTABLISHED events */
+    uint64_t sockops_passive;    /**< Sockops PASSIVE_ESTABLISHED events */
+    uint64_t sockops_state;      /**< Sockops STATE_CB events */
 };
 
 /* Read XDP statistics (aggregates per-CPU counters) */
@@ -1527,28 +1539,33 @@ const xdp_error_t *bpf_loader_xdp_get_last_error(bpf_loader_t *loader) {
 #include <time.h>
 
 /**
- * @brief Flow key structure matching BPF (must match spliff.bpf.c struct flow_key)
+ * @brief Flow key structure for cookie warmup operations
+ * @internal
  *
- * Layout must exactly match the BPF flow_key for map lookups to work:
- * - saddr, daddr: IP addresses in network byte order
- * - sport, dport: ports in network byte order
- * - protocol: IPPROTO_TCP (6) for TCP connections
- * - ip_version: 4 or 6
+ * Must match the BPF struct flow_key exactly for map operations.
+ * All addresses and ports are in network byte order for consistency
+ * with XDP packet parsing, sock_ops context, and SOCK_DIAG output.
  */
 struct warmup_flow_key {
-    __u32 saddr;      /* [4] Network byte order */
-    __u32 daddr;      /* [4] Network byte order */
-    __u16 sport;      /* [2] Network byte order */
-    __u16 dport;      /* [2] Network byte order */
-    __u8  protocol;   /* [1] IPPROTO_TCP = 6 */
-    __u8  ip_version; /* [1] 4 or 6 */
-    __u8  _pad[2];    /* [2] Align to 16 bytes */
+    __u32 saddr;      /**< Source IP, network byte order */
+    __u32 daddr;      /**< Dest IP, network byte order */
+    __u16 sport;      /**< Source port, network byte order */
+    __u16 dport;      /**< Dest port, network byte order */
+    __u8  protocol;   /**< IP protocol (IPPROTO_TCP = 6) */
+    __u8  ip_version; /**< IP version (4 or 6) */
+    __u8  _pad[2];    /**< Padding to align to 16 bytes */
 } __attribute__((packed));
 
-/* Cookie entry structure matching BPF (must match struct flow_cookie_entry) */
+/**
+ * @brief Cookie entry structure for warmup seeding
+ * @internal
+ *
+ * Must match the BPF struct flow_cookie_entry for map operations.
+ * Used by bpf_loader_xdp_warmup_cookies() to seed existing connections.
+ */
 struct warmup_cookie_entry {
-    __u64 socket_cookie;
-    __u64 timestamp_ns;
+    __u64 socket_cookie;  /**< Socket cookie (or inode for warmup) */
+    __u64 timestamp_ns;   /**< Timestamp when entry was created */
 };
 
 /* Warm-up flow_cookie_map with existing TCP connections */
@@ -1695,28 +1712,40 @@ int bpf_loader_xdp_warmup_cookies(bpf_loader_t *loader, bool debug) {
  * Used as fallback when userspace cache misses.
  */
 
-/* Must match struct flow_key in spliff.bpf.c */
+/**
+ * @brief Flow key structure for BPF map lookup operations
+ * @internal
+ *
+ * Must match the BPF struct flow_key exactly for map iteration.
+ * Used by bpf_loader_lookup_flow_by_cookie() to scan flow_states.
+ */
 struct bpf_flow_key {
-    __u32 saddr;
-    __u32 daddr;
-    __u16 sport;
-    __u16 dport;
-    __u8  protocol;
-    __u8  ip_version;
-    __u8  _pad[2];
+    __u32 saddr;      /**< Source IP, network byte order */
+    __u32 daddr;      /**< Dest IP, network byte order */
+    __u16 sport;      /**< Source port, network byte order */
+    __u16 dport;      /**< Dest port, network byte order */
+    __u8  protocol;   /**< IP protocol (IPPROTO_TCP = 6) */
+    __u8  ip_version; /**< IP version (4 or 6) */
+    __u8  _pad[2];    /**< Padding for alignment */
 } __attribute__((packed));
 
-/* Must match struct flow_state in spliff.bpf.c */
+/**
+ * @brief Flow state structure for BPF map lookup operations
+ * @internal
+ *
+ * Must match the BPF struct flow_state exactly for map iteration.
+ * Used by bpf_loader_lookup_flow_by_cookie() to find flows by cookie.
+ */
 struct bpf_flow_state {
-    __u64 socket_cookie;
-    __u64 first_seen_ns;
-    __u64 last_seen_ns;
-    __u32 pkt_count;
-    __u32 byte_count;
-    __u8  category;
-    __u8  state;
-    __u8  direction;
-    __u8  flags;
+    __u64 socket_cookie;  /**< The "Golden Thread" correlation key */
+    __u64 first_seen_ns;  /**< Connection start timestamp */
+    __u64 last_seen_ns;   /**< Last packet seen timestamp */
+    __u32 pkt_count;      /**< Packet counter */
+    __u32 byte_count;     /**< Byte counter */
+    __u8  category;       /**< Traffic category (CAT_*) */
+    __u8  state;          /**< Flow state (FLOW_STATE_*) */
+    __u8  direction;      /**< Direction (0=unknown, 1=c2s, 2=s2c) */
+    __u8  flags;          /**< Flags bitfield (FLOW_FLAG_*) */
 } __attribute__((packed));
 
 int bpf_loader_lookup_flow_by_cookie(bpf_loader_t *loader, uint64_t cookie,

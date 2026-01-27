@@ -107,16 +107,14 @@ WARN_LOGFILE           =
 #---------------------------------------------------------------------------
 
 # Input files and directories
-INPUT                  = src \
-                         README.md
+INPUT                  = src
 
 # Input encoding
 INPUT_ENCODING         = UTF-8
 
 # File patterns to process
 FILE_PATTERNS          = *.c \
-                         *.h \
-                         *.md
+                         *.h
 
 # Recursive search
 RECURSIVE              = YES
@@ -133,7 +131,8 @@ EXCLUDE_PATTERNS       = */build*/* \
                          *CLAUDE.md
 
 # Use README.md as main page
-USE_MDFILE_AS_MAINPAGE = README.md
+# Main page generated from module documentation
+USE_MDFILE_AS_MAINPAGE =
 
 #---------------------------------------------------------------------------
 # Configuration options related to source browsing

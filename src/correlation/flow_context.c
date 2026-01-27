@@ -782,24 +782,6 @@ void flow_update_xdp(flow_context_t *ctx, const xdp_packet_event_t *evt) {
     }
 }
 
-/**
- * @brief Fully initialize HTTP/2 session for a flow context
- *
- * Called by the home worker when first HTTP/2 data arrives. Creates:
- * - nghttp2 server session for parsing client→server requests
- * - HPACK inflater for decoding server→client response headers
- * - Reassembly buffer for fragmented frames
- *
- * @par Thread Safety
- * Must only be called by the home worker (verified via home_worker_id).
- * The flow_context_t.parser.h2 fields are single-writer once claimed.
- *
- * @param ctx   Flow context with proto == FLOW_PROTO_HTTP2
- * @param cbs   nghttp2 callbacks (from global or per-worker setup)
- * @param user  User data passed to callbacks (typically callback context)
- *
- * @return 0 on success, -1 on failure
- */
 int flow_h2_session_init(flow_context_t *ctx, nghttp2_session_callbacks *cbs,
                           void *user) {
     if (!ctx || ctx->proto != FLOW_PROTO_HTTP2) {
@@ -873,22 +855,6 @@ int flow_h2_session_init(flow_context_t *ctx, nghttp2_session_callbacks *cbs,
     return 0;
 }
 
-/**
- * @brief Initialize HTTP/1 parser for a flow context
- *
- * Called by the home worker when first HTTP/1 data arrives. Configures
- * the llhttp parser with the provided settings (should be from
- * http1_get_settings() for proper callback setup).
- *
- * @par Thread Safety
- * Must only be called by the home worker (verified via home_worker_id).
- * The flow_context_t.parser.h1 fields are single-writer once claimed.
- *
- * @param ctx       Flow context with proto == FLOW_PROTO_HTTP1
- * @param settings  llhttp settings with callbacks (typically from http1_get_settings())
- *
- * @return 0 on success, -1 on failure
- */
 int flow_h1_parser_init(flow_context_t *ctx, llhttp_settings_t *settings) {
     if (!ctx || ctx->proto != FLOW_PROTO_HTTP1) {
         return -1;
