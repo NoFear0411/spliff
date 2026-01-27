@@ -397,8 +397,8 @@ typedef struct object_pool {
     size_t capacity;            /**< Total number of objects in pool */
 
     /** Lock-free free-list implemented as CK ring buffer */
-    ck_ring_t ring;
-    ck_ring_buffer_t *ring_buf;
+    ck_ring_t ring;             /**< CK ring for lock-free operations */
+    ck_ring_buffer_t *ring_buf; /**< Ring buffer backing storage */
 
     /** @name Statistics (atomic for thread-safe reads) */
     /** @{ */

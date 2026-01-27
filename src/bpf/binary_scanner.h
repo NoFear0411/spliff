@@ -25,22 +25,21 @@
 /* Maximum build ID hex string length (SHA-256 = 64 hex chars + null) */
 #define BUILD_ID_HEX_MAX 65
 
-/* Results from scanning a binary for BoringSSL */
+/**
+ * @brief Results from scanning a binary for BoringSSL function offsets
+ */
 struct boringssl_offsets {
-    uint64_t ssl_write_offset;       /* File offset of SSL_write function */
-    uint64_t ssl_read_offset;        /* File offset of SSL_read function */
-    /* Internal "Golden Hooks" - the actual hot paths in Chrome */
-    uint64_t ssl_read_impl_offset;   /* ssl_read_impl(ssl_st*) - internal read */
-    uint64_t ssl_write_impl_offset;  /* DoPayloadWrite() - internal write */
-    /* Async I/O hooks - Chrome's event-driven network model */
-    uint64_t socket_read_offset;     /* SSLClientSocketImpl::ReadIfReady - async entry */
-    uint64_t on_read_ready_offset;   /* SSLClientSocketImpl::OnReadReady - completion */
-    /* DoPayloadRead receives raw char* buffer directly (not IOBuffer wrapper) */
-    uint64_t do_payload_read_offset; /* SSLClientSocketImpl::DoPayloadRead - best hook */
-    bool found;                       /* True if offsets were found in database */
-    char binary_path[256];            /* Path to the scanned binary */
-    char build_id[BUILD_ID_HEX_MAX]; /* Build ID hex string */
-    const char *version_info;         /* Version info from database (or NULL) */
+    uint64_t ssl_write_offset;       /**< File offset of SSL_write function */
+    uint64_t ssl_read_offset;        /**< File offset of SSL_read function */
+    uint64_t ssl_read_impl_offset;   /**< ssl_read_impl(ssl_st*) - internal read (Golden Hook) */
+    uint64_t ssl_write_impl_offset;  /**< DoPayloadWrite() - internal write (Golden Hook) */
+    uint64_t socket_read_offset;     /**< SSLClientSocketImpl::ReadIfReady - async entry */
+    uint64_t on_read_ready_offset;   /**< SSLClientSocketImpl::OnReadReady - completion */
+    uint64_t do_payload_read_offset; /**< SSLClientSocketImpl::DoPayloadRead - best hook */
+    bool found;                       /**< True if offsets were found in database */
+    char binary_path[256];            /**< Path to the scanned binary */
+    char build_id[BUILD_ID_HEX_MAX]; /**< Build ID hex string */
+    const char *version_info;         /**< Version info from database (or NULL) */
 };
 
 /*

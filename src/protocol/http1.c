@@ -96,12 +96,9 @@ static bool g_initialized = false;
 /**
  * @addtogroup http1
  * @{
- */
-
-/**
- * @name llhttp Callbacks
- * @brief Parser callback implementations (internal)
- * @internal
+ *
+ * @par llhttp Callbacks
+ * Parser callback implementations (internal)
  */
 
 /**
@@ -380,8 +377,8 @@ static int on_message_complete(llhttp_t *parser) {
 }
 
 /**
- * @name HTTP/1.1 Public API
- * @brief Public parsing functions
+ * @par HTTP/1.1 Public API
+ * Public parsing functions
  */
 
 /**
@@ -426,16 +423,6 @@ void http1_cleanup(void) {
     g_initialized = false;
 }
 
-/**
- * @brief Check if data appears to be HTTP/1.1 request
- *
- * Fast heuristic check for HTTP method prefixes without full parsing.
- * Checks for: GET, POST, PUT, HEAD, DELETE, OPTIONS, PATCH, CONNECT, TRACE.
- *
- * @param[in] data Data buffer to check
- * @param[in] len  Buffer length
- * @return true if data starts with HTTP method
- */
 bool http1_is_request(const uint8_t *data, size_t len) {
     if (len < 4) return false;
 
@@ -451,40 +438,12 @@ bool http1_is_request(const uint8_t *data, size_t len) {
             memcmp(data, "TRACE ", 6) == 0);
 }
 
-/**
- * @brief Check if data appears to be HTTP/1.1 response
- *
- * Checks for "HTTP/1." prefix which indicates HTTP response status line.
- *
- * @param[in] data Data buffer to check
- * @param[in] len  Buffer length
- * @return true if data starts with HTTP version string
- */
+
 bool http1_is_response(const uint8_t *data, size_t len) {
     return len >= 9 && memcmp(data, "HTTP/1.", 7) == 0;
 }
 
-/**
- * @brief Parse HTTP/1.1 message using llhttp
- *
- * Full HTTP/1.1 parser that extracts headers and optionally body.
- * Uses llhttp in HTTP_BOTH mode for automatic request/response detection.
- *
- * @par Implementation Notes:
- * - Message structure is zeroed before parsing
- * - Auto-initializes if http1_init() not called
- * - Partial messages are acceptable (headers complete is sufficient)
- * - Body data is already chunk-decoded by llhttp
- *
- * @param[in]  data          Raw HTTP data
- * @param[in]  len           Data length
- * @param[out] msg           Output message structure
- * @param[out] body_buf      Optional body accumulation buffer
- * @param[in]  body_buf_size Body buffer capacity
- * @param[out] body_len_out  Output: actual body bytes accumulated
- *
- * @return Data length on success (may have partial body), -1 on error
- */
+
 int http1_parse(const uint8_t *data, size_t len, http_message_t *msg,
                 uint8_t *body_buf, size_t body_buf_size, size_t *body_len_out) {
     if (!g_initialized) {
@@ -524,19 +483,7 @@ int http1_parse(const uint8_t *data, size_t len, http_message_t *msg,
     return (int)len;
 }
 
-/**
- * @brief Parse HTTP/1.1 headers only (compatibility wrapper)
- *
- * Simplified interface that parses headers without body accumulation.
- * Direction parameter is ignored; llhttp auto-detects.
- *
- * @param[in]  data Raw HTTP data
- * @param[in]  len  Data length
- * @param[out] msg  Output message structure
- * @param[in]  dir  Direction hint (ignored)
- *
- * @deprecated Use http1_parse() directly
- */
+
 void http1_parse_headers(const uint8_t *data, size_t len, http_message_t *msg, direction_t dir) {
     (void)dir;  /* Ignored - llhttp auto-detects direction */
 
@@ -544,18 +491,7 @@ void http1_parse_headers(const uint8_t *data, size_t len, http_message_t *msg, d
     http1_parse(data, len, msg, NULL, 0, NULL);
 }
 
-/**
- * @brief Find body start position
- *
- * Locates the header terminator (\\r\\n\\r\\n) and returns the offset
- * where body content begins.
- *
- * @param[in] data Raw HTTP data
- * @param[in] len  Data length
- * @return Byte offset of body start, or -1 if not found
- *
- * @note Prefer http1_parse() which provides body data via callbacks
- */
+
 int http1_find_body_start(const uint8_t *data, size_t len) {
     const uint8_t *pos = (const uint8_t *)memmem(data, len, "\r\n\r\n", 4);
     if (pos) {
@@ -564,31 +500,7 @@ int http1_find_body_start(const uint8_t *data, size_t len) {
     return -1;
 }
 
-/**
- * @brief Decode chunked transfer encoding
- *
- * Manually decodes HTTP/1.1 chunked encoding for compatibility with
- * code that processes raw data outside the llhttp callback flow.
- *
- * @par Chunked Format:
- * @code
- * <hex-size>[;chunk-ext]\r\n
- * <chunk-data>\r\n
- * ...
- * 0\r\n
- * [trailer-headers]\r\n
- * @endcode
- *
- * @param[in]  in       Chunked-encoded input
- * @param[in]  in_len   Input length
- * @param[out] out      Decoded output buffer
- * @param[in]  out_size Output buffer capacity
- *
- * @return Bytes written to out, or -1 on error
- *
- * @note llhttp handles this automatically in on_body(); this function
- *       is provided for direct data manipulation scenarios
- */
+
 int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_size) {
     const uint8_t *pos = in;
     const uint8_t *end = in + in_len;
@@ -628,8 +540,6 @@ int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t 
     return (int)(out_pos - out);
 }
 
-/** @} */ /* End of http1 addtogroup */
-
 /*============================================================================
  * Flow-Based HTTP/1 Parsing (Phase 3.6.5)
  *
@@ -660,6 +570,10 @@ static void h1_display_body_flow(struct flow_context *flow_ctx);
 
 /*--- Flow-based llhttp callbacks using persistent state ---*/
 
+/**
+ * @brief Handle start of new HTTP message in flow context
+ * @internal
+ */
 static int on_message_begin_flow(llhttp_t *parser) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
@@ -694,6 +608,10 @@ static int on_message_begin_flow(llhttp_t *parser) {
     return 0;
 }
 
+/**
+ * @brief Handle URL data in flow context
+ * @internal
+ */
 static int on_url_flow(llhttp_t *parser, const char *at, size_t len) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     flow_transaction_t *txn = &cb->flow_ctx->parser.h1.txn;
@@ -711,6 +629,10 @@ static int on_url_flow(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Handle status text in flow context (no-op)
+ * @internal
+ */
 static int on_status_flow(llhttp_t *parser, const char *at, size_t len) {
     (void)parser;
     (void)at;
@@ -719,6 +641,10 @@ static int on_status_flow(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Handle header field name in flow context
+ * @internal
+ */
 static int on_header_field_flow(llhttp_t *parser, const char *at, size_t len) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
@@ -742,6 +668,10 @@ static int on_header_field_flow(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Handle header value in flow context
+ * @internal
+ */
 static int on_header_value_flow(llhttp_t *parser, const char *at, size_t len) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
@@ -787,6 +717,10 @@ static int on_header_value_flow(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Handle header value completion in flow context
+ * @internal
+ */
 static int on_header_value_complete_flow(llhttp_t *parser) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
@@ -796,6 +730,10 @@ static int on_header_value_complete_flow(llhttp_t *parser) {
     return 0;
 }
 
+/**
+ * @brief Handle headers complete in flow context
+ * @internal
+ */
 static int on_headers_complete_flow(llhttp_t *parser) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
@@ -826,6 +764,10 @@ static int on_headers_complete_flow(llhttp_t *parser) {
     return 0;
 }
 
+/**
+ * @brief Handle body data in flow context
+ * @internal
+ */
 static int on_body_flow(llhttp_t *parser, const char *at, size_t len) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     flow_transaction_t *txn = &cb->flow_ctx->parser.h1.txn;
@@ -838,6 +780,10 @@ static int on_body_flow(llhttp_t *parser, const char *at, size_t len) {
     return 0;
 }
 
+/**
+ * @brief Handle message complete in flow context
+ * @internal
+ */
 static int on_message_complete_flow(llhttp_t *parser) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
@@ -893,12 +839,17 @@ static int on_reset_flow(llhttp_t *parser) {
     return 0;
 }
 
-/* Global flow-based settings */
+/** @cond INTERNAL */
+/** Flow-based llhttp settings */
 static llhttp_settings_t g_flow_settings;
+
+/** Flag indicating if flow settings have been initialized */
 static bool g_flow_settings_initialized = false;
+/** @endcond */
 
 /**
  * @brief Initialize flow-based llhttp settings
+ * @internal
  */
 static void http1_init_flow_settings(void) {
     if (g_flow_settings_initialized) return;
@@ -1212,3 +1163,5 @@ bool http1_try_process_event(const uint8_t *data, size_t len,
     return false;  /* No flow context or flow-based parser failed */
 }
 #endif /* HAVE_THREADING */
+
+/** @} */ /* End of http1 addtogroup */

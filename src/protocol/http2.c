@@ -185,8 +185,10 @@ void http2_set_callback_event(void *callback_ctx, const ssl_data_event_t *event)
     }
 }
 
-/* Global state - callbacks shared across all flow-based sessions */
+/** @internal Shared nghttp2 callback structure for all flow-based sessions */
 static nghttp2_session_callbacks *g_h2_callbacks = NULL;
+
+/** @internal Flag indicating if HTTP/2 module has been initialized */
 static bool g_h2_initialized = false;
 
 /*
@@ -1471,7 +1473,11 @@ bool http2_try_process_event(const uint8_t *data, size_t len,
 #else /* !HAVE_NGHTTP2 */
 
 /* Stub implementation when nghttp2 is not available */
+
+/** @cond INTERNAL */
+/** Flag indicating if HTTP/2 stub module has been initialized */
 static bool g_h2_initialized = false;
+/** @endcond */
 
 int http2_init(void) {
     g_h2_initialized = true;
@@ -1530,6 +1536,15 @@ bool http2_is_valid_frame_header(const uint8_t *data, size_t len) {
 }
 
 #ifdef HAVE_THREADING
+/**
+ * @brief Stub HTTP/2 event processing when nghttp2 is unavailable
+ *
+ * @param[in] data   Raw data buffer (unused)
+ * @param[in] len    Data length (unused)
+ * @param[in] event  Worker event (unused)
+ * @param[in] worker Worker context (unused)
+ * @return false (no HTTP/2 support without nghttp2)
+ */
 bool http2_try_process_event(const uint8_t *data, size_t len,
                              struct worker_event *event,
                              struct worker_ctx *worker) {

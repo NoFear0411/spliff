@@ -48,12 +48,6 @@
  * @{
  */
 
-/**
- * @brief Initialize output context
- *
- * Sets up the output thread context with references to worker queues
- * and output destination.
- */
 int output_init(output_ctx_t *ctx, worker_ctx_t *workers, int num_workers,
                 FILE *output_file) {
     if (!ctx || !workers || num_workers <= 0) {
@@ -145,20 +139,6 @@ static int collect_and_write_output(output_ctx_t *ctx) {
     return written;
 }
 
-/**
- * @brief Output thread entry point
- *
- * Main loop for the output thread:
- * 1. Collect messages from all worker output queues
- * 2. Write to output file
- * 3. Flush periodically (every 100 iterations or when idle)
- * 4. Sleep 1ms when idle to avoid busy-spinning
- * 5. On shutdown, drain remaining messages before exiting
- *
- * @param[in] arg Pointer to output_ctx_t
- *
- * @return NULL
- */
 void *output_thread_main(void *arg) {
     output_ctx_t *ctx = (output_ctx_t *)arg;
     if (!ctx) {
@@ -219,16 +199,6 @@ void *output_thread_main(void *arg) {
  * @{
  */
 
-/**
- * @brief Allocate output message from worker's pool
- *
- * Allocates a message and initializes timestamp and worker_id.
- * Caller should fill in msg->data and msg->len, then call output_enqueue().
- *
- * @param[in] worker Worker context
- *
- * @return Message pointer, or NULL if pool exhausted
- */
 output_msg_t *output_alloc(worker_ctx_t *worker) {
     if (!worker) {
         return NULL;
@@ -245,17 +215,6 @@ output_msg_t *output_alloc(worker_ctx_t *worker) {
     return msg;
 }
 
-/**
- * @brief Enqueue output message to output thread
- *
- * Transfers ownership of the message to the output thread.
- * On failure (queue full), the message is freed back to the pool.
- *
- * @param[in] worker Worker context
- * @param[in] msg    Message to enqueue (ownership transferred)
- *
- * @return 0 on success, -1 if queue full
- */
 int output_enqueue(worker_ctx_t *worker, output_msg_t *msg) {
     if (!worker || !msg) {
         return -1;
@@ -270,18 +229,6 @@ int output_enqueue(worker_ctx_t *worker, output_msg_t *msg) {
     return 0;
 }
 
-/**
- * @brief Format and enqueue output message (printf-style)
- *
- * Convenience function that combines output_alloc(), vsnprintf(),
- * and output_enqueue(). Suitable for simple formatted output.
- *
- * @param[in] worker Worker context
- * @param[in] fmt    printf format string
- * @param[in] ...    Format arguments
- *
- * @return 0 on success, -1 on allocation or enqueue failure
- */
 int output_write(worker_ctx_t *worker, const char *fmt, ...) {
     if (!worker || !fmt) {
         return -1;

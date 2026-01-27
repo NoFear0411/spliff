@@ -122,10 +122,14 @@ static void get_process_name(uint32_t pid, char *buf, size_t bufsize) {
 /* Track library paths that already have probes attached */
 #define MAX_PROBED_PATHS 128
 
+/**
+ * @brief Track library paths that already have probes attached
+ * @internal
+ */
 typedef struct {
-    char path[512];
-    lib_type_t type;
-    bool active;
+    char path[512];  /**< Absolute path to the library */
+    lib_type_t type; /**< Type of SSL/TLS library */
+    bool active;     /**< Whether probes are currently active */
 } probed_path_t;
 
 static probed_path_t g_probed_paths[MAX_PROBED_PATHS];

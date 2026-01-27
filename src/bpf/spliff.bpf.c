@@ -46,56 +46,90 @@
 #define PROTO_HTTP1     1   // HTTP/1.x - route to llhttp
 #define PROTO_HTTP2     2   // HTTP/2   - route to nghttp2
 
-// Data structure for SSL events
+/**
+ * @brief SSL data event sent to userspace via ring buffer
+ *
+ * Contains captured SSL/TLS plaintext data along with metadata for
+ * correlation with XDP flow tracking and process identification.
+ */
 struct ssl_data_event {
-    __u64 timestamp_ns;
-    __u64 delta_ns;       // Latency (for handshake or request-response)
-    __u64 ssl_ctx;        // SSL context pointer for connection tracking
-    __u64 socket_cookie;  // Socket cookie for XDP correlation ("Golden Thread")
-    __u32 pid;
-    __u32 tid;
-    __u32 uid;
-    __u32 len;            // Actual data length
-    __u32 buf_filled;     // How much of buf[] is filled
-    __u32 event_type;     // EVENT_SSL_READ, EVENT_SSL_WRITE, EVENT_HANDSHAKE
-    char comm[TASK_COMM_LEN];
-    __u8 buf[MAX_BUF_SIZE];
+    __u64 timestamp_ns;   /**< Event timestamp in nanoseconds */
+    __u64 delta_ns;       /**< Latency (for handshake or request-response) */
+    __u64 ssl_ctx;        /**< SSL context pointer for connection tracking */
+    __u64 socket_cookie;  /**< Socket cookie for XDP correlation ("Golden Thread") */
+    __u32 pid;            /**< Process ID */
+    __u32 tid;            /**< Thread ID */
+    __u32 uid;            /**< User ID */
+    __u32 len;            /**< Actual data length */
+    __u32 buf_filled;     /**< How much of buf[] is filled */
+    __u32 event_type;     /**< EVENT_SSL_READ, EVENT_SSL_WRITE, EVENT_HANDSHAKE */
+    char comm[TASK_COMM_LEN];  /**< Process command name */
+    __u8 buf[MAX_BUF_SIZE];    /**< Captured plaintext data buffer */
 };
 
-// Arguments saved between entry and exit probes
+/**
+ * @brief Arguments saved between SSL read/write entry and exit probes
+ * @internal
+ *
+ * Stored in ssl_args_map keyed by thread ID to correlate uprobe entry
+ * with uretprobe exit for SSL_read/SSL_write operations.
+ */
 struct ssl_args {
-    __u64 ssl_ctx;        // SSL context pointer
-    __u64 buf_ptr;        // Buffer pointer
-    __u32 len;            // Requested length
-    __u64 out_len_ptr;    // Output length pointer (for SSL_read_ex/SSL_write_ex)
+    __u64 ssl_ctx;        /**< SSL context pointer */
+    __u64 buf_ptr;        /**< Buffer pointer for data capture */
+    __u32 len;            /**< Requested length */
+    __u64 out_len_ptr;    /**< Output length pointer (for SSL_read_ex/SSL_write_ex) */
 };
 
-// Handshake state saved between entry and exit probes
+/**
+ * @brief Handshake state saved between entry and exit probes
+ * @internal
+ *
+ * Stored in handshake_args_map keyed by thread ID to measure
+ * SSL/TLS handshake latency.
+ */
 struct handshake_args {
-    __u64 ssl_ctx;        // SSL context pointer
-    __u64 start_ns;       // Start timestamp
+    __u64 ssl_ctx;        /**< SSL context pointer */
+    __u64 start_ns;       /**< Start timestamp for latency calculation */
 };
 
-// ALPN query state saved between entry and exit probes
+/**
+ * @brief ALPN query state saved between entry and exit probes
+ * @internal
+ *
+ * Stored in alpn_query_map keyed by thread ID to capture the
+ * negotiated ALPN protocol (h2, http/1.1, etc.) after handshake.
+ */
 struct alpn_query_args {
-    __u64 ssl_ctx;        // SSL context pointer
-    __u64 data_ptr;       // Pointer to output data pointer (OpenSSL) or buffer (NSS/GnuTLS)
-    __u64 len_ptr;        // Pointer to length output
+    __u64 ssl_ctx;        /**< SSL context pointer */
+    __u64 data_ptr;       /**< Pointer to output data pointer (OpenSSL) or buffer (NSS/GnuTLS) */
+    __u64 len_ptr;        /**< Pointer to length output */
 };
 
-// Session info for tracked web connections
-// Only sessions that pass socket family check (AF_INET/AF_INET6) and have valid ALPN
+/**
+ * @brief Session info for tracked web connections
+ *
+ * Only sessions that pass socket family check (AF_INET/AF_INET6)
+ * and have valid ALPN negotiation are tracked. Stored in
+ * tracked_sessions map keyed by SSL context pointer.
+ */
 struct session_info {
-    __u32 protocol;       // PROTO_HTTP1, PROTO_HTTP2
-    __u16 family;         // AF_INET, AF_INET6
-    __u16 flags;          // Reserved for future use
-    __s32 fd;             // OS file descriptor (for socket family lookup)
+    __u32 protocol;       /**< PROTO_HTTP1, PROTO_HTTP2 */
+    __u16 family;         /**< AF_INET, AF_INET6 */
+    __u16 flags;          /**< Reserved for future use */
+    __s32 fd;             /**< OS file descriptor (for socket family lookup) */
 };
 
-// SSL_set_fd arguments (for OpenSSL fd tracking)
+/**
+ * @brief SSL_set_fd arguments for OpenSSL fd tracking
+ * @internal
+ *
+ * Stored in ssl_fd_args_map keyed by thread ID to correlate
+ * SSL context with OS file descriptor for socket cookie lookup.
+ */
 struct ssl_fd_args {
-    __u64 ssl_ctx;        // SSL* pointer
-    __s32 fd;             // OS file descriptor
+    __u64 ssl_ctx;        /**< SSL* pointer */
+    __s32 fd;             /**< OS file descriptor */
 };
 
 // =============================================================================
@@ -132,41 +166,59 @@ struct ssl_fd_args {
 #define TCP_FLAG_PSH      0x08
 #define TCP_FLAG_ACK      0x10
 
-// Flow key (5-tuple) - packed for memcmp consistency
+/**
+ * @brief Flow key (5-tuple) for XDP flow tracking
+ *
+ * Packed struct for consistent memcmp and map lookup operations.
+ * All addresses and ports are stored in network byte order for
+ * consistency with XDP packet parsing and sock_ops context.
+ */
 struct flow_key {
-    __u32 saddr;          // [4] Source IP (v4) or hash (v6)
-    __u32 daddr;          // [4] Dest IP (v4) or hash (v6)
-    __u16 sport;          // [2] Source port
-    __u16 dport;          // [2] Dest port
-    __u8  protocol;       // [1] TCP or UDP
-    __u8  ip_version;     // [1] 4 or 6
-    __u8  _pad[2];        // [2] Align to 16 bytes
+    __u32 saddr;          /**< Source IP (v4) or hash (v6), network byte order */
+    __u32 daddr;          /**< Dest IP (v4) or hash (v6), network byte order */
+    __u16 sport;          /**< Source port, network byte order */
+    __u16 dport;          /**< Dest port, network byte order */
+    __u8  protocol;       /**< IP protocol (IPPROTO_TCP=6, IPPROTO_UDP=17) */
+    __u8  ip_version;     /**< IP version (4 or 6) */
+    __u8  _pad[2];        /**< Padding to align to 16 bytes */
 } __attribute__((packed));
 
-// XDP packet event - optimized for cache efficiency
+/**
+ * @brief XDP packet event for flow metadata reporting
+ *
+ * Optimized for cache efficiency with fields ordered by size.
+ * Sent to userspace via xdp_events ring buffer for new flows,
+ * terminations, and ambiguous traffic needing classification.
+ */
 struct xdp_packet_event {
-    __u64 timestamp_ns;   // [8] Absolute time for latency calcs
-    __u64 socket_cookie;  // [8] The "Golden Thread" to uprobes/L7
-    struct flow_key flow; // [16] Src/Dst IP + Ports
+    __u64 timestamp_ns;   /**< Absolute time for latency calculations */
+    __u64 socket_cookie;  /**< The "Golden Thread" to uprobes/L7 */
+    struct flow_key flow; /**< Src/Dst IP + Ports (5-tuple) */
 
-    __u32 pkt_len;        // [4] Wire length
-    __u32 ifindex;        // [4] NIC ID
-    __u32 event_type;     // [4] EVENT_XDP_PACKET (matches uprobe enum)
+    __u32 pkt_len;        /**< Wire length in bytes */
+    __u32 ifindex;        /**< Network interface index */
+    __u32 event_type;     /**< EVENT_XDP_PACKET (matches uprobe enum) */
 
-    __u16 payload_off;    // [2] L4 payload start
-    __u8  category;       // [1] Protocol class
-    __u8  tls_type;       // [1] TLS record type (Handshake vs Data)
-    __u8  direction;      // [1] 0=unknown, 1=ingress, 2=egress
-    __u8  tcp_flags;      // [1] SYN/FIN/RST for flow lifecycle
-    __u8  _pad[2];        // [2] Align to 8-byte boundary
+    __u16 payload_off;    /**< L4 payload offset from packet start */
+    __u8  category;       /**< Traffic category (CAT_TLS_TCP, CAT_PLAIN_HTTP, etc.) */
+    __u8  tls_type;       /**< TLS record type (Handshake=0x16 vs AppData=0x17) */
+    __u8  direction;      /**< 0=unknown, 1=ingress, 2=egress */
+    __u8  tcp_flags;      /**< TCP flags (SYN/FIN/RST) for flow lifecycle */
+    __u8  _pad[2];        /**< Padding to align to 8-byte boundary */
 } __attribute__((packed));
 
-// Socket cookie correlation - bridges uprobe SSL* to XDP 5-tuple
+/**
+ * @brief Socket cookie correlation - bridges uprobe SSL* to XDP 5-tuple
+ *
+ * Stored in cookie_to_ssl map by userspace after correlating XDP and
+ * uprobe events. Enables the "Double View" architecture: XDP provides
+ * network metadata while uprobes capture decrypted content.
+ */
 struct cookie_correlation {
-    __u64 ssl_ctx;        // [8] SSL* from uprobe
-    __u64 timestamp_ns;   // [8] When established
-    __u32 pid;            // [4] Process ID
-    __u32 _pad;           // [4] Alignment
+    __u64 ssl_ctx;        /**< SSL* from uprobe */
+    __u64 timestamp_ns;   /**< When correlation was established */
+    __u32 pid;            /**< Process ID owning the connection */
+    __u32 _pad;           /**< Alignment padding */
 };
 
 
@@ -293,10 +345,19 @@ struct {
 // We need to track the IOBuffer* where data will eventually be stored.
 //
 // Map: SSLClientSocketImpl* (this ptr) → socket_read_args
+
+/**
+ * @brief Chrome async I/O buffer tracking for SSLClientSocketImpl
+ * @internal
+ *
+ * Chrome's asynchronous SSL I/O requires tracking the IOBuffer* across
+ * Read() entry (which may return ERR_IO_PENDING) and OnReadReady() callback.
+ * Stored in socket_read_map keyed by SSLClientSocketImpl* (this ptr).
+ */
 struct socket_read_args {
-    __u64 io_buffer;     // IOBuffer* where data will be stored
-    __u32 buf_len;       // Requested read length
-    __u64 timestamp_ns;  // When Read() was called
+    __u64 io_buffer;     /**< IOBuffer* where data will be stored */
+    __u32 buf_len;       /**< Requested read length */
+    __u64 timestamp_ns;  /**< When Read() was called, for latency */
 };
 
 struct {
@@ -339,19 +400,23 @@ struct {
 // Timeout for zombie flow cleanup (userspace sweeper checks last_seen_ns)
 #define FLOW_TIMEOUT_NS (30ULL * 1000000000ULL)  // 30 seconds
 
-// Flow state - tracks each 5-tuple through the state machine
-// Fields ordered by size (8→4→1) to minimize padding: 36 bytes total
+/**
+ * @brief Flow state - tracks each 5-tuple through the XDP state machine
+ *
+ * Fields ordered by size (8->4->1) to minimize padding (36 bytes total).
+ * State machine: PENDING -> CLASSIFIED/AMBIGUOUS -> (silenced via session_registry)
+ */
 struct flow_state {
-    __u64 socket_cookie;      // [8] The "Golden Thread" correlation key
-    __u64 first_seen_ns;      // [8] Connection start (SYN timestamp)
-    __u64 last_seen_ns;       // [8] Last packet seen (for timeout)
-    __u32 pkt_count;          // [4] Packet counter (stats)
-    __u32 byte_count;         // [4] Byte counter (stats)
-    __u8  category;           // [1] CAT_TLS_TCP, CAT_PLAIN_HTTP, CAT_OTHER
-    __u8  state;              // [1] FLOW_STATE_*
-    __u8  direction;          // [1] 0=unknown, 1=client→server, 2=server→client
-    __u8  flags;              // [1] FLOW_FLAG_* bitfield
-} __attribute__((packed));    // 36 bytes, no padding waste
+    __u64 socket_cookie;      /**< The "Golden Thread" correlation key */
+    __u64 first_seen_ns;      /**< Connection start (SYN timestamp) */
+    __u64 last_seen_ns;       /**< Last packet seen (for timeout cleanup) */
+    __u32 pkt_count;          /**< Packet counter for stats */
+    __u32 byte_count;         /**< Byte counter for stats */
+    __u8  category;           /**< Traffic category (CAT_TLS_TCP, CAT_PLAIN_HTTP, CAT_OTHER) */
+    __u8  state;              /**< State machine stage (FLOW_STATE_*) */
+    __u8  direction;          /**< 0=unknown, 1=client->server, 2=server->client */
+    __u8  flags;              /**< Flags bitfield (FLOW_FLAG_*) */
+} __attribute__((packed));    /* 36 bytes, no padding waste */
 
 // Flow state map - keyed by 5-tuple
 // LRU: Automatic eviction of oldest flows when full (prevents memory exhaustion)
@@ -363,13 +428,17 @@ struct {
     __type(value, struct flow_state);  // 36 bytes
 } flow_states SEC(".maps");
 
-// Session policy - the XDP "Gatekeeper" decision cache
-// Once userspace PCRE2-JIT classifies a flow, XDP checks this to fast-pass
-// Fields ordered by size: 8 bytes total, no padding
+/**
+ * @brief Session policy - the XDP "Gatekeeper" decision cache
+ *
+ * Once userspace PCRE2-JIT classifies a flow, this policy is updated
+ * in session_registry. XDP reads it to decide: full processing or fast-pass.
+ * Silenced flows skip ring buffer writes, reducing overhead.
+ */
 struct session_policy {
-    __u32 proto_type;         // [4] PROTO_HTTP1, PROTO_HTTP2, PROTO_UNKNOWN
-    __u8  silenced;           // [1] 1 = stop sending payloads to ringbuf
-    __u8  _pad[3];            // [3] Explicit padding for alignment
+    __u32 proto_type;         /**< Protocol type (PROTO_HTTP1, PROTO_HTTP2, PROTO_UNKNOWN) */
+    __u8  silenced;           /**< 1 = stop sending payloads to ringbuf */
+    __u8  _pad[3];            /**< Explicit padding for alignment */
 };
 
 // Session registry - indexed by socket_cookie (the universal correlator)
@@ -421,19 +490,23 @@ struct {
 // Typical: "GET /path HTTP/1.1\r\n" = ~20 bytes, plus Host header ~50 bytes
 #define XDP_PAYLOAD_MAX 128
 
-// XDP payload event - for ambiguous traffic needing PCRE2-JIT classification
-// Sent when XDP structural DPI is uncertain (e.g., non-standard HTTP method)
-// Fields ordered by size: 164 bytes total
+/**
+ * @brief XDP payload event for ambiguous traffic needing PCRE2-JIT classification
+ *
+ * Sent when XDP structural DPI is uncertain (e.g., non-standard HTTP method).
+ * Contains first 128 bytes of payload for userspace regex classification.
+ * Fields ordered by size: 172 bytes total.
+ */
 struct xdp_payload_event {
-    __u64 timestamp_ns;                // [8] Event time
-    __u64 socket_cookie;               // [8] Correlation key
-    struct flow_key flow;              // [16] 5-tuple for map lookup
-    __u32 payload_len;                 // [4] Actual bytes captured (≤128)
-    __u32 event_type;                  // [4] EVENT_XDP_PACKET
-    __u8  category;                    // [1] Best-guess category from XDP
-    __u8  _pad[3];                     // [3] Alignment
-    __u8  payload[XDP_PAYLOAD_MAX];    // [128] First bytes for PCRE2-JIT
-} __attribute__((packed));             // 172 bytes
+    __u64 timestamp_ns;                /**< Event timestamp */
+    __u64 socket_cookie;               /**< Correlation key for session lookup */
+    struct flow_key flow;              /**< 5-tuple for map lookup */
+    __u32 payload_len;                 /**< Actual bytes captured (<=128) */
+    __u32 event_type;                  /**< EVENT_XDP_PACKET */
+    __u8  category;                    /**< Best-guess category from XDP DPI */
+    __u8  _pad[3];                     /**< Alignment padding */
+    __u8  payload[XDP_PAYLOAD_MAX];    /**< First bytes for PCRE2-JIT analysis */
+} __attribute__((packed));             /* 172 bytes */
 
 // Per-CPU heap for payload events (avoids stack overflow)
 // 172 bytes exceeds comfortable stack usage; PERCPU_ARRAY is safe
@@ -444,21 +517,25 @@ struct {
     __type(value, struct xdp_payload_event);
 } xdp_payload_heap SEC(".maps");
 
-// XDP statistics counters (per-CPU for lock-free updates)
-// Userspace sums all CPUs for total; useful for debugging and monitoring
+/**
+ * @brief XDP statistics counters for monitoring and debugging
+ *
+ * Per-CPU counters for lock-free updates. Userspace sums all CPUs
+ * to get totals. Useful for performance monitoring and troubleshooting.
+ */
 struct xdp_stats {
-    __u64 packets_total;      // All packets seen
-    __u64 packets_tcp;        // TCP packets processed
-    __u64 flows_created;      // New flow_state entries
-    __u64 flows_classified;   // Successful protocol classification
-    __u64 flows_ambiguous;    // Sent to userspace for PCRE2-JIT
-    __u64 flows_terminated;   // FIN/RST seen
-    __u64 gatekeeper_hits;    // Silenced flows (fast-pass)
-    __u64 cookie_failures;    // Socket cookie lookup failures (IPv6, etc.)
-    __u64 ringbuf_drops;      // Ring buffer full (bpf_ringbuf_output failures)
-    __u64 sockops_active;     // Sockops ACTIVE_ESTABLISHED events
-    __u64 sockops_passive;    // Sockops PASSIVE_ESTABLISHED events
-    __u64 sockops_state;      // Sockops STATE_CB events (cleanup)
+    __u64 packets_total;      /**< All packets seen by XDP */
+    __u64 packets_tcp;        /**< TCP packets processed */
+    __u64 flows_created;      /**< New flow_state entries created */
+    __u64 flows_classified;   /**< Successful protocol classification */
+    __u64 flows_ambiguous;    /**< Sent to userspace for PCRE2-JIT */
+    __u64 flows_terminated;   /**< FIN/RST seen (connection end) */
+    __u64 gatekeeper_hits;    /**< Silenced flows (fast-pass, no ringbuf) */
+    __u64 cookie_failures;    /**< Socket cookie lookup failures (IPv6, etc.) */
+    __u64 ringbuf_drops;      /**< Ring buffer full (bpf_ringbuf_output failures) */
+    __u64 sockops_active;     /**< Sockops ACTIVE_ESTABLISHED events */
+    __u64 sockops_passive;    /**< Sockops PASSIVE_ESTABLISHED events */
+    __u64 sockops_state;      /**< Sockops STATE_CB events (cleanup) */
 };
 
 struct {
@@ -468,14 +545,22 @@ struct {
     __type(value, struct xdp_stats);
 } xdp_stats_map SEC(".maps");
 
-// Flow → Socket Cookie cache (populated by sock_ops, read by XDP)
+// Flow -> Socket Cookie cache (populated by sock_ops, read by XDP)
 // sock_ops runs at socket establishment with full task context, allowing
 // bpf_get_socket_cookie() which is NOT available in XDP context.
 // XDP then looks up the pre-cached cookie for correlation with uprobe data.
 // 65K entries matches flow_states capacity.
+
+/**
+ * @brief Flow cookie cache entry for XDP-uprobe correlation
+ *
+ * Populated by sock_ops program at connection establishment when
+ * bpf_get_socket_cookie() is available. XDP reads the pre-cached
+ * cookie since it cannot call bpf_get_socket_cookie() directly.
+ */
 struct flow_cookie_entry {
-    __u64 socket_cookie;      // [8] The "Golden Thread" correlator
-    __u64 timestamp_ns;       // [8] When cached (for staleness detection)
+    __u64 socket_cookie;      /**< The "Golden Thread" correlator */
+    __u64 timestamp_ns;       /**< When cached (for staleness detection) */
 };
 
 struct {

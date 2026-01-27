@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 
+/** @cond INTERNAL */
 /*----------------------------------------------------------------------------
  * Branch Prediction Macros
  *
@@ -38,6 +39,7 @@
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
+/** @endcond */
 
 #if defined(HAVE_VECTORSCAN) || defined(HAVE_HYPERSCAN)
 #include <hs/hs.h>

@@ -34,29 +34,6 @@
 #include <strings.h>
 #include <arpa/inet.h>
 
-/**
- * @brief Parse WebSocket frame from raw data
- *
- * Parses the WebSocket frame header and validates structure.
- * Handles all three payload length encodings (7-bit, 16-bit, 64-bit)
- * and extracts masking key if present.
- *
- * @par Header Size Calculation:
- * - Base: 2 bytes (FIN/RSV/opcode + MASK/len7)
- * - +2 bytes if len7 == 126 (16-bit length)
- * - +8 bytes if len7 == 127 (64-bit length)
- * - +4 bytes if MASK bit set (masking key)
- *
- * @param[in]  data  Raw frame data buffer
- * @param[in]  len   Available data length
- * @param[out] frame Parsed frame structure
- *
- * @return Total frame size (header + payload) consumed, or:
- *         - 0 if need more data (incomplete frame)
- *         - Never returns negative; invalid frames return 0
- *
- * @note Close frames have status code extracted into frame->close_code
- */
 int ws_parse_frame(const uint8_t *data, size_t len, ws_frame_t *frame) {
     if (!data || !frame || len < 2) {
         return 0;  /* Need more data */
@@ -137,23 +114,6 @@ int ws_parse_frame(const uint8_t *data, size_t len, ws_frame_t *frame) {
     return (int)total_len;
 }
 
-/**
- * @brief Unmask WebSocket payload data in-place
- *
- * Applies the XOR unmasking transformation required by RFC 6455.
- * Client-to-server frames must be masked; server-to-client frames
- * are not masked.
- *
- * @par XOR Algorithm:
- * For each byte at position i:
- * `unmasked[i] = masked[i] XOR mask_key[i % 4]`
- *
- * @param[in,out] payload Data to unmask (modified in-place)
- * @param[in]     len     Payload length in bytes
- * @param[in]     mask_key 4-byte masking key from frame header
- *
- * @note The operation is symmetric; can also be used for masking
- */
 void ws_unmask_payload(uint8_t *payload, size_t len, const uint8_t *mask_key) {
     if (!payload || !mask_key) return;
 
@@ -162,20 +122,6 @@ void ws_unmask_payload(uint8_t *payload, size_t len, const uint8_t *mask_key) {
     }
 }
 
-/**
- * @brief Get human-readable name for WebSocket opcode
- *
- * @param[in] opcode Frame opcode value
- *
- * @return Static string with opcode name:
- *         - "CONT" for continuation
- *         - "TEXT" for text data
- *         - "BIN" for binary data
- *         - "CLOSE" for close frame
- *         - "PING" for ping
- *         - "PONG" for pong
- *         - "UNKNOWN" for reserved/invalid
- */
 const char *ws_opcode_name(ws_opcode_t opcode) {
     switch (opcode) {
         case WS_OPCODE_CONTINUATION: return "CONT";
@@ -188,15 +134,6 @@ const char *ws_opcode_name(ws_opcode_t opcode) {
     }
 }
 
-/**
- * @brief Get human-readable description for close status code
- *
- * Translates RFC 6455 Section 7.4.1 status codes to descriptions.
- *
- * @param[in] code Close status code (1000-1015 range)
- *
- * @return Static string with code description
- */
 const char *ws_close_code_name(uint16_t code) {
     switch (code) {
         case WS_CLOSE_NORMAL:           return "Normal closure";
@@ -214,25 +151,6 @@ const char *ws_close_code_name(uint16_t code) {
     }
 }
 
-/**
- * @brief Validate potential WebSocket frame data
- *
- * Performs heuristic checks to determine if data looks like a
- * valid WebSocket frame. Used to detect WebSocket traffic after
- * HTTP upgrade.
- *
- * @par Validation Checks:
- * - Opcode in valid range (0x0-0x2 or 0x8-0xA)
- * - Control frames: payload <= 125 bytes, FIN must be set
- * - Sufficient data for extended length field if needed
- *
- * @param[in] data Data buffer to analyze
- * @param[in] len  Buffer length
- *
- * @return true if data appears to be valid WebSocket frame
- *
- * @note RSV bits are not validated (extensions may use them)
- */
 bool ws_is_frame(const uint8_t *data, size_t len) {
     if (!data || len < 2) return false;
 
@@ -262,25 +180,6 @@ bool ws_is_frame(const uint8_t *data, size_t len) {
     return true;
 }
 
-/**
- * @brief Check if HTTP request is WebSocket upgrade
- *
- * Validates presence of required WebSocket handshake headers
- * per RFC 6455 Section 4.1.
- *
- * @par Required Headers:
- * - Upgrade: websocket
- * - Connection: Upgrade (or includes "Upgrade")
- * - Sec-WebSocket-Key: (base64 nonce)
- * - Sec-WebSocket-Version: (protocol version)
- *
- * @param[in] headers      Array of header strings (name/value pairs)
- * @param[in] header_count Total count (headers array has header_count*2 elements)
- *
- * @return true if all required upgrade headers present
- *
- * @note Headers array format: [name0, value0, name1, value1, ...]
- */
 bool ws_is_upgrade_request(const char *headers[], int header_count) {
     bool has_upgrade = false;
     bool has_connection_upgrade = false;
@@ -306,24 +205,6 @@ bool ws_is_upgrade_request(const char *headers[], int header_count) {
     return has_upgrade && has_connection_upgrade && has_ws_key && has_ws_version;
 }
 
-/**
- * @brief Check if HTTP response accepts WebSocket upgrade
- *
- * Validates server response for successful WebSocket handshake
- * per RFC 6455 Section 4.2.2.
- *
- * @par Required Conditions:
- * - Status code: 101 (Switching Protocols)
- * - Upgrade: websocket
- * - Connection: Upgrade
- * - Sec-WebSocket-Accept: (computed hash)
- *
- * @param[in] status_code  HTTP response status code
- * @param[in] headers      Array of header strings (name/value pairs)
- * @param[in] header_count Total count (headers array has header_count*2 elements)
- *
- * @return true if response confirms WebSocket upgrade
- */
 bool ws_is_upgrade_response(int status_code, const char *headers[], int header_count) {
     if (status_code != 101) return false;
 

@@ -20,20 +20,19 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* BoringSSL function offset entry */
+/**
+ * @brief BoringSSL function offset entry for build ID database
+ */
 struct boringssl_offset_entry {
-    const char *build_id;        /* ELF build ID hex string */
-    const char *version_info;    /* Human-readable version (e.g., "Chrome 144.0.7559.59") */
-    uint64_t ssl_read_offset;    /* File offset of SSL_read */
-    uint64_t ssl_write_offset;   /* File offset of SSL_write */
-    /* Internal functions (Golden Hooks) - may have different signatures */
-    uint64_t ssl_read_impl_offset;   /* ssl_read_impl(ssl_st*) - internal read */
-    uint64_t ssl_write_impl_offset;  /* DoPayloadWrite() - write entry point */
-    /* Async I/O hooks for Chrome's event-driven network model */
-    uint64_t socket_read_offset;     /* SSLClientSocketImpl::ReadIfReady - async read entry */
-    uint64_t on_read_ready_offset;   /* SSLClientSocketImpl::OnReadReady - async completion */
-    /* DoPayloadRead receives raw char* buffer (not IOBuffer wrapper) */
-    uint64_t do_payload_read_offset; /* SSLClientSocketImpl::DoPayloadRead - best hook point */
+    const char *build_id;        /**< ELF build ID hex string */
+    const char *version_info;    /**< Human-readable version (e.g., "Chrome 144.0.7559.59") */
+    uint64_t ssl_read_offset;    /**< File offset of SSL_read */
+    uint64_t ssl_write_offset;   /**< File offset of SSL_write */
+    uint64_t ssl_read_impl_offset;   /**< ssl_read_impl(ssl_st*) - internal read (Golden Hook) */
+    uint64_t ssl_write_impl_offset;  /**< DoPayloadWrite() - write entry point (Golden Hook) */
+    uint64_t socket_read_offset;     /**< SSLClientSocketImpl::ReadIfReady - async read entry */
+    uint64_t on_read_ready_offset;   /**< SSLClientSocketImpl::OnReadReady - async completion */
+    uint64_t do_payload_read_offset; /**< SSLClientSocketImpl::DoPayloadRead - best hook point */
 };
 
 /*
