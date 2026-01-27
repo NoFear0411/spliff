@@ -221,8 +221,7 @@ bool signature_is_binary(const char *description);
 bool signature_is_local_file(const char *description);
 
 /**
- * @name Adding New Signatures
- * @brief Guide for extending signature detection
+ * @par Adding New Signatures
  *
  * To add new file format signatures:
  *

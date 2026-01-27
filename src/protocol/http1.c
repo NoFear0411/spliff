@@ -94,11 +94,14 @@ static llhttp_settings_t g_settings;
 static bool g_initialized = false;
 
 /**
- * @defgroup http1_callbacks llhttp Callbacks
- * @brief Parser callback implementations
- * @ingroup http1
- * @internal
+ * @addtogroup http1
  * @{
+ */
+
+/**
+ * @name llhttp Callbacks
+ * @brief Parser callback implementations (internal)
+ * @internal
  */
 
 /**
@@ -376,13 +379,9 @@ static int on_message_complete(llhttp_t *parser) {
     return 0;
 }
 
-/** @} */ /* End of http1_callbacks group */
-
 /**
- * @defgroup http1_public HTTP/1.1 Public API
+ * @name HTTP/1.1 Public API
  * @brief Public parsing functions
- * @ingroup http1
- * @{
  */
 
 /**
@@ -629,7 +628,7 @@ int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t 
     return (int)(out_pos - out);
 }
 
-/** @} */ /* End of http1_public group */
+/** @} */ /* End of http1 addtogroup */
 
 /*============================================================================
  * Flow-Based HTTP/1 Parsing (Phase 3.6.5)
