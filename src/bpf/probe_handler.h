@@ -44,50 +44,52 @@ enum event_type {
     EVENT_PROCESS_EXEC = 7 /* New process exec - dynamic probe attachment */
 };
 
-/* SSL data event from BPF (must match BPF side) */
+/**
+ * @brief SSL data event from BPF (must match BPF side)
+ */
 typedef struct ssl_data_event {
-    uint64_t timestamp_ns;
-    uint64_t delta_ns;       /* Latency (function execution time) */
-    uint64_t ssl_ctx;        /* SSL context pointer for connection tracking */
-    uint64_t socket_cookie;  /* Socket cookie for XDP correlation ("Golden Thread") */
-    uint32_t pid;
-    uint32_t tid;
-    uint32_t uid;
-    uint32_t len;
-    int32_t buf_filled;
-    uint32_t event_type;     /* EVENT_SSL_READ, EVENT_SSL_WRITE, EVENT_HANDSHAKE */
-    char comm[TASK_COMM_LEN];
-    uint8_t data[MAX_BUF_SIZE];
+    uint64_t timestamp_ns;   /**< Event timestamp in nanoseconds */
+    uint64_t delta_ns;       /**< Latency (function execution time) */
+    uint64_t ssl_ctx;        /**< SSL context pointer for connection tracking */
+    uint64_t socket_cookie;  /**< Socket cookie for XDP correlation ("Golden Thread") */
+    uint32_t pid;            /**< Process ID */
+    uint32_t tid;            /**< Thread ID */
+    uint32_t uid;            /**< User ID */
+    uint32_t len;            /**< Requested data length */
+    int32_t buf_filled;      /**< Actual bytes captured (-1 on error) */
+    uint32_t event_type;     /**< EVENT_SSL_READ, EVENT_SSL_WRITE, EVENT_HANDSHAKE */
+    char comm[TASK_COMM_LEN]; /**< Process command name */
+    uint8_t data[MAX_BUF_SIZE]; /**< Captured data buffer */
 } ssl_data_event_t;
 
 /* Event callback function type */
 typedef void (*event_callback_t)(const ssl_data_event_t *event, void *ctx);
 
-/* Tracked NSS SSL FD (from SSL_ImportFD) */
+/**
+ * @brief Tracked NSS SSL FD (from SSL_ImportFD)
+ */
 typedef struct {
-    uint32_t pid;
-    uint64_t fd;         /* PRFileDesc pointer (SSL-wrapped) */
-    bool active;
+    uint32_t pid;        /**< Process ID owning this FD */
+    uint64_t fd;         /**< PRFileDesc pointer (SSL-wrapped) */
+    bool active;         /**< Whether this FD is currently active */
 } nss_ssl_fd_t;
 
-/* Probe handler state */
+/**
+ * @brief Probe handler state and filtering configuration
+ */
 typedef struct {
-    struct ring_buffer *rb;
-    event_callback_t callback;
-    void *callback_ctx;
-
-    /* Filtering */
-    char target_comm[64];
-    int *target_pids;
-    int num_target_pids;
-    int target_ppid;
-    int ppid_cache[PID_CACHE_SIZE];
-    int ppid_cache_count;
-    bool filter_ipc;        /* Filter out IPC/Unix socket traffic */
-
-    /* NSS SSL FD tracking (for IPC filtering via SSL_ImportFD) */
-    nss_ssl_fd_t nss_ssl_fds[NSS_CONN_CACHE_SIZE];
-    int nss_ssl_fd_count;
+    struct ring_buffer *rb;      /**< BPF ring buffer for events */
+    event_callback_t callback;   /**< User callback for events */
+    void *callback_ctx;          /**< User context passed to callback */
+    char target_comm[64];        /**< Filter: target process command name */
+    int *target_pids;            /**< Filter: array of target PIDs */
+    int num_target_pids;         /**< Filter: number of target PIDs */
+    int target_ppid;             /**< Filter: target parent PID */
+    int ppid_cache[PID_CACHE_SIZE]; /**< Cache of PIDs matching ppid filter */
+    int ppid_cache_count;        /**< Number of cached PIDs */
+    bool filter_ipc;             /**< Filter out IPC/Unix socket traffic */
+    nss_ssl_fd_t nss_ssl_fds[NSS_CONN_CACHE_SIZE]; /**< NSS SSL FD tracking cache */
+    int nss_ssl_fd_count;        /**< Number of tracked NSS SSL FDs */
 } probe_handler_t;
 
 /* Initialize probe handler - returns 0 on success, -1 on failure */

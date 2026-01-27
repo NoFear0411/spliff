@@ -335,19 +335,6 @@ static void dispatcher_event_callback(const ssl_data_event_t *event, void *ctx) 
  * @{
  */
 
-/**
- * @brief Initialize dispatcher context
- *
- * Sets up dispatcher with references to BPF ring buffer and worker array.
- * Does not start the dispatcher thread.
- *
- * @param[out] ctx         Dispatcher context to initialize
- * @param[in]  handler     BPF probe handler with ring buffer
- * @param[in]  workers     Array of worker contexts
- * @param[in]  num_workers Number of workers
- *
- * @return 0 on success, -1 on invalid arguments
- */
 int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
                     worker_ctx_t *workers, int num_workers) {
     if (!ctx || !handler || !workers || num_workers <= 0) {
@@ -396,38 +383,12 @@ void dispatcher_cleanup(dispatcher_ctx_t *ctx) {
     ctx->lifecycle_ctx = NULL;
 }
 
-/**
- * @brief Set process lifecycle callback for dynamic SSL detection
- *
- * Called when EVENT_PROCESS_EXEC is received. The callback can scan
- * the new process for SSL libraries and attach probes dynamically.
- *
- * @param[in] ctx      Dispatcher context
- * @param[in] cb       Callback function
- * @param[in] user_ctx User context passed to callback
- */
 void dispatcher_set_lifecycle_callback(dispatcher_ctx_t *ctx, process_lifecycle_cb_t cb, void *user_ctx) {
     if (!ctx) return;
     ctx->lifecycle_cb = cb;
     ctx->lifecycle_ctx = user_ctx;
 }
 
-/**
- * @brief Cleanup all resources for a PID across all workers
- *
- * Called when a process exits (EVENT_PROCESS_EXIT). Iterates through
- * all workers and cleans up:
- * - HTTP/2 connections and streams
- * - Pending body buffers
- * - ALPN cache entries
- * - HTTP/1.1 request cache entries
- *
- * @param[in] ctx Dispatcher context
- * @param[in] pid Process ID that exited
- *
- * @note This accesses worker state directly, which is safe because
- *       the exit event means no more events will arrive for this PID.
- */
 void dispatcher_cleanup_pid(dispatcher_ctx_t *ctx, uint32_t pid) {
     if (!ctx || !ctx->workers) return;
 
@@ -452,16 +413,6 @@ void dispatcher_cleanup_pid(dispatcher_ctx_t *ctx, uint32_t pid) {
  * @{
  */
 
-/**
- * @brief Dispatcher thread entry point
- *
- * Main loop that polls the BPF ring buffer and dispatches events.
- * Runs until running flag is cleared.
- *
- * @param[in] arg Pointer to dispatcher_ctx_t
- *
- * @return NULL
- */
 void *dispatcher_thread_main(void *arg) {
     dispatcher_ctx_t *ctx = (dispatcher_ctx_t *)arg;
     if (!ctx || !ctx->handler) {
@@ -603,23 +554,6 @@ static void format_ipv4(uint32_t ip_net, char *buf, size_t buf_size) {
              ip & 0xFF);
 }
 
-/**
- * @brief XDP event handler callback
- *
- * Called by ring_buffer__poll() for each XDP event. Event type is
- * inferred from struct size since BPF ring buffers don't carry type info.
- *
- * @par Event Types:
- * - 172 bytes (xdp_payload_event_t): AMBIGUOUS - needs PCRE2-JIT
- * - 56 bytes (xdp_packet_event_t) + FIN/RST: FLOW_END
- * - 56 bytes (xdp_packet_event_t) otherwise: FLOW_NEW
- *
- * @param[in] ctx     User context (dispatcher_ctx_t*)
- * @param[in] data    Event data
- * @param[in] data_sz Event data size
- *
- * @return 0 to continue processing
- */
 int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
     dispatcher_ctx_t *dispatcher = (dispatcher_ctx_t *)ctx;
 

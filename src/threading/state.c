@@ -67,14 +67,6 @@ worker_state_t *get_current_worker_state(void) {
     return tls_worker_state;
 }
 
-/**
- * @brief Set current worker's state in thread-local storage
- *
- * Called during worker thread initialization to enable protocol
- * parsers to access per-worker state.
- *
- * @param[in] state Worker state to associate with current thread
- */
 void set_current_worker_state(worker_state_t *state) {
     tls_worker_state = state;
 }
@@ -93,29 +85,6 @@ uint64_t get_time_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/**
- * @brief Initialize per-worker state
- *
- * Allocates all buffers and initializes data structures for a worker.
- * Called once per worker thread during startup.
- *
- * @par Allocation Strategy:
- * - HTTP/2 connection and stream pools: fixed-size arrays with LRU eviction
- * - Stream body buffers: pre-allocated to avoid malloc during processing
- * - Decompression/body buffers: shared scratch space per worker
- * - Pending body accum_bufs: allocated on-demand, reused across entries
- *
- * @par Cache Line Alignment:
- * All major allocations use aligned_alloc(64, ...) to prevent false
- * sharing between workers and improve cache performance.
- *
- * @param[out] state     Worker state to initialize
- * @param[in]  worker_id Worker ID (0 to num_workers-1) for logging
- *
- * @return 0 on success, -1 on allocation failure
- *
- * @note On failure, partially allocated resources are cleaned up
- */
 int worker_state_init(worker_state_t *state, int worker_id) {
     if (!state) {
         return -1;

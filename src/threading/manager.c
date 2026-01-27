@@ -102,20 +102,6 @@ int threading_default_workers(void) {
  * @{
  */
 
-/**
- * @brief Initialize threading manager
- *
- * Allocates and initializes all worker contexts but does not start
- * any threads. Call threading_start() to begin processing.
- *
- * @param[out] mgr         Manager structure to initialize
- * @param[in]  num_workers Number of worker threads (0 = auto-detect)
- * @param[in]  pin_cores   Whether to pin threads to CPU cores
- *
- * @return 0 on success, -1 on failure
- *
- * @note On failure, partially initialized workers are cleaned up
- */
 int threading_init(threading_mgr_t *mgr, int num_workers, bool pin_cores) {
     if (!mgr) {
         return -1;
@@ -157,23 +143,6 @@ int threading_init(threading_mgr_t *mgr, int num_workers, bool pin_cores) {
     return 0;
 }
 
-/**
- * @brief Start all threads
- *
- * Creates and starts all threads in order:
- * 1. Worker threads (with optional CPU affinity)
- * 2. Output thread
- * 3. Dispatcher thread
- *
- * @par CPU Pinning:
- * If pin_cores is enabled, workers are pinned to cores 3+ to avoid
- * contention with main/dispatcher/output threads on cores 0-2.
- *
- * @param[in] mgr     Initialized manager
- * @param[in] handler BPF probe handler for dispatcher
- *
- * @return 0 on success, -1 on failure (threads cleaned up)
- */
 int threading_start(threading_mgr_t *mgr, probe_handler_t *handler) {
     if (!mgr || !mgr->initialized || !handler) {
         return -1;
@@ -345,18 +314,6 @@ void threading_cleanup(threading_mgr_t *mgr) {
  * @{
  */
 
-/**
- * @brief Print threading statistics to stderr
- *
- * @par Output Format
- * Displays user-friendly statistics about SSL/TLS event processing:
- * - Events captured and processed
- * - Output statistics
- * - Cookie retry statistics (deferred event queue)
- * - Detailed per-worker breakdown (debug mode only)
- *
- * @param[in] mgr Threading manager
- */
 void threading_print_stats(threading_mgr_t *mgr) {
     if (!mgr || !mgr->initialized) {
         return;
@@ -455,13 +412,6 @@ void threading_print_stats(threading_mgr_t *mgr) {
  * @{
  */
 
-/**
- * @brief Check if threading is enabled and running
- *
- * @param[in] mgr Manager to check
- *
- * @return true if manager is initialized and not shutting down
- */
 bool threading_is_running(threading_mgr_t *mgr) {
     return mgr && mgr->initialized && !atomic_load(&mgr->shutdown_requested);
 }

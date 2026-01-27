@@ -601,30 +601,6 @@ void signatures_cleanup(void) {
     signature_count = 0;
 }
 
-/**
- * @brief Full file type detection with metadata
- *
- * Performs comprehensive signature detection and returns complete
- * information about the detected format including class, binary flag,
- * and trailer validation status.
- *
- * @par Detection Order:
- * 1. Special container formats (ISOBMFF, RIFF, TAR) - need deeper inspection
- * 2. Signature table scan using sorted index (longest matches first)
- *
- * @param[in]  data             Data buffer to analyze
- * @param[in]  len              Length of data buffer (must be >= 2)
- * @param[in]  validate_trailer Check trailer bytes for formats that have them
- * @param[out] result           Detection result structure (zeroed if no match)
- *
- * @return true if a signature was detected, false otherwise
- *
- * @note The result structure is always zeroed before detection begins
- * @note Trailer validation only occurs if the format has defined trailer
- *       bytes and validate_trailer is true
- *
- * @see signature_detect() for simpler API returning just description
- */
 bool signature_detect_full(const uint8_t *data, size_t len,
                            bool validate_trailer,
                            signature_result_t *result) {
@@ -670,23 +646,6 @@ bool signature_detect_full(const uint8_t *data, size_t len,
     return false;
 }
 
-/**
- * @brief Simple file type detection (legacy API)
- *
- * Simplified detection that returns only the description string.
- * For full metadata including file class and binary flag, use
- * signature_detect_full() instead.
- *
- * @param[in] data Data buffer to analyze
- * @param[in] len  Length of data buffer
- *
- * @return Description string if detected (e.g., "PNG image"),
- *         NULL if no signature matched
- *
- * @deprecated Use signature_detect_full() for complete detection info
- *
- * @see signature_detect_full()
- */
 const char *signature_detect(const uint8_t *data, size_t len) {
     signature_result_t result;
     if (signature_detect_full(data, len, false, &result)) {
@@ -695,26 +654,6 @@ const char *signature_detect(const uint8_t *data, size_t len) {
     return NULL;
 }
 
-/**
- * @brief Get human-readable name for file class
- *
- * Converts a file_class_t enum value to a display-friendly string
- * suitable for UI output.
- *
- * @param[in] file_class The classification category to name
- *
- * @return Static string with class name (never NULL):
- *         - FILE_CLASS_IMAGE → "Image"
- *         - FILE_CLASS_VIDEO → "Video"
- *         - FILE_CLASS_AUDIO → "Audio"
- *         - FILE_CLASS_ARCHIVE → "Archive"
- *         - FILE_CLASS_DOCUMENT → "Document"
- *         - FILE_CLASS_FONT → "Font"
- *         - FILE_CLASS_EXECUTABLE → "Executable"
- *         - FILE_CLASS_DATABASE → "Database"
- *         - FILE_CLASS_CONTAINER → "Container"
- *         - FILE_CLASS_UNKNOWN/other → "Unknown"
- */
 const char *signature_class_name(file_class_t file_class) {
     switch (file_class) {
         case FILE_CLASS_IMAGE:      return "Image";
@@ -730,23 +669,6 @@ const char *signature_class_name(file_class_t file_class) {
     }
 }
 
-/**
- * @brief Check if content type is binary based on description
- *
- * Looks up the description string in the signature table to
- * determine if the content should be treated as binary data
- * (displayed as hexdump rather than text).
- *
- * @param[in] description File type description from detection
- *
- * @return true if binary content, false if text content
- *
- * @note Returns false for NULL description
- * @note Returns true for descriptions not found in table
- *       (assumes special detections like ISOBMFF, RIFF, TAR are binary)
- *
- * @deprecated Use signature_detect_full() and check result.is_binary instead
- */
 bool signature_is_binary(const char *description) {
     if (!description) return false;
 
@@ -761,27 +683,6 @@ bool signature_is_binary(const char *description) {
     return true;
 }
 
-/**
- * @brief Check if content indicates local file I/O
- *
- * Identifies file signatures that suggest the SSL data is from
- * local file operations (file:// protocol, dlopen, etc.) rather
- * than HTTP traffic. Used to filter out noise from local file reads.
- *
- * @par Detected Local File Types:
- * - ELF binaries (Linux executables and libraries)
- * - Mach-O binaries (macOS executables and libraries)
- * - SQLite databases (local database files)
- * - Java class files (JVM class loading)
- *
- * @param[in] description File type description from detection
- *
- * @return true if likely local file I/O, false if HTTP content
- *
- * @note This is a heuristic; some valid HTTP downloads could
- *       match these patterns, but they're rare enough that
- *       filtering them reduces noise significantly
- */
 bool signature_is_local_file(const char *description) {
     if (!description) return false;
 

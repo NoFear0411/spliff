@@ -368,6 +368,7 @@ typedef struct flow_context {
     uint32_t uid;                   /**< User ID */
 
     /*=== Protocol Parser (union to save memory) ===*/
+    /** @brief Protocol-specific parser context (union to save memory) */
     union {
         h1_parser_ctx_t h1;         /**< HTTP/1.x context */
         h2_parser_ctx_t h2;         /**< HTTP/2 context */
