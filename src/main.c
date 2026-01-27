@@ -39,8 +39,13 @@
 #include "protocol/detector.h"
 #include "util/safe_str.h"
 
-/* BPF skeleton (generated at build time - embeds CO-RE BPF bytecode) */
+/* BPF skeleton (generated at build time - embeds CO-RE BPF bytecode)
+ * Pragma suppresses -Woverlength-strings: skeleton embeds ~1MB bytecode as
+ * string literal, exceeding C23's 65535 char minimum (bpftool limitation) */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Woverlength-strings"
 #include "spliff.skel.h"
+#pragma GCC diagnostic pop
 
 #ifdef HAVE_THREADING
 #include "threading/threading.h"
