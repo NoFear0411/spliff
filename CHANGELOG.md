@@ -2,6 +2,89 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.8] - 2026-01-29
+
+### Added
+- **Dynamic Flow Pool**: On-demand allocation via jemalloc replaces fixed 8192-slot pre-allocated pool
+  - Initial memory reduced from ~292 MB to ~9 KB (two 256-entry hash tables)
+  - No artificial capacity limit — bounded only by system memory
+  - `aligned_alloc(64, ...)` for cache-line-aligned flow contexts
+  - OOM counter (`alloc_failures`) for production monitoring
+
+- **Incremental Hash Table Resizing**: Cookie and shadow indexes grow without latency spikes
+  - Tables start at 256 entries, grow at 75% load factor
+  - Incremental migration: 8 entries moved per insert/lookup operation
+  - Adaptive batch size (8→32) under pressure to prevent resize storms
+  - Both insert and lookup drive migration (prevents stall during read-heavy workloads)
+  - New tables start clean — no tombstone accumulation after growth
+
+- **Generation Counter**: Safe pointer validation for worker threads
+  - `uint32_t generation` on `flow_context_t` incremented on each allocation
+  - `uint32_t expected_gen` on `worker_event_t` set by dispatcher at enqueue time
+  - Workers check `flow_ctx->generation != expected_gen` before processing
+  - Catches both freed and reused flows with a single 4-byte compare
+
+- **Inflight Event Reference Counting**: Prevents use-after-free during flow cleanup
+  - `_Atomic int32_t inflight_events` on `flow_context_t` tracks dispatched-but-unprocessed events
+  - Dispatcher increments before enqueue, worker decrements after processing
+  - Deferred free blocks until inflight count reaches zero
+  - All early-exit paths (cookie retry, misroute defer) properly decrement
+
+- **Deferred Free with Grace Period**: Safe memory reclamation for flow contexts
+  - Terminated flows moved to deferred FIFO queue instead of immediate free
+  - 2-second grace period ensures all in-flight worker events complete
+  - Janitor drains deferred queue during periodic sweeps
+  - Combined with generation counter provides defense-in-depth
+
+- **Intrusive Linked List**: O(active) flow traversal replaces O(8192) bitmap scan
+  - `list_prev`/`list_next` pointers in flow_context_t first cache line
+  - Janitor walks only active flows, not all 8192 slots
+  - Active list maintained via head insertion/removal
+
+- **Binary Scanner Deduplication**: "Unknown build ID" messages printed once per unique binary
+  - Static tracking of up to 64 unique build IDs
+  - Prevents repeated messages when same binary scanned by multiple code paths
+  - Diagnostic output includes binary path for easier debugging
+
+### Changed
+- **All Libraries Mandatory**: Removed all conditional compilation guards
+  - `HAVE_THREADING`, `HAVE_NGHTTP2`, `HAVE_ZSTD`, `HAVE_BROTLI`, `HAVE_ZLIB_NG`,
+    `HAVE_VECTORSCAN`/`HAVE_HYPERSCAN` — all removed
+  - Build definitions simplified to just `PCRE2_CODE_UNIT_WIDTH=8`
+  - No more fallback stubs or degraded-mode code paths
+
+- **Index Values**: Indexes store `flow_context_t*` pointers directly instead of `flow_id_t` indices
+  - Eliminates `flow_pool_get()` indirection on every lookup
+  - Dispatcher and janitor work with pointers throughout
+
+- **Cache-Line-Conscious Layout**: `flow_context_t` restructured for hot-path performance
+  - Cache line 0: identity (cookie, pid, ssl_ctx) + lifecycle (generation, list pointers)
+  - Cache line 1: flow key, timestamps, counters
+  - Cache line 2: strings (comm, alpn, ifname), state, flags
+  - Correlation lookups touch 1 cache line, janitor touches 1-2
+
+- **Flow Pool Statistics**: Updated for dynamic architecture
+  - Removed `pool_capacity` (no fixed capacity)
+  - Added `pool_alloc_failures` counter
+  - Stats display: "Active: N flows, peak M" instead of "N / 8192 active"
+
+### Removed
+- Fixed 8192-slot pre-allocated flow pool (`FLOW_POOL_CAPACITY`)
+- Bitmap-based allocation/deallocation (`FLOW_BITMAP_WORDS`)
+- `INDEX_LOAD_FACTOR` constant (replaced by incremental resize logic)
+- `flow_pool_get()` inline function (indexes return pointers directly)
+- All `#ifdef HAVE_*` conditional compilation guards across 7 source files
+- Vectorscan/Hyperscan manual fallback stub (~110 lines)
+- nghttp2 disabled-mode stubs (~90 lines)
+
+### Technical Details
+- Modified: `flow_context.h`, `flow_context.c`, `threading.h`, `dispatcher.c`, `worker.c`,
+  `main.c`, `manager.c`, `CMakeLists.txt`, `decompressor.c`, `http1.c`, `http2.c`,
+  `detector.c`, `state.c`, `binary_scanner.c`
+- New constants: `FLOW_INDEX_INITIAL_CAPACITY` (256), `FLOW_INDEX_GROW_BATCH` (8),
+  `FLOW_DEFERRED_FREE_GRACE_NS` (2s)
+- Net change: -157 lines (790 insertions, 947 deletions) across 13 files
+
 ## [0.9.7] - 2026-01-28
 
 ### Added

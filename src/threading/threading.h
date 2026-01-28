@@ -313,6 +313,7 @@ typedef struct worker_event {
     /** @{ */
     flow_id_t flow_id;           /**< Flow ID in shared pool (FLOW_ID_INVALID if none) */
     flow_context_t *flow_ctx;    /**< Resolved flow context (NULL until resolved) */
+    uint32_t expected_gen;       /**< Generation at dispatch time (for stale pointer detection) */
     bool needs_cookie_retry;     /**< True if XDP data not yet available for retry */
     /** @} */
 

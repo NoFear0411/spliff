@@ -219,6 +219,7 @@ static int process_deferred_batch(worker_ctx_t *ctx) {
             if (flow_ctx) {
                 event->flow_id = flow_ctx->self_id;
                 event->flow_ctx = flow_ctx;
+                event->expected_gen = flow_ctx->generation;
             }
         }
 
@@ -473,9 +474,26 @@ static void worker_loop(worker_ctx_t *ctx) {
         while (work_done < NAPI_BUDGET &&
                ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, &event)) {
 
+            /* Save original flow pointer for inflight tracking.
+             * Generation check may NULL event->flow_ctx, but we still
+             * need to decrement the counter the dispatcher incremented. */
+            flow_context_t *inflight_flow_ctx = event->flow_ctx;
+
+            /* Generation check: detect stale flow pointers (flow freed+reused) */
+            if (event->flow_ctx &&
+                event->flow_ctx->generation != event->expected_gen) {
+                event->flow_ctx = NULL;  /* Stale — treat as uncorrelated */
+            }
+
             /* Check if cookie retry needed */
             if (event->needs_cookie_retry && event->flow_ctx == NULL) {
                 if (defer_event_for_retry(ctx, event) == 0) {
+                    /* Decrement inflight on original flow (generation check
+                     * may have NULLed flow_ctx, but dispatcher incremented) */
+                    if (inflight_flow_ctx) {
+                        atomic_fetch_sub_explicit(&inflight_flow_ctx->inflight_events,
+                                                   1, memory_order_release);
+                    }
                     /* Successfully deferred - don't count against budget */
                     continue;
                 }
@@ -671,6 +689,12 @@ static void worker_loop(worker_ctx_t *ctx) {
                                             my_id, event->flow_ctx->self_id);
                                 }
                                 if (defer_event_for_retry(ctx, event) == 0) {
+                                    /* Decrement inflight — will be re-processed later */
+                                    if (inflight_flow_ctx) {
+                                        atomic_fetch_sub_explicit(
+                                            &inflight_flow_ctx->inflight_events,
+                                            1, memory_order_release);
+                                    }
                                     continue; /* Skip process_worker_event, will retry later */
                                 }
                                 /* Defer failed (queue full), process anyway */
@@ -691,6 +715,15 @@ static void worker_loop(worker_ctx_t *ctx) {
             }
 
             process_worker_event(ctx, event);
+
+            /* Decrement in-flight count so deferred free knows we're done.
+             * Use saved pointer — event->flow_ctx may have been NULLed by
+             * generation check, but the dispatcher still incremented inflight. */
+            if (inflight_flow_ctx) {
+                atomic_fetch_sub_explicit(&inflight_flow_ctx->inflight_events, 1,
+                                           memory_order_release);
+            }
+
             pool_free(&ctx->event_pool, event);
             work_done++;
         }

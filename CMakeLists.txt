@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(spliff
-    VERSION 0.9.7
+    VERSION 0.9.8
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C
@@ -616,25 +616,6 @@ target_link_libraries(spliff PRIVATE
 
 # Compile definitions for all features
 target_compile_definitions(spliff PRIVATE
-    # HTTP parsing
-    HAVE_LLHTTP
-    HAVE_NGHTTP2
-    # Compression
-    HAVE_ZSTD
-    HAVE_BROTLI
-    $<$<BOOL:${HAVE_ZLIB_NG}>:HAVE_ZLIB_NG>
-    # Threading
-    HAVE_THREADING
-    HAVE_XDP
-    HAVE_LIBURCU
-    # Memory allocator
-    $<$<BOOL:${HAVE_JEMALLOC}>:HAVE_JEMALLOC>
-    $<$<BOOL:${HAVE_MIMALLOC}>:HAVE_MIMALLOC>
-    # Pattern matching engine
-    $<$<BOOL:${HAVE_VECTORSCAN}>:HAVE_VECTORSCAN>
-    $<$<BOOL:${HAVE_HYPERSCAN}>:HAVE_HYPERSCAN>
-    $<$<BOOL:${HAVE_PCRE2_PATTERNS}>:HAVE_PCRE2_PATTERNS>
-    HAVE_PCRE2
     PCRE2_CODE_UNIT_WIDTH=8
 )
 
@@ -677,7 +658,7 @@ target_link_libraries(test_http1 PRIVATE
     PkgConfig::BROTLI
 )
 target_compile_definitions(test_http1 PRIVATE
-    HAVE_LLHTTP HAVE_NGHTTP2 HAVE_ZSTD HAVE_BROTLI
+    PCRE2_CODE_UNIT_WIDTH=8
 )
 add_test(NAME http1_parser_tests COMMAND test_http1)
 
@@ -696,7 +677,7 @@ target_link_libraries(test_http2 PRIVATE
     PkgConfig::BROTLI
 )
 target_compile_definitions(test_http2 PRIVATE
-    HAVE_LLHTTP HAVE_NGHTTP2 HAVE_ZSTD HAVE_BROTLI
+    PCRE2_CODE_UNIT_WIDTH=8
 )
 add_test(NAME http2_parser_tests COMMAND test_http2)
 

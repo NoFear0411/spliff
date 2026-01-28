@@ -41,9 +41,7 @@
 #include "../correlation/flow_context.h"
 #include "../output/display.h"
 #include "../content/decompressor.h"
-#ifdef HAVE_THREADING
 #include "../threading/threading.h"
-#endif
 #include <llhttp.h>
 #include <string.h>
 #include <strings.h>
@@ -1078,7 +1076,6 @@ int http1_parse_flow(struct flow_context *flow_ctx, const uint8_t *data, size_t 
     return (int)(parsed > 0 ? parsed : len);
 }
 
-#ifdef HAVE_THREADING
 /**
  * @brief Unified HTTP/1 event processing entry point
  *
@@ -1162,6 +1159,5 @@ bool http1_try_process_event(const uint8_t *data, size_t len,
 
     return false;  /* No flow context or flow-based parser failed */
 }
-#endif /* HAVE_THREADING */
 
 /** @} */ /* End of http1 addtogroup */

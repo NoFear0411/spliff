@@ -45,9 +45,7 @@
 #include <stdio.h>
 #include <time.h>
 
-#ifdef HAVE_NGHTTP2
 #include <nghttp2/nghttp2.h>
-#endif
 
 /**
  * @brief Thread-local storage for current worker state
@@ -146,7 +144,6 @@ int worker_state_init(worker_state_t *state, int worker_id) {
         goto cleanup;
     }
 
-#ifdef HAVE_NGHTTP2
     /* Create nghttp2 session callbacks (thread-local copy) */
     if (nghttp2_session_callbacks_new(&state->h2_callbacks) != 0) {
         fprintf(stderr, "Worker %d: failed to create nghttp2 callbacks\n", worker_id);
@@ -156,7 +153,6 @@ int worker_state_init(worker_state_t *state, int worker_id) {
     /* Note: The actual callback setup will be done by http2 module
      * when it's updated to use per-worker state. For now, we just
      * create the callback object. */
-#endif
 
     state->initialized = true;
     return 0;
@@ -198,7 +194,6 @@ void worker_state_cleanup(worker_state_t *state) {
         h2_connection_local_t *conns = (h2_connection_local_t *)state->h2_connections;
         for (int i = 0; i < state->h2_connection_capacity; i++) {
             if (conns[i].active) {
-#ifdef HAVE_NGHTTP2
                 if (conns[i].server_session) {
                     nghttp2_session_del(conns[i].server_session);
                     conns[i].server_session = NULL;
@@ -207,7 +202,6 @@ void worker_state_cleanup(worker_state_t *state) {
                     nghttp2_hd_inflate_del(conns[i].response_inflater);
                     conns[i].response_inflater = NULL;
                 }
-#endif
                 if (conns[i].response_buf) {
                     free(conns[i].response_buf);
                     conns[i].response_buf = NULL;
@@ -235,13 +229,11 @@ void worker_state_cleanup(worker_state_t *state) {
         state->body_buf = NULL;
     }
 
-#ifdef HAVE_NGHTTP2
     /* Free nghttp2 callbacks */
     if (state->h2_callbacks) {
         nghttp2_session_callbacks_del(state->h2_callbacks);
         state->h2_callbacks = NULL;
     }
-#endif
 
     state->initialized = false;
 }
@@ -329,14 +321,12 @@ h2_connection_local_t *worker_get_h2_connection(worker_state_t *state,
     }
     slot->response_buf_len = 0;
 
-#ifdef HAVE_NGHTTP2
     /* Create HPACK inflater */
     if (nghttp2_hd_inflate_new(&slot->response_inflater) != 0) {
         free(slot->response_buf);
         slot->active = false;
         return NULL;
     }
-#endif
 
     state->h2_connection_count++;
     return slot;
@@ -353,7 +343,6 @@ void worker_cleanup_h2_connection(worker_state_t *state, h2_connection_local_t *
         return;
     }
 
-#ifdef HAVE_NGHTTP2
     if (conn->server_session) {
         nghttp2_session_del(conn->server_session);
         conn->server_session = NULL;
@@ -362,7 +351,6 @@ void worker_cleanup_h2_connection(worker_state_t *state, h2_connection_local_t *
         nghttp2_hd_inflate_del(conn->response_inflater);
         conn->response_inflater = NULL;
     }
-#endif
 
     if (conn->response_buf) {
         free(conn->response_buf);

@@ -25,6 +25,33 @@
 /* BoringSSL signature string to search for (quick presence check) */
 #define BORINGSSL_SIG_THIRD_PARTY "third_party/boringssl"
 
+/* Deduplication for "Unknown build ID" messages.
+ * Prevents spamming stderr when the same binary is scanned by
+ * multiple code paths (process exec handler + EDR discovery). */
+#define MAX_UNKNOWN_BUILD_IDS 64
+#define BUILD_ID_HEX_LEN     64   /* Max hex string length */
+static char g_unknown_build_ids[MAX_UNKNOWN_BUILD_IDS][BUILD_ID_HEX_LEN];
+static int  g_unknown_build_id_count = 0;
+
+static bool is_build_id_already_reported(const char *build_id) {
+    for (int i = 0; i < g_unknown_build_id_count; i++) {
+        if (strcmp(g_unknown_build_ids[i], build_id) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void mark_build_id_reported(const char *build_id) {
+    if (g_unknown_build_id_count >= MAX_UNKNOWN_BUILD_IDS) {
+        return;  /* Table full — stop tracking, allow repeats */
+    }
+    strncpy(g_unknown_build_ids[g_unknown_build_id_count], build_id,
+            BUILD_ID_HEX_LEN - 1);
+    g_unknown_build_ids[g_unknown_build_id_count][BUILD_ID_HEX_LEN - 1] = '\0';
+    g_unknown_build_id_count++;
+}
+
 /* Chrome binary paths to check */
 static const char *chrome_paths[] = {
     "/opt/google/chrome/chrome",
@@ -266,20 +293,25 @@ int scan_binary_for_boringssl(const char *binary_path,
     const struct boringssl_offset_entry *entry = lookup_offsets_by_build_id(offsets->build_id);
 
     if (!entry) {
-        fprintf(stderr, "[scanner] Unknown build ID: %s\n", offsets->build_id);
-        fprintf(stderr, "[scanner] \n");
-        fprintf(stderr, "[scanner] To add support for this binary:\n");
-        fprintf(stderr, "[scanner]   1. Download debug symbols for this browser version\n");
-        fprintf(stderr, "[scanner]   2. Run: nm -C <debug-symbols> | grep -E ' t SSL_read$| t SSL_write$'\n");
-        fprintf(stderr, "[scanner]   3. Add entry to src/bpf/boringssl_offsets.h\n");
-        fprintf(stderr, "[scanner] \n");
-        fprintf(stderr, "[scanner] Example entry:\n");
-        fprintf(stderr, "[scanner]   {\n");
-        fprintf(stderr, "[scanner]       .build_id = \"%s\",\n", offsets->build_id);
-        fprintf(stderr, "[scanner]       .version_info = \"Browser X.Y.Z\",\n");
-        fprintf(stderr, "[scanner]       .ssl_read_offset = 0x????????,\n");
-        fprintf(stderr, "[scanner]       .ssl_write_offset = 0x????????,\n");
-        fprintf(stderr, "[scanner]   },\n");
+        /* Only print the verbose help message once per unique build ID */
+        if (!is_build_id_already_reported(offsets->build_id)) {
+            mark_build_id_reported(offsets->build_id);
+            fprintf(stderr, "[scanner] Unknown build ID: %s (%s)\n",
+                    offsets->build_id, binary_path);
+            fprintf(stderr, "[scanner] \n");
+            fprintf(stderr, "[scanner] To add support for this binary:\n");
+            fprintf(stderr, "[scanner]   1. Download debug symbols for this browser version\n");
+            fprintf(stderr, "[scanner]   2. Run: nm -C <debug-symbols> | grep -E ' t SSL_read$| t SSL_write$'\n");
+            fprintf(stderr, "[scanner]   3. Add entry to src/bpf/boringssl_offsets.h\n");
+            fprintf(stderr, "[scanner] \n");
+            fprintf(stderr, "[scanner] Example entry:\n");
+            fprintf(stderr, "[scanner]   {\n");
+            fprintf(stderr, "[scanner]       .build_id = \"%s\",\n", offsets->build_id);
+            fprintf(stderr, "[scanner]       .version_info = \"Browser X.Y.Z\",\n");
+            fprintf(stderr, "[scanner]       .ssl_read_offset = 0x????????,\n");
+            fprintf(stderr, "[scanner]       .ssl_write_offset = 0x????????,\n");
+            fprintf(stderr, "[scanner]   },\n");
+        }
         return -1;
     }
 

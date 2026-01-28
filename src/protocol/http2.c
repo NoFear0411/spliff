@@ -58,16 +58,13 @@
 #include "../content/decompressor.h"
 #include "../content/signatures.h"
 #include "../correlation/flow_context.h"
-#ifdef HAVE_THREADING
 #include "../threading/threading.h"
-#endif
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 #include <strings.h>
 
-#ifdef HAVE_NGHTTP2
 #include <nghttp2/nghttp2.h>
 #include <unistd.h>
 #include <libgen.h>
@@ -1299,7 +1296,6 @@ void http2_process_frame_flow(const uint8_t *data, int len,
              event->pid, (unsigned long long)event->ssl_ctx);
 }
 
-#ifdef HAVE_THREADING
 /**
  * @brief Unified HTTP/2 event processing entry point
  *
@@ -1468,92 +1464,3 @@ bool http2_try_process_event(const uint8_t *data, size_t len,
 
     return false;  /* Not HTTP/2 - let caller try other protocols */
 }
-#endif /* HAVE_THREADING */
-
-#else /* !HAVE_NGHTTP2 */
-
-/* Stub implementation when nghttp2 is not available */
-
-/** @cond INTERNAL */
-/** Flag indicating if HTTP/2 stub module has been initialized */
-static bool g_h2_initialized = false;
-/** @endcond */
-
-int http2_init(void) {
-    g_h2_initialized = true;
-    return 0;
-}
-
-void http2_cleanup(void) {
-    g_h2_initialized = false;
-}
-
-const char *http2_frame_name(int type) {
-    static const char *names[] = {
-        "DATA", "HEADERS", "PRIORITY", "RST_STREAM", "SETTINGS",
-        "PUSH_PROMISE", "PING", "GOAWAY", "WINDOW_UPDATE", "CONTINUATION"
-    };
-    return (type >= 0 && type < 10) ? names[type] : "UNKNOWN";
-}
-
-bool http2_is_preface(const uint8_t *data, size_t len) {
-    const char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    return len >= 24 && memcmp(data, preface, 24) == 0;
-}
-
-void http2_process_frame_flow(const uint8_t *data, int len,
-                              const ssl_data_event_t *event,
-                              flow_context_t *flow_ctx) {
-    (void)data;
-    (void)len;
-    (void)event;
-    (void)flow_ctx;
-    /* No-op without nghttp2 */
-}
-
-struct nghttp2_session_callbacks *http2_get_callbacks(void) {
-    return NULL;
-}
-
-void *http2_create_callback_ctx(flow_context_t *flow_ctx) {
-    (void)flow_ctx;
-    return NULL;
-}
-
-void http2_free_callback_ctx(void *callback_ctx) {
-    (void)callback_ctx;
-}
-
-void http2_set_callback_event(void *callback_ctx, const ssl_data_event_t *event) {
-    (void)callback_ctx;
-    (void)event;
-}
-
-bool http2_is_valid_frame_header(const uint8_t *data, size_t len) {
-    (void)data;
-    (void)len;
-    return false;
-}
-
-#ifdef HAVE_THREADING
-/**
- * @brief Stub HTTP/2 event processing when nghttp2 is unavailable
- *
- * @param[in] data   Raw data buffer (unused)
- * @param[in] len    Data length (unused)
- * @param[in] event  Worker event (unused)
- * @param[in] worker Worker context (unused)
- * @return false (no HTTP/2 support without nghttp2)
- */
-bool http2_try_process_event(const uint8_t *data, size_t len,
-                             struct worker_event *event,
-                             struct worker_ctx *worker) {
-    (void)data;
-    (void)len;
-    (void)event;
-    (void)worker;
-    return false;  /* No HTTP/2 support without nghttp2 */
-}
-#endif /* HAVE_THREADING */
-
-#endif /* HAVE_NGHTTP2 */

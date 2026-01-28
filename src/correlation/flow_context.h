@@ -4,17 +4,17 @@
  * spliff - eBPF-based SSL/TLS traffic sniffer
  * Copyright (C) 2025-2026 spliff authors
  *
- * flow_context.h - Shared Pool Architecture for XDP-SSL Correlation
+ * flow_context.h - Dynamic Flow Pool with Dual Index for XDP-SSL Correlation
  *
- * This module implements the "Shared Pool with Dual Index" architecture,
- * the gold standard for eBPF-based observability. Key principles:
+ * This module implements the "Dynamic Pool with Dual Index" architecture:
  *
- *   1. SINGLE SOURCE OF TRUTH: All flow data lives in one pre-allocated pool
- *   2. DUAL INDEXING: Two indexes point to the same pool entries
- *      - cookie_index: socket_cookie → flow_id (primary, fast path)
- *      - shadow_index: (pid, ssl_ctx) → flow_id (fallback for early events)
- *   3. ZERO-COPY: Data never moves, only 4-byte index entries change
+ *   1. SINGLE SOURCE OF TRUTH: All flow data in dynamically allocated contexts
+ *   2. DUAL INDEXING: Two incrementally-resizing hash tables point to contexts
+ *      - cookie_index: socket_cookie → flow_context_t* (primary, fast path)
+ *      - shadow_index: (pid, ssl_ctx) → flow_context_t* (fallback for early events)
+ *   3. ZERO-COPY: Data never moves, only pointer-sized index entries change
  *   4. ATOMIC HANDOVER: Cookie promotion is a single index insertion
+ *   5. NO CAPACITY LIMIT: Flows allocated on demand via jemalloc
  *
  * @see docs/SHARED_POOL_ARCHITECTURE.md for full design documentation
  */
@@ -35,21 +35,21 @@
 
 /**
  * @defgroup flow_config Flow Context Configuration
- * @brief Compile-time configuration for the shared pool
+ * @brief Compile-time configuration for the dynamic pool
  * @{
  */
-
-/** Maximum concurrent flows (power of 2 for efficient hashing) */
-#define FLOW_POOL_CAPACITY      8192
 
 /** Flow timeout in nanoseconds (60 seconds) */
 #define FLOW_TIMEOUT_NS         (60ULL * 1000000000ULL)
 
-/** Number of 64-bit words in the free bitmap */
-#define FLOW_BITMAP_WORDS       (FLOW_POOL_CAPACITY / 64)
+/** Initial hash table capacity (power of 2, grows as needed) */
+#define FLOW_INDEX_INITIAL_CAPACITY  256
 
-/** Index load factor - resize when 75% full (not implemented, fixed size) */
-#define INDEX_LOAD_FACTOR       0.75
+/** Entries migrated per insert/lookup during incremental resize */
+#define FLOW_INDEX_GROW_BATCH        8
+
+/** Deferred free grace period: 2 seconds (protects stale worker pointers) */
+#define FLOW_DEFERRED_FREE_GRACE_NS  (2ULL * 1000000000ULL)
 
 /** @} */
 
@@ -59,17 +59,15 @@
 
 /**
  * @defgroup flow_types Flow Context Types
- * @brief Core type definitions for the shared pool
+ * @brief Core type definitions for the dynamic pool
  * @{
  */
 
 /**
- * @brief Flow identifier - index into the pool
+ * @brief Flow identifier - monotonic allocation counter
  *
- * Using a 32-bit ID instead of a pointer provides:
- * - Smaller index entries (4 bytes vs 8 bytes)
- * - Bounds checking capability
- * - Same pattern as eBPF map values
+ * Using a 32-bit ID provides debugging traceability.
+ * Indexes now store pointers directly; this ID is for logging only.
  */
 typedef uint32_t flow_id_t;
 
@@ -322,6 +320,7 @@ typedef struct {
  * @par Memory Layout
  * Aligned to 64 bytes for cache line optimization. Fields are ordered
  * to minimize padding and group frequently-accessed data together.
+ * Cache line 0 contains identity + lifecycle (generation, list pointers).
  *
  * @par Ownership
  * Each flow_context_t is owned by exactly one worker thread, determined
@@ -329,19 +328,22 @@ typedef struct {
  * cookie unknown). This eliminates the need for locking.
  *
  * @par Lifecycle
- * 1. Allocated from pool when first event arrives
+ * 1. Allocated via aligned_alloc when first event arrives
  * 2. Added to shadow_index immediately (always has pid+ssl_ctx)
  * 3. Added to cookie_index when socket_cookie becomes known
  * 4. Parser initialized when ALPN detected
- * 5. Freed on timeout or explicit termination
+ * 5. Freed via deferred free (2s grace) on timeout or termination
  */
 typedef struct flow_context {
-    /*=== Identity (32 bytes) ===*/
+    /*=== Cache Line 0: Identity + Lifecycle (64 bytes) ===*/
     uint64_t socket_cookie;         /**< Primary key (0 if unknown) */
     uint32_t pid;                   /**< Process ID */
+    uint32_t generation;            /**< Allocation generation (never 0) */
     uint64_t ssl_ctx;               /**< SSL context pointer */
-    flow_id_t self_id;              /**< Own index in pool (for debugging) */
-    uint32_t _pad1;                 /**< Alignment padding */
+    flow_id_t self_id;              /**< Monotonic ID (for debugging/logging) */
+    uint32_t _pad0;                 /**< Alignment padding */
+    struct flow_context *list_prev; /**< Active/deferred list: previous */
+    struct flow_context *list_next; /**< Active/deferred list: next */
 
     /*=== Network View - from XDP (48 bytes) ===*/
     flow_key_t flow;                /**< 5-tuple: IPs and ports (28 bytes) */
@@ -387,33 +389,20 @@ typedef struct flow_context {
     _Atomic bool active;
 
     /**
+     * @brief Count of events dispatched but not yet processed by workers.
+     *
+     * Incremented by dispatcher when dispatching an event with this flow_ctx.
+     * Decremented by worker after finishing event processing.
+     * Deferred free will not release resources while inflight_events > 0.
+     */
+    _Atomic int32_t inflight_events;
+
+    /**
      * @brief Home worker ID for "Sticky" worker affinity
      *
      * Implements the "Hybrid Sticky" architecture for thread-safe access
      * without locking. The first worker to process an event for this flow
      * claims ownership via atomic CAS (Compare-And-Swap).
-     *
-     * @par Discovery Phase (Claim)
-     * @code
-     *   uint32_t expected = WORKER_ID_NONE;
-     *   if (atomic_compare_exchange_strong(&ctx->home_worker_id, &expected, my_id)) {
-     *       // I am now the home worker - initialize parser state
-     *   }
-     * @endcode
-     *
-     * @par Data Phase (Route)
-     * @code
-     *   if (atomic_load(&ctx->home_worker_id) == my_id) {
-     *       // Direct path: process locally
-     *   } else {
-     *       // Forward to home worker via SPSC ring
-     *   }
-     * @endcode
-     *
-     * @par Benefits
-     * - No mutex contention (single-writer guarantee)
-     * - Cache-friendly (all flow state in one structure)
-     * - Linear scaling with worker count
      *
      * @note Value is WORKER_ID_NONE (UINT32_MAX) until claimed
      */
@@ -448,31 +437,35 @@ enum flow_flags {
 
 /**
  * @defgroup flow_indexes Index Structures
- * @brief Hash tables mapping keys to flow_id
+ * @brief Incrementally-resizing hash tables mapping keys to flow pointers
  * @{
  */
 
 /**
  * @brief Cookie index entry
  *
- * Maps socket_cookie to flow_id. Uses open addressing with
+ * Maps socket_cookie to flow_context_t pointer. Uses open addressing with
  * linear probing for collision resolution.
  */
 typedef struct {
     uint64_t cookie;                /**< Socket cookie (key) */
-    flow_id_t id;                   /**< Flow ID (value) */
-    uint32_t _pad;                  /**< Alignment */
+    flow_context_t *ctx;            /**< Flow context pointer (value) */
 } cookie_entry_t;
 
 /**
- * @brief Cookie index hash table
+ * @brief Cookie index hash table with incremental resizing
  *
  * Primary index for fast lookups when socket_cookie is known.
- * Most lookups should hit this index.
+ * Grows incrementally: when load factor exceeds 75%, a new table
+ * is allocated and entries migrate in batches of FLOW_INDEX_GROW_BATCH
+ * per insert/lookup operation. Zero latency spikes.
  */
 typedef struct {
-    cookie_entry_t *buckets;        /**< Hash table buckets */
-    size_t capacity;                /**< Number of buckets */
+    cookie_entry_t *buckets;        /**< Active table */
+    cookie_entry_t *old_buckets;    /**< Previous table (NULL if not migrating) */
+    size_t capacity;                /**< Active table size */
+    size_t old_capacity;            /**< Previous table size (0 if done) */
+    size_t migrate_pos;             /**< Next old bucket to migrate */
     _Atomic uint64_t count;         /**< Active entries */
     _Atomic uint64_t hits;          /**< Successful lookups */
     _Atomic uint64_t misses;        /**< Failed lookups */
@@ -481,24 +474,28 @@ typedef struct {
 /**
  * @brief Shadow index entry
  *
- * Maps (pid, ssl_ctx) pair to flow_id. Used as fallback when
+ * Maps (pid, ssl_ctx) pair to flow_context_t pointer. Used as fallback when
  * socket_cookie is not yet known.
  */
 typedef struct {
     uint32_t pid;                   /**< Process ID (key part 1) */
     uint64_t ssl_ctx;               /**< SSL context (key part 2) */
-    flow_id_t id;                   /**< Flow ID (value) */
+    flow_context_t *ctx;            /**< Flow context pointer (value) */
 } shadow_entry_t;
 
 /**
- * @brief Shadow index hash table
+ * @brief Shadow index hash table with incremental resizing
  *
  * Fallback index for early SSL events before socket_cookie is known.
  * Every flow has an entry here; not all flows are in cookie_index.
+ * Same incremental resize strategy as cookie_index.
  */
 typedef struct {
-    shadow_entry_t *buckets;        /**< Hash table buckets */
-    size_t capacity;                /**< Number of buckets */
+    shadow_entry_t *buckets;        /**< Active table */
+    shadow_entry_t *old_buckets;    /**< Previous table (NULL if not migrating) */
+    size_t capacity;                /**< Active table size */
+    size_t old_capacity;            /**< Previous table size (0 if done) */
+    size_t migrate_pos;             /**< Next old bucket to migrate */
     _Atomic uint64_t count;         /**< Active entries */
     _Atomic uint64_t hits;          /**< Successful lookups */
     _Atomic uint64_t promotions;    /**< Flows promoted to cookie_index */
@@ -512,33 +509,32 @@ typedef struct {
 
 /**
  * @defgroup flow_pool Flow Pool
- * @brief Pre-allocated pool of flow contexts
+ * @brief Dynamic pool of flow contexts with deferred free
  * @{
  */
 
 /**
- * @brief Flow context pool - the single source of truth
+ * @brief Dynamic flow context pool
  *
- * All flow_context_t instances live in this pre-allocated array.
- * The indexes (cookie_index, shadow_index) store flow_id values
- * that index into this pool.
- *
- * @par Allocation Strategy
- * Uses a bitmap for O(1) free slot finding via __builtin_ctzll().
- * Each bit represents one slot: 1 = free, 0 = allocated.
+ * Flows are allocated on demand via aligned_alloc (64-byte aligned for
+ * cache line optimization). An intrusive doubly-linked list tracks active
+ * flows for O(active) janitor traversal. Freed flows enter a deferred
+ * free queue (2s grace period) to protect against stale worker pointers.
  *
  * @par Thread Safety
  * Pool allocation/deallocation must be done by a single thread
- * (the dispatcher). Workers only read/write existing slots.
+ * (the dispatcher). Workers only read/write existing contexts.
  */
 typedef struct {
-    flow_context_t *slots;              /**< Pre-allocated context array */
-    size_t capacity;                    /**< Total number of slots */
-    uint64_t free_bitmap[FLOW_BITMAP_WORDS]; /**< 1=free, 0=used */
-    _Atomic uint64_t allocated;         /**< Currently allocated count */
-    _Atomic uint64_t peak;              /**< Peak allocation (high water) */
-    _Atomic uint64_t total_allocs;      /**< Total allocations */
-    _Atomic uint64_t total_frees;       /**< Total frees */
+    flow_context_t *active_head;    /**< Head of active doubly-linked list */
+    flow_context_t *deferred_head;  /**< Deferred free FIFO: oldest */
+    flow_context_t *deferred_tail;  /**< Deferred free FIFO: newest */
+    _Atomic uint64_t allocated;     /**< Currently active count */
+    _Atomic uint64_t peak;          /**< Peak allocation (high water) */
+    _Atomic uint64_t total_allocs;  /**< Lifetime allocations */
+    _Atomic uint64_t total_frees;   /**< Lifetime frees */
+    _Atomic uint64_t alloc_failures; /**< OOM counter */
+    _Atomic uint64_t next_id;       /**< Monotonic ID counter */
 } flow_pool_t;
 
 /** @} */
@@ -573,67 +569,61 @@ typedef struct {
 
 /**
  * @defgroup flow_pool_ops Pool Operations
- * @brief Allocation and deallocation from the pool
+ * @brief Allocation and deallocation from the dynamic pool
  * @{
  */
 
 /**
  * @brief Initialize the flow pool
  *
- * Allocates the slot array and initializes the free bitmap.
- * All slots start as free (bitmap bits = 1).
+ * Zeroes the struct and initializes counters. No pre-allocation.
  *
- * @param pool      Pool to initialize
- * @param capacity  Number of slots (should be FLOW_POOL_CAPACITY)
- * @return 0 on success, -1 on allocation failure
+ * @param pool  Pool to initialize
+ * @return 0 on success, -1 on failure
  */
-int flow_pool_init(flow_pool_t *pool, size_t capacity);
+int flow_pool_init(flow_pool_t *pool);
 
 /**
  * @brief Cleanup the flow pool
  *
- * Frees parser resources for all active slots, then frees the array.
+ * Frees all active and deferred flows.
  *
  * @param pool  Pool to cleanup
  */
 void flow_pool_cleanup(flow_pool_t *pool);
 
 /**
- * @brief Allocate a slot from the pool
+ * @brief Allocate a new flow context
  *
- * Finds a free slot using the bitmap (O(1) with __builtin_ctzll).
- * Initializes the slot to zeroed state with self_id set.
+ * Uses aligned_alloc(64, sizeof(flow_context_t)) via jemalloc.
+ * Initializes to zeroed state, assigns monotonic ID and generation.
+ * Inserts at head of active list.
  *
  * @param pool  The flow pool
- * @return flow_id of allocated slot, or FLOW_ID_INVALID if full
+ * @return Pointer to new flow_context_t, or NULL if OOM
  */
-flow_id_t flow_pool_alloc(flow_pool_t *pool);
+flow_context_t *flow_pool_alloc(flow_pool_t *pool);
 
 /**
- * @brief Free a slot back to the pool
+ * @brief Free a flow context (deferred)
  *
- * Frees any parser resources, marks slot inactive, updates bitmap.
+ * Marks inactive, removes from active list, adds to deferred FIFO.
+ * Actual free() happens after FLOW_DEFERRED_FREE_GRACE_NS.
  *
  * @param pool  The flow pool
- * @param id    The flow_id to free
+ * @param ctx   The flow context to free
  */
-void flow_pool_free(flow_pool_t *pool, flow_id_t id);
+void flow_pool_free(flow_pool_t *pool, flow_context_t *ctx);
 
 /**
- * @brief Get pointer to flow context by ID
+ * @brief Drain deferred free queue
  *
- * Performs bounds checking before returning pointer.
+ * Frees entries whose grace period has expired.
  *
  * @param pool  The flow pool
- * @param id    The flow_id
- * @return Pointer to flow_context_t, or NULL if invalid ID
+ * @param now   Current timestamp in nanoseconds
  */
-static inline flow_context_t *flow_pool_get(flow_pool_t *pool, flow_id_t id) {
-    if (!pool || !pool->slots || id >= pool->capacity) {
-        return NULL;
-    }
-    return &pool->slots[id];
-}
+void flow_pool_drain_deferred(flow_pool_t *pool, uint64_t now);
 
 /** @} */
 
@@ -651,7 +641,7 @@ static inline flow_context_t *flow_pool_get(flow_pool_t *pool, flow_id_t id) {
  * @brief Initialize cookie index
  *
  * @param idx       Index to initialize
- * @param capacity  Number of buckets
+ * @param capacity  Initial number of buckets
  * @return 0 on success, -1 on failure
  */
 int cookie_index_init(cookie_index_t *idx, size_t capacity);
@@ -666,21 +656,26 @@ void cookie_index_cleanup(cookie_index_t *idx);
 /**
  * @brief Insert into cookie index
  *
+ * Drives incremental migration if in progress. Triggers growth at 75% load.
+ *
  * @param idx     The index
  * @param cookie  Socket cookie (key)
- * @param id      Flow ID (value)
- * @return 0 on success, -1 if full
+ * @param ctx     Flow context pointer (value)
+ * @return 0 on success, -1 if full or allocation failure
  */
-int cookie_index_insert(cookie_index_t *idx, uint64_t cookie, flow_id_t id);
+int cookie_index_insert(cookie_index_t *idx, uint64_t cookie, flow_context_t *ctx);
 
 /**
  * @brief Lookup in cookie index
  *
+ * Searches active table first, then old table if migration in progress.
+ * Drives incremental migration on each call.
+ *
  * @param idx     The index
  * @param cookie  Socket cookie to find
- * @return flow_id, or FLOW_ID_INVALID if not found
+ * @return flow_context_t pointer, or NULL if not found
  */
-flow_id_t cookie_index_lookup(cookie_index_t *idx, uint64_t cookie);
+flow_context_t *cookie_index_lookup(cookie_index_t *idx, uint64_t cookie);
 
 /**
  * @brief Remove from cookie index
@@ -694,7 +689,7 @@ void cookie_index_remove(cookie_index_t *idx, uint64_t cookie);
  * @brief Initialize shadow index
  *
  * @param idx       Index to initialize
- * @param capacity  Number of buckets
+ * @param capacity  Initial number of buckets
  * @return 0 on success, -1 on failure
  */
 int shadow_index_init(shadow_index_t *idx, size_t capacity);
@@ -709,25 +704,29 @@ void shadow_index_cleanup(shadow_index_t *idx);
 /**
  * @brief Insert into shadow index
  *
+ * Drives incremental migration if in progress. Triggers growth at 75% load.
+ *
  * @param idx      The index
  * @param pid      Process ID (key part 1)
  * @param ssl_ctx  SSL context (key part 2)
- * @param id       Flow ID (value)
- * @return 0 on success, -1 if full
+ * @param ctx      Flow context pointer (value)
+ * @return 0 on success, -1 if full or allocation failure
  */
 int shadow_index_insert(shadow_index_t *idx, uint32_t pid,
-                        uint64_t ssl_ctx, flow_id_t id);
+                        uint64_t ssl_ctx, flow_context_t *ctx);
 
 /**
  * @brief Lookup in shadow index
  *
+ * Searches active table first, then old table if migration in progress.
+ *
  * @param idx      The index
  * @param pid      Process ID
  * @param ssl_ctx  SSL context
- * @return flow_id, or FLOW_ID_INVALID if not found
+ * @return flow_context_t pointer, or NULL if not found
  */
-flow_id_t shadow_index_lookup(shadow_index_t *idx, uint32_t pid,
-                              uint64_t ssl_ctx);
+flow_context_t *shadow_index_lookup(shadow_index_t *idx, uint32_t pid,
+                                     uint64_t ssl_ctx);
 
 /**
  * @brief Remove from shadow index
@@ -753,7 +752,7 @@ void shadow_index_remove(shadow_index_t *idx, uint32_t pid, uint64_t ssl_ctx);
 /**
  * @brief Initialize flow manager
  *
- * Initializes pool and both indexes.
+ * Initializes pool and both indexes (starting at FLOW_INDEX_INITIAL_CAPACITY).
  *
  * @param mgr  Manager to initialize
  * @return 0 on success, -1 on failure
@@ -800,7 +799,6 @@ flow_context_t *flow_lookup(flow_manager_t *mgr, uint64_t cookie,
  * @brief Extended flow lookup with path information
  *
  * Same as flow_lookup() but also returns which index was used.
- * Useful for debugging and monitoring correlation efficiency.
  *
  * @param mgr      Flow manager
  * @param cookie   Socket cookie (0 if unknown)
@@ -816,7 +814,7 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
 /**
  * @brief Get or create flow context
  *
- * If flow exists, returns it. Otherwise allocates new slot,
+ * If flow exists, returns it. Otherwise allocates new context,
  * initializes with provided keys, and adds to shadow_index.
  * If cookie != 0, also adds to cookie_index.
  *
@@ -824,7 +822,7 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
  * @param cookie   Socket cookie (0 if unknown)
  * @param pid      Process ID
  * @param ssl_ctx  SSL context
- * @return Pointer to flow_context_t, or NULL if pool full
+ * @return Pointer to flow_context_t, or NULL if OOM
  */
 flow_context_t *flow_get_or_create(flow_manager_t *mgr, uint64_t cookie,
                                     uint32_t pid, uint64_t ssl_ctx);
@@ -848,7 +846,7 @@ int flow_promote_cookie(flow_manager_t *mgr, uint32_t pid,
 /**
  * @brief Terminate and free a flow
  *
- * Removes from both indexes, frees resources, returns slot to pool.
+ * Removes from both indexes, frees resources, adds to deferred free queue.
  *
  * @param mgr  Flow manager
  * @param ctx  Flow context to terminate
@@ -858,7 +856,8 @@ void flow_terminate(flow_manager_t *mgr, flow_context_t *ctx);
 /**
  * @brief Evict stale flows
  *
- * Scans pool for flows older than timeout and frees them.
+ * Walks active list for flows older than timeout and terminates them.
+ * Also drains the deferred free queue.
  *
  * @param mgr         Flow manager
  * @param current_ns  Current timestamp
@@ -874,11 +873,11 @@ int flow_evict_stale(flow_manager_t *mgr, uint64_t current_ns);
  */
 typedef struct {
     /* Pool statistics */
-    uint64_t pool_capacity;         /**< Total pool slots */
-    uint64_t pool_allocated;        /**< Currently allocated flows */
+    uint64_t pool_allocated;        /**< Currently active flows */
     uint64_t pool_peak;             /**< Peak allocation (high water) */
     uint64_t pool_total_allocs;     /**< Lifetime allocations */
     uint64_t pool_total_frees;      /**< Lifetime frees */
+    uint64_t pool_alloc_failures;   /**< OOM allocation failures */
 
     /* Cookie index statistics */
     uint64_t cookie_count;          /**< Entries in cookie index */
@@ -952,16 +951,6 @@ int flow_init_parser(flow_context_t *ctx, const char *alpn);
  * Called by the home worker when first HTTP/2 data arrives. Creates
  * nghttp2 server session, HPACK inflater, and reassembly buffer.
  *
- * @par Usage
- * @code
- *   // In worker claim logic:
- *   if (atomic_compare_exchange_strong(&ctx->home_worker_id, &expected, my_id)) {
- *       if (ctx->proto == FLOW_PROTO_HTTP2 && !ctx->parser.h2.session) {
- *           flow_h2_session_init(ctx, g_callbacks, callback_context);
- *       }
- *   }
- * @endcode
- *
  * @param ctx   Flow context with proto == FLOW_PROTO_HTTP2
  * @param cbs   nghttp2 session callbacks
  * @param user  User data for callbacks
@@ -976,16 +965,6 @@ int flow_h2_session_init(flow_context_t *ctx, nghttp2_session_callbacks *cbs,
  * Called by the home worker when first HTTP/1 data arrives. Configures
  * the llhttp parser with the global callback settings.
  *
- * @par Usage
- * @code
- *   // In worker claim logic:
- *   if (atomic_compare_exchange_strong(&ctx->home_worker_id, &expected, my_id)) {
- *       if (ctx->proto == FLOW_PROTO_HTTP1 && !ctx->parser.h1.initialized) {
- *           flow_h1_parser_init(ctx, http1_get_settings());
- *       }
- *   }
- * @endcode
- *
  * @param ctx       Flow context with proto == FLOW_PROTO_HTTP1
  * @param settings  llhttp settings with callbacks (from http1_get_settings())
  * @return 0 on success, -1 on failure
@@ -995,7 +974,7 @@ int flow_h1_parser_init(flow_context_t *ctx, llhttp_settings_t *settings);
 /**
  * @brief Free flow context resources (parser, buffers)
  *
- * Does not free the slot itself - just internal resources.
+ * Does not free the context itself - just internal resources.
  *
  * @param ctx  Flow context
  */
@@ -1013,109 +992,15 @@ void flow_free_resources(flow_context_t *ctx);
  * @{
  */
 
-/**
- * @brief Initialize HTTP/2 stream pool free list
- *
- * Called once when H2 session is initialized. Links all stream slots
- * into a free list for O(1) allocation.
- *
- * @param ctx  Flow context with proto == FLOW_PROTO_HTTP2
- */
 void flow_h2_init_stream_pool(flow_context_t *ctx);
-
-/**
- * @brief Allocate a stream slot for HTTP/2
- *
- * O(1) allocation from free list. Initializes stream_id and resets state.
- *
- * @param ctx        Flow context
- * @param stream_id  HTTP/2 stream ID
- * @return Pointer to transaction, or NULL if pool exhausted
- */
 flow_transaction_t *flow_h2_alloc_stream(flow_context_t *ctx, int32_t stream_id);
-
-/**
- * @brief Find stream by ID in HTTP/2 context
- *
- * Linear search through active streams. For 64 slots, this is acceptable.
- * Future: hash table if stream count increases.
- *
- * @param ctx        Flow context
- * @param stream_id  HTTP/2 stream ID to find
- * @return Pointer to transaction, or NULL if not found
- */
 flow_transaction_t *flow_h2_find_stream(flow_context_t *ctx, int32_t stream_id);
-
-/**
- * @brief Free a stream slot back to pool
- *
- * Frees any body buffer, resets state, returns to free list.
- *
- * @param ctx  Flow context
- * @param txn  Transaction to free
- */
 void flow_h2_free_stream(flow_context_t *ctx, flow_transaction_t *txn);
-
-/**
- * @brief Reap timed-out "ghost" streams
- *
- * Scans active streams and frees any that have been idle longer than
- * FLOW_STREAM_TIMEOUT_MS. Called periodically by worker.
- *
- * @param ctx         Flow context
- * @param current_ms  Current monotonic timestamp in milliseconds
- * @return Number of streams reaped
- */
 int flow_h2_reap_ghosts(flow_context_t *ctx, uint32_t current_ms);
-
-/**
- * @brief Reset HTTP/1 transaction for next request
- *
- * Clears transaction state but keeps parser. Called when response
- * completes and connection remains open (keep-alive).
- *
- * @param ctx  Flow context with proto == FLOW_PROTO_HTTP1
- */
 void flow_h1_reset_txn(flow_context_t *ctx);
-
-/**
- * @brief Allocate body buffer for transaction
- *
- * Dynamically allocates body buffer when -b option is enabled.
- * Called when first body data arrives.
- *
- * @param txn       Transaction to allocate buffer for
- * @param capacity  Initial capacity (will grow as needed)
- * @return 0 on success, -1 on allocation failure
- */
 int flow_txn_alloc_body(flow_transaction_t *txn, size_t capacity);
-
-/**
- * @brief Append data to transaction body buffer
- *
- * Grows buffer as needed. Does nothing if body capture disabled.
- *
- * @param txn   Transaction
- * @param data  Data to append
- * @param len   Length of data
- * @return 0 on success, -1 on allocation failure
- */
 int flow_txn_append_body(flow_transaction_t *txn, const uint8_t *data, size_t len);
-
-/**
- * @brief Free transaction body buffer
- *
- * @param txn  Transaction
- */
 void flow_txn_free_body(flow_transaction_t *txn);
-
-/**
- * @brief Get monotonic time in milliseconds
- *
- * Used for ghost stream detection timestamps.
- *
- * @return Current time in milliseconds since boot
- */
 uint32_t flow_get_monotonic_ms(void);
 
 /** @} */

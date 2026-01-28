@@ -232,7 +232,8 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
 
     /* Populate Shared Pool correlation fields for worker */
     event->flow_id = flow_ctx ? flow_ctx->self_id : FLOW_ID_INVALID;
-    event->flow_ctx = flow_ctx;  /* Worker will validate/resolve this */
+    event->flow_ctx = flow_ctx;  /* Worker will validate via generation check */
+    event->expected_gen = flow_ctx ? flow_ctx->generation : 0;
 
     /*
      * Set retry flag if we have a cookie but XDP data hasn't arrived yet.
@@ -248,9 +249,17 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
         memcpy(event->data, bpf_event->data, event->data_len);
     }
 
+    /* Track in-flight events for safe deferred free */
+    if (flow_ctx) {
+        atomic_fetch_add_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+    }
+
     /* Enqueue to worker's input ring */
     if (!ck_ring_enqueue_spsc(&worker->in_ring, worker->in_buffer, event)) {
         /* Queue full - return event to pool and drop */
+        if (flow_ctx) {
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+        }
         pool_free(&worker->event_pool, event);
         atomic_fetch_add(&ctx->events_dropped, 1);
         atomic_fetch_add(&worker->events_dropped, 1);
