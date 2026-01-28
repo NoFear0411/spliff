@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.9.6-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.7-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -25,6 +25,72 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | HTTP/1.1 | llhttp  | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
 | HTTP/2   | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
 
+### Centralized Session Statistics (v0.9.7)
+- **Unified Shutdown Report**: All subsystem metrics collected and displayed from one place
+- **Production-Grade Metrics**: Full pipeline visibility in every build (no debug flag required)
+- **Per-Worker Breakdown**: Individual event counts, retry stats, CPU efficiency
+- **Flow Pool Analytics**: Utilization, peak, cookie/shadow index hit rates, promotion rate
+- **XDP Classification**: Packet counts, flow classification, sockops, correlation success rate
+- **SSL Probe Counters**: Total SSL_read/SSL_write interceptions
+
+<details>
+<summary>Sample Session Statistics Output</summary>
+
+```
+============================================
+           Session Statistics
+============================================
+
+  Application Layer (SSL/TLS)
+  ----------------------------------------------
+  Events:      50 captured -> 50 processed
+  Output:      18 messages (1.8 KB)
+
+  Workers (16)
+  ----------------------------------------------
+  Worker  1: 3 events
+  Worker  2: 6 events
+  Worker  3: 2 events
+  Worker  7: 7 events
+  Worker  9: 8 events
+  Worker 10: 5 events
+  Worker 12: 4 events
+  Worker 14: 3 events
+  Worker 15: 12 events
+  CPU: Good (NAPI-style, 4338 sleep cycles)
+
+  Flow Pool
+  ----------------------------------------------
+  Utilization: 5 / 8192 active (0.1%), peak 6 (0.1%)
+  Throughput:  12 allocs, 7 frees
+  Cookie index: 1 entries, 36 hits (81.8%), 8 misses
+  Shadow index: 0 entries, 19 hits, 2 promotions
+  Promotion:    16.7% of flows got socket_cookie
+
+  Network Layer (XDP)
+  ----------------------------------------------
+  Packets:     124 processed (91 TCP)
+  Connections: 8 tracked, 8 classified
+  Correlation: 100.0% socket cookie success
+  Classified:  8 flows
+  Ambiguous:   12 (deeper inspection needed)
+  Terminated:  7 (FIN/RST)
+  Cache hits:  0 (fast-path gatekeeper)
+  Cookie miss: 0 (correlation gaps)
+
+  Sockops (cookie caching)
+  ----------------------------------------------
+  Events:  8 (active: 8, passive: 0)
+  Cleanup: 0
+
+  SSL Probes
+  ----------------------------------------------
+  SSL_read/SSL_write intercepted: 50
+
+============================================
+```
+</details>
+
 ### Embedded BPF Skeleton (v0.9.6)
 - **Single Binary Deployment**: BPF bytecode embedded directly via `bpftool gen skeleton`
 - **No External Files**: No separate .bpf.o file needed - binary is self-contained
@@ -44,7 +110,7 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **Worker Affinity**: Atomic CAS claim ensures single-writer guarantee per flow
 - **HPACK Corruption Detection**: Connection-fatal flag per RFC 7540 Section 4.3
 - **Ghost Stream Reaping**: 10-second timeout for idle stream cleanup
-- **Pool Statistics**: Runtime visibility into capacity, allocations, index hit rates
+- **Pool Statistics**: Centralized shutdown report with capacity, allocations, index hit rates
 - **BPF Map Warm-up**: Direct iteration of BPF flow_states for accurate pre-existing connection correlation
 
 ### Dynamic Process Monitoring (v0.9.0+)
@@ -62,7 +128,7 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **Dual Warm-up Strategy** (v0.9.3):
   - BPF map warm-up: iterates `flow_states` for real socket cookies
   - Netlink warm-up: seeds `flow_cookie_map` via SOCK_DIAG for XDP visibility
-- **XDP Statistics**: Debug-mode metrics (packets, flows, gatekeeper hits)
+- **XDP Statistics**: Full session metrics (packets, flows, classification, sockops, gatekeeper hits)
 
 ### BPF-Level Filtering (v0.7.0+)
 - **Socket Family Detection**: Filters AF_UNIX (IPC) at kernel level
@@ -665,8 +731,9 @@ Build output goes to `build/` directory (gitignored). Run `make docs` to generat
 | v0.8.x | XDP packet-level flow tracking + sock_ops | ✅ Complete |
 | v0.9.0-0.9.4 | Dynamic process monitoring + Shared Pool Architecture | ✅ Complete |
 | v0.9.5 | Modular Protocol Architecture + Vectorscan detection | ✅ Complete |
-| v0.9.6 | Embedded BPF Skeleton + XDP-SSL correlation fix + Thread cleanup | ✅ **Current** |
-| v0.10.0 | Content-based protocol detection + Enhanced statistics | 🔄 Next |
+| v0.9.6 | Embedded BPF Skeleton + XDP-SSL correlation fix + Thread cleanup | ✅ Complete |
+| v0.9.7 | Centralized session statistics + Production-grade shutdown metrics | ✅ **Current** |
+| v0.10.0 | Content-based protocol detection + ZSTD decompression pipeline | 🔄 Next |
 | v0.11.0 | HTTP/3 + QUIC protocol support (ngtcp2/nghttp3) | Planned |
 | v1.0.0 | WebSocket support + Production hardening | Planned |
 | v1.1.0+ | EDR agent mode + Event streaming | Planned |

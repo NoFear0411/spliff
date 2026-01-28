@@ -315,93 +315,55 @@ void threading_cleanup(threading_mgr_t *mgr) {
  */
 
 void threading_print_stats(threading_mgr_t *mgr) {
-    if (!mgr || !mgr->initialized) {
+    /* No-op: stats printing is now centralized in main.c print_shutdown_stats() */
+    (void)mgr;
+}
+
+void threading_get_aggregate_stats(threading_mgr_t *mgr, threading_stats_t *stats) {
+    if (!mgr || !stats) {
         return;
     }
 
-    /* Collect aggregate stats */
-    uint64_t dispatched, dropped;
-    dispatcher_get_stats(&mgr->dispatcher, &dispatched, &dropped);
+    memset(stats, 0, sizeof(*stats));
 
-    uint64_t total_processed = 0;
-    uint64_t total_dropped = 0;
-    uint64_t total_sleep = 0;
-    uint64_t total_deferred_successes = 0;
-    uint64_t total_deferred_failures = 0;
+    if (!mgr->initialized) {
+        return;
+    }
 
+    /* Dispatcher stats */
+    dispatcher_get_stats(&mgr->dispatcher,
+                         &stats->events_dispatched,
+                         &stats->events_dropped);
+
+    /* Per-worker stats */
+    stats->num_workers = mgr->num_workers;
     for (int i = 0; i < mgr->num_workers; i++) {
         worker_ctx_t *w = &mgr->workers[i];
-        total_processed += atomic_load(&w->events_processed);
-        total_dropped += atomic_load(&w->events_dropped);
-        total_sleep += atomic_load(&w->sleep_cycles);
-        total_deferred_successes += atomic_load(&w->deferred_successes);
-        total_deferred_failures += atomic_load(&w->deferred_failures);
+        uint64_t processed  = atomic_load(&w->events_processed);
+        uint64_t dropped    = atomic_load(&w->events_dropped);
+        uint64_t sleep      = atomic_load(&w->sleep_cycles);
+        uint64_t def_ok     = atomic_load(&w->deferred_successes);
+        uint64_t def_fail   = atomic_load(&w->deferred_failures);
+
+        stats->worker_processed[i]     = processed;
+        stats->worker_dropped[i]       = dropped;
+        stats->worker_deferred_ok[i]   = def_ok;
+        stats->worker_deferred_fail[i] = def_fail;
+
+        stats->total_processed    += processed;
+        stats->total_dropped      += dropped;
+        stats->total_sleep_cycles += sleep;
+        stats->total_deferred_ok  += def_ok;
+        stats->total_deferred_fail += def_fail;
     }
 
-    uint64_t messages, bytes;
-    output_get_stats(&mgr->output, &messages, &bytes);
+    /* Output thread stats */
+    output_get_stats(&mgr->output,
+                     &stats->messages_written,
+                     &stats->bytes_written);
 
-    /* Print user-friendly summary */
-    fprintf(stderr, "\n=== Application Layer (SSL/TLS) ===\n");
-    fprintf(stderr, "Events captured: %lu", dispatched);
-    if (dropped > 0) {
-        fprintf(stderr, " (%lu dropped)", dropped);
-    }
-    fprintf(stderr, "\n");
-    fprintf(stderr, "Events processed: %lu\n", total_processed);
-    fprintf(stderr, "Output: %lu messages, %lu bytes\n", messages, bytes);
-
-    /* Cookie retry statistics (Golden Thread correlation) */
-    uint64_t total_deferred = total_deferred_successes + total_deferred_failures;
-    if (total_deferred > 0) {
-        double success_rate = 100.0 * total_deferred_successes / total_deferred;
-        fprintf(stderr, "\nCookie Retry Statistics:\n");
-        fprintf(stderr, "  Retry successes: %lu (%.1f%%)\n",
-                total_deferred_successes, success_rate);
-        fprintf(stderr, "  Retry failures:  %lu (%.1f%%)\n",
-                total_deferred_failures, 100.0 - success_rate);
-    }
-
-    /* Detailed breakdown in debug mode */
-    if (g_config.debug_mode) {
-        fprintf(stderr, "\n--- Debug: Per-Worker Statistics ---\n");
-        fprintf(stderr, "Workers: %d (parallel SSL event processors)\n\n", mgr->num_workers);
-
-        for (int i = 0; i < mgr->num_workers; i++) {
-            worker_ctx_t *w = &mgr->workers[i];
-            uint64_t processed = atomic_load(&w->events_processed);
-            uint64_t w_dropped = atomic_load(&w->events_dropped);
-            uint64_t w_successes = atomic_load(&w->deferred_successes);
-            uint64_t w_failures = atomic_load(&w->deferred_failures);
-
-            /* Only show workers that processed events */
-            if (processed > 0 || w_dropped > 0) {
-                fprintf(stderr, "  Worker %2d: %lu events", i, processed);
-                if (w_dropped > 0) {
-                    fprintf(stderr, " (%lu dropped)", w_dropped);
-                }
-                if (w_successes > 0 || w_failures > 0) {
-                    fprintf(stderr, " [retry: %lu ok, %lu fail]",
-                            w_successes, w_failures);
-                }
-                fprintf(stderr, "\n");
-            }
-        }
-
-        /* CPU efficiency based on NAPI-style sleep cycles */
-        if (total_sleep > 0) {
-            fprintf(stderr, "\n  CPU efficiency: ");
-            /* In NAPI mode, any sleep cycles means we're keeping up */
-            fprintf(stderr, "Good (NAPI-style, %lu sleep cycles)\n", total_sleep);
-        } else if (total_processed > 0) {
-            fprintf(stderr, "\n  CPU efficiency: High load (continuous processing)\n");
-        }
-    }
-
-    /* Flow pool statistics (Shared Pool Architecture) */
-    flow_manager_print_stats(&mgr->dispatcher.flow_mgr, g_config.debug_mode);
-
-    fprintf(stderr, "\n");
+    /* Flow pool stats */
+    flow_manager_get_stats(&mgr->dispatcher.flow_mgr, &stats->flow_pool);
 }
 
 /** @} */ /* end manager_stats */
