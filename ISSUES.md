@@ -1,35 +1,10 @@
 # Known Issues
 
-This document tracks known issues, bugs, and limitations in spliff. For feature requests and discussion, see [GitHub Issues](https://github.com/NoFear0411/spliff/issues).
+This document tracks known issues, bugs, limitations, and resolved issues in spliff. For feature requests and discussion, see [GitHub Issues](https://github.com/NoFear0411/spliff/issues).
 
 ## Open Issues
 
-### 1. SSL-sockops Timing Race (High Priority) ✅ FIXED
-
-**Symptoms:**
-- First HTTP request from each process lacks XDP correlation
-- Under high load, ~50% of request/response pairs miss correlation
-- Statistics show "Cookie misses" incrementing
-
-**Root Cause:**
-Race condition between SSL uprobe events and sockops `flow_cookie_map` population. The SSL_read/SSL_write uprobe fires before sockops has cached the socket cookie in `flow_cookie_map`.
-
-**Affected Components:**
-- `src/bpf/spliff.bpf.c` - sockops handler timing
-- `src/threading/dispatcher.c` - cookie lookup in SSL event handler
-
-**Resolution (v0.9.2):**
-Implemented cookie retry queue with bitmask-based slot management:
-- Events with valid `socket_cookie` but missing `flow_info` are deferred
-- Up to 3 retry attempts with batch processing every 4 NAPI iterations
-- Acquire/release memory ordering ensures cross-thread visibility
-- Statistics tracked: `deferred_successes` and `deferred_failures`
-
-**Status:** Fixed in `src/threading/worker.c` and `src/threading/dispatcher.c`
-
----
-
-### 2. VPN (Wireguard) Correlation Failure (High Priority)
+### 1. VPN (Wireguard) Correlation Failure (High Priority)
 
 **Symptoms:**
 - XDP correlation stops working when VPN is connected
@@ -69,37 +44,7 @@ This is a **fundamental limitation of XDP on virtual/tunnel interfaces**, not a 
 
 ---
 
-### 3. High CPU Usage (99% Active Polling) (Medium Priority) ✅ FIXED
-
-**Symptoms:**
-- CPU efficiency always shows "High load (99% active polling)"
-- Workers consume CPU even when idle
-- System load unnecessarily high during low traffic
-
-**Root Cause:**
-Worker threads use spin-wait polling loop instead of event-driven blocking. Workers continuously check queues and yield, burning CPU cycles.
-
-**Affected Components:**
-- `src/threading/worker.c` - worker main loop
-- `src/threading/dispatcher.c` - event dispatch loop
-
-**Resolution (v0.9.2):**
-Implemented NAPI-style adaptive polling:
-- Workers use `epoll_wait()` when caught up with traffic (zero CPU when idle)
-- Under heavy load, workers loop continuously without syscall overhead
-- Budget-based processing: max 64 events per iteration before checking epoll
-- Sleep cycles tracked for efficiency reporting
-
-**Expected Results:**
-- CPU (idle): ~0% (vs 99% before)
-- CPU (heavy load): 80-95% (actual work vs busy-wait)
-- Statistics now show "Good (NAPI-style, N sleep cycles)" when efficient
-
-**Status:** Fixed in `src/threading/worker.c` and `src/threading/threading.h`
-
----
-
-### 4. Static NIC Attachment (Medium Priority)
+### 2. Static NIC Attachment (Medium Priority)
 
 **Symptoms:**
 - Interfaces that appear after spliff starts are not monitored
@@ -122,9 +67,71 @@ XDP interface discovery and attachment happens once at startup. No monitoring fo
 
 ---
 
+## Known Limitations
+
+These are architectural or design constraints rather than bugs.
+
+- **Chrome/Chromium Support (Experimental)**: Browsers using statically-linked BoringSSL are **experimental**:
+  - Offsets vary between browser versions, builds, and distributions
+  - Detection relies on heuristic binary scanning that may fail
+  - Recommended: Use Firefox (NSS) for reliable browser traffic capture
+
+- **Protocol Detection Timing**: ALPN-based protocol detection may miss if the ALPN event arrives after data events. Content-based fallback detection is planned for v0.10.0.
+- **HTTP/2 Mid-Stream Capture**: Joining existing HTTP/2 connections may cause HPACK decode errors for first few responses. Recovery is automatic via `hpack_corrupted` flag per RFC 7540.
+- **HTTP/2 Stream Limits**: 64 concurrent streams per flow. Ghost streams (inactive >10s) are automatically reaped.
+- **XDP Native Mode**: Some network drivers don't support XDP native mode; spliff automatically falls back to SKB mode with a status message.
+- **Plain HTTP Capture**: Currently only captures TLS-encrypted traffic. Plain HTTP capture planned for future release.
+- **QUIC/HTTP/3**: Not yet supported (planned for v0.11.0).
+- **Kernel Requirements**: Requires Linux 5.x+ with BTF support (`CONFIG_DEBUG_INFO_BTF=y`).
+
+---
+
 ## Resolved Issues
 
-*No resolved issues yet in this tracking document.*
+### SSL-sockops Timing Race (Fixed in v0.9.2)
+
+**Symptoms:**
+- First HTTP request from each process lacks XDP correlation
+- Under high load, ~50% of request/response pairs miss correlation
+- Statistics show "Cookie misses" incrementing
+
+**Root Cause:**
+Race condition between SSL uprobe events and sockops `flow_cookie_map` population. The SSL_read/SSL_write uprobe fires before sockops has cached the socket cookie in `flow_cookie_map`.
+
+**Resolution:**
+Implemented cookie retry queue with bitmask-based slot management:
+- Events with valid `socket_cookie` but missing `flow_info` are deferred
+- Up to 3 retry attempts with batch processing every 4 NAPI iterations
+- Acquire/release memory ordering ensures cross-thread visibility
+- Statistics tracked: `deferred_successes` and `deferred_failures`
+
+**Fixed in:** `src/threading/worker.c` and `src/threading/dispatcher.c`
+
+---
+
+### High CPU Usage / 99% Active Polling (Fixed in v0.9.2)
+
+**Symptoms:**
+- CPU efficiency always shows "High load (99% active polling)"
+- Workers consume CPU even when idle
+- System load unnecessarily high during low traffic
+
+**Root Cause:**
+Worker threads use spin-wait polling loop instead of event-driven blocking. Workers continuously check queues and yield, burning CPU cycles.
+
+**Resolution:**
+Implemented NAPI-style adaptive polling:
+- Workers use `epoll_wait()` when caught up with traffic (zero CPU when idle)
+- Under heavy load, workers loop continuously without syscall overhead
+- Budget-based processing: max 64 events per iteration before checking epoll
+- Sleep cycles tracked for efficiency reporting
+
+**Results:**
+- CPU (idle): ~0% (vs 99% before)
+- CPU (heavy load): 80-95% (actual work vs busy-wait)
+- Statistics now show "Good (NAPI-style, N sleep cycles)" when efficient
+
+**Fixed in:** `src/threading/worker.c` and `src/threading/threading.h`
 
 ---
 

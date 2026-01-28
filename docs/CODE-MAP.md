@@ -1,4 +1,4 @@
-# CODE-MAP.md - spliff v0.9.6 Comprehensive Code Map
+# CODE-MAP.md - spliff v0.9.8 Comprehensive Code Map
 
 > **Purpose:** AI-friendly and human-readable architecture reference for understanding, maintaining, and extending the spliff codebase.
 
@@ -16,25 +16,27 @@
 
 ## Project Overview
 
-**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.6 features:
+**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.8 features:
 
+- **Dynamic Flow Pool**: On-demand allocation via jemalloc with incremental hash table resizing
 - **Embedded BPF Skeleton**: CO-RE BTF bytecode embedded in binary, strip-safe
 - **XDP-SSL Correlation**: Socket cookie "Golden Thread" links packets, sockets, and TLS data
 - **Modular Protocol Architecture**: Clean plugin-style routing for HTTP/1, HTTP/2, detection
 - **Multi-threaded Processing**: Lock-free worker threads with connection affinity
-- **Shared Pool Architecture**: 8192-slot pre-allocated flow context pool with dual-index lookup
+- **Centralized Session Statistics**: Production-grade shutdown metrics with per-worker breakdown
 
 ---
 
 ## Directory Structure
 
 ```
-sslsniff/
+spliff/
 ├── CMakeLists.txt                  # CMake build config (C23, LTO, sanitizers, packaging)
 ├── Makefile                        # Convenience wrapper for CMake targets
 ├── Doxyfile                        # Doxygen documentation config
 ├── README.md                       # User documentation, examples, features
 ├── CHANGELOG.md                    # Version history and migration notes
+├── ISSUES.md                       # Known issues, limitations, resolved bugs
 ├── LICENSE                         # GPL-3.0 for userspace, GPL-2.0 for BPF
 ├── src/
 │   ├── main.c                      # Entry point, CLI parsing, orchestration
@@ -57,7 +59,8 @@ sslsniff/
 │   │   ├── http1.h                 # HTTP/1.1 API
 │   │   ├── http2.c                 # HTTP/2 parser using nghttp2
 │   │   ├── http2.h                 # HTTP/2 API
-│   │   └── websocket.h             # WebSocket frame parser (stub)
+│   │   ├── websocket.c             # WebSocket frame parser
+│   │   └── websocket.h             # WebSocket API
 │   ├── content/                    # Content decompression and identification
 │   │   ├── decompressor.c          # gzip/zstd/brotli decompression
 │   │   ├── decompressor.h          # Decompressor API
@@ -67,8 +70,8 @@ sslsniff/
 │   │   ├── display.c               # Colored output, latency formatting
 │   │   └── display.h               # Display API
 │   ├── correlation/                # XDP-SSL correlation and flow pooling
-│   │   ├── flow_context.c          # Shared pool management (dual-index lookup)
-│   │   └── flow_context.h          # flow_context_t, pool types
+│   │   ├── flow_context.c          # Dynamic pool, dual-index lookup, deferred free
+│   │   └── flow_context.h          # flow_context_t, pool types, index types
 │   ├── threading/                  # Multi-threaded event processing
 │   │   ├── threading.h             # Threading API, worker struct, ring buffers
 │   │   ├── dispatcher.c            # BPF ring consumer, flow routing
@@ -81,12 +84,15 @@ sslsniff/
 │       ├── safe_str.c              # Safe string operations
 │       └── safe_str.h              # String API
 ├── tests/                          # Unit tests
+│   ├── test_common.c
 │   ├── test_http1.c
 │   ├── test_http2.c
-│   ├── test_xdp.c
-│   └── test_common.c
+│   └── test_xdp.c
 └── docs/                           # Documentation
-    └── CODE-MAP.md                 # This file
+    ├── ARCHITECTURE.md             # System diagrams and data flow
+    ├── CODE-MAP.md                 # This file
+    ├── EDR_XDR_ROADMAP.md          # Long-term EDR/XDR vision
+    └── TROUBLESHOOTING.md          # Common issues and solutions
 ```
 
 ---
@@ -95,7 +101,7 @@ sslsniff/
 
 ### Core Entry Point
 
-#### `src/main.c` (~1610 lines)
+#### `src/main.c` (~1737 lines)
 **Purpose:** CLI orchestration, library discovery, BPF initialization, event loop control
 
 **Key Functions:**
@@ -142,14 +148,13 @@ sslsniff/
 | `MAX_HEADERS` | 128 |
 | `MAX_BODY_BUFFER` | 1 MB |
 | `XDP_PAYLOAD_MAX` | 128 bytes |
-| `FLOW_POOL_CAPACITY` | 8192 |
-| `SPLIFF_VERSION` | "0.9.6" |
+| `SPLIFF_VERSION` | "0.9.8" |
 
 ---
 
 ### eBPF Programs & Loading
 
-#### `src/bpf/spliff.bpf.c` (~3287 lines)
+#### `src/bpf/spliff.bpf.c` (~3372 lines)
 **Purpose:** Kernel eBPF programs for SSL/TLS interception, packet classification, socket tracking
 
 **BPF Programs:**
@@ -177,7 +182,7 @@ sslsniff/
 
 ---
 
-#### `src/bpf/bpf_loader.c` (~1757 lines)
+#### `src/bpf/bpf_loader.c` (~1786 lines)
 **Purpose:** Load BPF programs, attach uprobes/XDP, discover SSL libraries
 
 **Key Functions:**
@@ -207,14 +212,14 @@ sslsniff/
 
 ---
 
-#### `src/bpf/binary_scanner.c` (~345 lines)
+#### `src/bpf/binary_scanner.c` (~377 lines)
 **Purpose:** Detect BoringSSL in Chrome/Chromium binaries via build ID lookup
 
 ---
 
 ### Protocol Parsing
 
-#### `src/protocol/detector.c` (~80 lines)
+#### `src/protocol/detector.c` (~276 lines)
 **Purpose:** O(n) protocol detection using vectorscan NFA
 
 **Detection Results:**
@@ -227,7 +232,7 @@ sslsniff/
 
 ---
 
-#### `src/protocol/http1.c` (HTTP/1.1 parser)
+#### `src/protocol/http1.c` (~1163 lines)
 **Purpose:** Parse HTTP/1.1 using llhttp (Node.js parser)
 
 **Key Functions:**
@@ -240,7 +245,7 @@ sslsniff/
 
 ---
 
-#### `src/protocol/http2.c` (HTTP/2 parser)
+#### `src/protocol/http2.c` (~1466 lines)
 **Purpose:** Parse HTTP/2 frames using nghttp2
 
 **Key Functions:**
@@ -260,7 +265,7 @@ sslsniff/
 
 ### Content Processing
 
-#### `src/content/decompressor.c` (~412 lines)
+#### `src/content/decompressor.c` (~237 lines)
 **Purpose:** Decompress HTTP bodies
 
 **Supported Formats:**
@@ -273,7 +278,7 @@ sslsniff/
 
 ---
 
-#### `src/content/signatures.c` (~793 lines)
+#### `src/content/signatures.c` (~694 lines)
 **Purpose:** Identify file types via magic bytes (50+ formats)
 
 **Categories:** Images, Video, Audio, Archives, Documents, Data formats
@@ -282,49 +287,80 @@ sslsniff/
 
 ### Flow Correlation
 
-#### `src/correlation/flow_context.h` (~1122 lines)
-**Purpose:** Type definitions for shared pool architecture
+#### `src/correlation/flow_context.h` (~1008 lines)
+**Purpose:** Type definitions for dynamic flow pool architecture
 
 **Key Types:**
 ```c
 typedef struct flow_context {
-    uint64_t socket_cookie;     // "Golden Thread" correlation key
-    uint32_t pid, ssl_ctx;      // Dual-index lookup keys
-    flow_state_t state;         // INIT, ACTIVE, CLOSING, CLOSED
-    flow_proto_t proto;         // UNKNOWN, HTTP1, HTTP2, OTHER
-    uint16_t flags;             // HAS_XDP, HAS_SSL, IN_COOKIE, IN_SHADOW
-    atomic_uint32_t home_worker_id;  // CAS-protected worker claim
+    /* Cache Line 0: Identity + Lifecycle */
+    uint64_t socket_cookie;         // "Golden Thread" correlation key
+    uint32_t pid;                   // Process ID
+    uint32_t generation;            // Allocation generation (stale pointer detect)
+    uint64_t ssl_ctx;               // SSL context pointer
+    flow_id_t self_id;              // Monotonic ID (debugging)
+    struct flow_context *list_prev; // Active/deferred list pointer
+    struct flow_context *list_next; // Active/deferred list pointer
+
+    /* Network View (from XDP) */
+    flow_key_t flow;                // 5-tuple: IPs and ports
+    uint32_t ifindex;               // Network interface index
+    uint64_t first_seen_ns;         // First packet timestamp
+    uint64_t last_seen_ns;          // Last activity timestamp
+
+    /* Traffic Counters */
+    uint32_t pkts_in, pkts_out;
+    uint32_t bytes_in, bytes_out;
+
+    /* Application View (from SSL) */
+    char comm[16], alpn[16], ifname[16];
+
+    /* State and Flags */
+    flow_proto_t proto;             // UNKNOWN, HTTP1, HTTP2, OTHER
+    flow_state_t state;             // INIT, ACTIVE, CLOSING, CLOSED
+    uint8_t flags;                  // HAS_XDP, HAS_SSL, IN_COOKIE, IN_SHADOW
+
+    /* Protocol Parser (union to save memory) */
     union {
-        http1_parser_t h1;
-        http2_parser_t h2;
+        h1_parser_ctx_t h1;         // HTTP/1.x context
+        h2_parser_ctx_t h2;         // HTTP/2 context
     } parser;
-    char alpn[16];
+    ...
 } flow_context_t;
 ```
 
 **Dual-Index Lookup:**
-- `cookie_index`: socket_cookie → flow_id (primary)
-- `shadow_index`: (pid, ssl_ctx) → flow_id (fallback)
+- `cookie_index`: socket_cookie → `flow_context_t*` (primary, direct pointer)
+- `shadow_index`: (pid, ssl_ctx) → `flow_context_t*` (fallback)
+- Both use incremental resizing (8 entries/op at 75% load factor)
 
 ---
 
-#### `src/correlation/flow_context.c` (~1342 lines)
-**Purpose:** Implement shared pool, dual-index lookup, atomic handover
+#### `src/correlation/flow_context.c` (~1450 lines)
+**Purpose:** Dynamic pool management, dual-index lookup, deferred free, stream allocation
 
 **Key Functions:**
 | Function | Purpose |
 |----------|---------|
-| `flow_manager_init()` | Allocate 8192 slots |
-| `flow_get_by_cookie()` | Primary lookup |
-| `flow_get_by_shadow()` | Fallback lookup |
-| `flow_alloc()` | O(1) allocation |
-| `flow_promote_cookie()` | Move shadow → cookie index |
+| `flow_pool_init()` | Initialize pool (empty, on-demand allocation) |
+| `flow_pool_alloc()` | Allocate flow via jemalloc (cache-line aligned) |
+| `flow_pool_free()` | Deferred free (2-second grace period) |
+| `flow_pool_drain_deferred()` | Reclaim deferred flows after grace period |
+| `flow_manager_init()` | Initialize manager with pool + indexes (256-entry tables) |
+| `flow_lookup()` | Dual-index lookup (cookie then shadow) |
+| `flow_get_or_create()` | Lookup or allocate new flow |
+| `flow_promote_cookie()` | Move shadow → cookie index when cookie becomes known |
+| `flow_terminate()` | Remove from indexes, defer free |
+| `flow_evict_stale()` | Janitor: evict inactive flows (O(active) scan) |
+| `flow_update_xdp()` | Merge XDP packet metadata into flow |
+| `flow_manager_get_stats()` | Collect pool/index statistics for shutdown report |
+| `flow_manager_print_stats()` | Print formatted session statistics |
 
 ---
 
 ### Threading
 
-#### `src/threading/threading.h` (~1330 lines)
+#### `src/threading/threading.h` (~1376 lines)
 **Purpose:** Threading infrastructure definitions
 
 **Configuration:**
@@ -337,36 +373,38 @@ typedef struct flow_context {
 
 ---
 
-#### `src/threading/dispatcher.c` (~771 lines)
+#### `src/threading/dispatcher.c` (~714 lines)
 **Purpose:** Route events from BPF to workers
 
 **Routing:** `hash(pid, ssl_ctx) % num_workers → worker_id`
 
 ---
 
-#### `src/threading/worker.c` (~832 lines)
-**Purpose:** Worker thread main loop
+#### `src/threading/worker.c` (~834 lines)
+**Purpose:** Worker thread main loop with NAPI-style adaptive polling
 
 **Processing Order:**
 1. `http1_try_process_event()` → if handled, return
 2. `http2_try_process_event()` → if handled, return
 3. `signature_detect()` + raw display
 
+**Safety:** Generation check on dequeued events detects stale flow pointers
+
 ---
 
-#### `src/threading/manager.c` (~481 lines)
+#### `src/threading/manager.c` (~393 lines)
 **Purpose:** Thread lifecycle management
 
 **Auto Thread Count:** `max(1, num_cpus - 3)` capped at 16
 
 ---
 
-#### `src/threading/output.c` (~334 lines)
+#### `src/threading/output.c` (~281 lines)
 **Purpose:** Serialize output from workers to stdout
 
 ---
 
-#### `src/threading/state.c` (~542 lines)
+#### `src/threading/state.c` (~499 lines)
 **Purpose:** Per-worker isolated state
 
 **Per-Worker:**
@@ -378,7 +416,7 @@ typedef struct flow_context {
 
 ### Output
 
-#### `src/output/display.c` (~626 lines)
+#### `src/output/display.c` (~528 lines)
 **Purpose:** Terminal output with ANSI colors
 
 **Colors:** C_RESET, C_DIM, C_RED, C_GREEN, C_YELLOW, C_CYAN, C_MAGENTA
@@ -398,12 +436,18 @@ typedef struct flow_context {
 | Release | `-O3` + LTO |
 | RelWithSan | `-O2 -g` + sanitizers |
 
+**BPF Skeleton Generation:**
+- `bpftool gen skeleton` embeds BPF bytecode at build time
+- Target `bpf_skeleton` generates `spliff.skel.h` from compiled `spliff.bpf.o`
+
 **Feature Flags:**
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `USE_VECTORSCAN` | ON | O(n) protocol detection |
 | `USE_ZLIB_NG` | ON | SIMD decompression |
 | `ENABLE_LTO` | ON | Link-time optimization |
+| `ENABLE_ZSTD` | ON | zstd decompression |
+| `ENABLE_BROTLI` | ON | brotli decompression |
 
 **Dependencies:**
 | Library | Purpose |
@@ -464,7 +508,8 @@ typedef struct flow_context {
 │ dispatcher_poll_ringbuf()                                       │
 │   ↓ hash(pid, ssl_ctx) % num_workers                            │
 │ worker input ring → worker thread                               │
-│   ↓ flow_get_by_cookie() or shadow lookup                       │
+│   ↓ flow_lookup() — cookie_index (fast) or shadow_index         │
+│   ↓ generation check — detect stale pointers                    │
 │   ↓ http1_try_process_event() or http2_try_process_event()      │
 │   ↓ output_write() → output ring → stdout                       │
 └─────────────────────────────────────────────────────────────────┘
@@ -474,16 +519,18 @@ typedef struct flow_context {
 
 ## Key Architectures
 
-### 1. Shared Pool with Dual-Index Lookup
+### 1. Dynamic Flow Pool with Dual-Index Lookup
 
 **Problem:** Events arrive from two async sources (SSL and XDP) with different identifiers.
 
 **Solution:**
-1. Pre-allocate 8192 flow contexts (no malloc in hot path)
-2. Two indexes point to same pool:
-   - `cookie_index[socket_cookie]` → primary, fast
-   - `shadow_index[(pid, ssl_ctx)]` → fallback
+1. Allocate flow contexts on-demand via jemalloc (~37 KB each, cache-line aligned)
+2. Two pointer-based indexes into allocated flows:
+   - `cookie_index[socket_cookie]` → `flow_context_t*` (primary, fast)
+   - `shadow_index[(pid, ssl_ctx)]` → `flow_context_t*` (fallback)
 3. Promote shadow → cookie when socket_cookie becomes available
+4. Incremental hash table resizing (8 entries/op at 75% load, no stop-the-world rehash)
+5. Deferred free with 2-second grace period + generation counters for stale pointer safety
 
 ### 2. Golden Thread (Socket Cookie Correlation)
 
@@ -514,29 +561,25 @@ signature_detect(...);  // Fallback
 - No external .bpf.o file needed
 - Strip-safe, tamper-resistant single binary
 
+### 6. Centralized Session Statistics (v0.9.7)
+
+- Unified shutdown report collects metrics from all subsystems
+- Per-worker event counts, retry stats, CPU efficiency
+- Flow pool analytics: active/peak counts, index hit rates, promotion rate
+- XDP classification: packets, flows, sockops, correlation success rate
+- SSL probe counters: total SSL_read/SSL_write interceptions
+
 ---
 
 ## Known Issues & TODOs
 
-### Protocol Detection
-- [ ] HTTP parsing broken when ALPN event timing is off
-- [ ] Need content-based protocol detection fallback
-- [ ] ALPN event may arrive after data events
-
-### Decompression
-- [ ] ZSTD detected but not auto-decompressing bodies
-- [ ] Content-Encoding header parsing incomplete
-
-### Statistics
-- [ ] Shutdown stats too basic for production
-- [ ] Need per-worker metrics
-- [ ] Missing latency percentiles
+See [../ISSUES.md](../ISSUES.md) for the full list of open issues, known limitations, and resolved bugs.
 
 ### Future Features
-- [ ] HTTP/3 (QUIC) support
-- [ ] WebSocket frame parsing
+- [ ] HTTP/3 (QUIC) support (planned v0.11.0)
+- [ ] WebSocket frame parsing (planned v1.0)
 - [ ] TUI mode
-- [ ] EDR/XDR integration
+- [ ] EDR/XDR agent mode + event streaming
 
 ---
 
@@ -544,17 +587,16 @@ signature_detect(...);  // Fallback
 
 | Metric | Value |
 |--------|-------|
-| Total Lines of Code | ~16,000+ |
-| BPF Program | ~3,287 lines |
+| Total Lines of Code | ~19,400 |
+| BPF Program | ~3,372 lines |
 | Source Files | 25+ |
 | SSL Libraries | 5 (OpenSSL, GnuTLS, NSS, WolfSSL, BoringSSL) |
 | HTTP Protocols | 2 (HTTP/1.1, HTTP/2) |
 | Decompression Formats | 4 |
 | File Signatures | 50+ |
-| Max Concurrent Flows | 8,192 |
 | Max Workers | 16 |
 | Max HTTP/2 Streams | 64 per flow |
 
 ---
 
-*Last updated: v0.9.6 (January 2026)*
+*Last updated: v0.9.8 (January 2026)*
