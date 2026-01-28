@@ -38,7 +38,7 @@
  */
 
 /** @brief Full version string (major.minor.patch) */
-#define SPLIFF_VERSION "0.9.6"
+#define SPLIFF_VERSION "0.9.8"
 
 /** @brief Major version number (breaking changes) */
 #define SPLIFF_VERSION_MAJOR 0
@@ -47,7 +47,7 @@
 #define SPLIFF_VERSION_MINOR 9
 
 /** @brief Patch version number (bug fixes) */
-#define SPLIFF_VERSION_PATCH 6
+#define SPLIFF_VERSION_PATCH 8
 
 /** @} */ /* end of version group */
 

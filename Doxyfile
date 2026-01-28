@@ -11,7 +11,7 @@
 PROJECT_NAME           = "spliff"
 
 # Project version or revision number
-PROJECT_NUMBER         = "0.9.7"
+PROJECT_NUMBER         = "0.9.8"
 
 # Brief description of the project
 PROJECT_BRIEF          = "eBPF-based SSL/TLS Traffic Sniffer"

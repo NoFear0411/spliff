@@ -47,9 +47,7 @@
 #include "spliff.skel.h"
 #pragma GCC diagnostic pop
 
-#ifdef HAVE_THREADING
 #include "threading/threading.h"
-#endif
 
 /* Global state */
 static volatile sig_atomic_t g_exiting = 0;
@@ -62,11 +60,9 @@ static bool g_probe_initialized = false;
 static bool g_xdp_initialized = false;
 static bool g_debug_mode = false;
 
-#ifdef HAVE_THREADING
 static threading_mgr_t g_threading;
 static bool g_threading_initialized = false;
 static dispatcher_ctx_t g_xdp_dispatcher;  /* XDP event dispatcher context */
-#endif
 
 /* Configuration - IPC filtering enabled by default (BPF handles kernel-level filtering) */
 config_t g_config = {
@@ -463,13 +459,11 @@ static void handle_process_exec_event(const ssl_data_event_t *event) {
     }
 }
 
-#ifdef HAVE_THREADING
 /* Process exec callback for threading mode - called directly by dispatcher */
 static void threading_process_exec_callback(const ssl_data_event_t *event, void *ctx) {
     (void)ctx;
     handle_process_exec_event(event);
 }
-#endif
 
 /* ─── Centralized Shutdown Statistics ─────────────────────────────────────── */
 
@@ -511,7 +505,6 @@ static void print_shutdown_stats(void) {
     fprintf(stderr, "============================================%s\n", reset);
 
     /* ── Application Layer (SSL/TLS) ─────────────────────────────────── */
-#ifdef HAVE_THREADING
     threading_stats_t ts;
     memset(&ts, 0, sizeof(ts));
     threading_get_aggregate_stats(&g_threading, &ts);
@@ -575,16 +568,14 @@ static void print_shutdown_stats(void) {
     fprintf(stderr, "\n  %sFlow Pool%s\n", cyan, reset);
     fprintf(stderr, "  %s----------------------------------------------%s\n", dim, reset);
 
-    double util_pct = fp->pool_capacity > 0
-        ? 100.0 * fp->pool_allocated / fp->pool_capacity : 0.0;
-    double peak_pct = fp->pool_capacity > 0
-        ? 100.0 * fp->pool_peak / fp->pool_capacity : 0.0;
-
-    fprintf(stderr, "  Utilization: %lu / %lu active (%.1f%%), peak %lu (%.1f%%)\n",
-            fp->pool_allocated, fp->pool_capacity, util_pct,
-            fp->pool_peak, peak_pct);
+    fprintf(stderr, "  Active:      %lu flows, peak %lu\n",
+            fp->pool_allocated, fp->pool_peak);
     fprintf(stderr, "  Throughput:  %lu allocs, %lu frees\n",
             fp->pool_total_allocs, fp->pool_total_frees);
+    if (fp->pool_alloc_failures > 0) {
+        fprintf(stderr, "  %sOOM:         %lu allocation failures%s\n",
+                yellow, fp->pool_alloc_failures, reset);
+    }
 
     /* Flow index details */
     uint64_t cookie_total = fp->cookie_hits + fp->cookie_misses;
@@ -599,7 +590,6 @@ static void print_shutdown_stats(void) {
         double promo_rate = 100.0 * fp->shadow_promotions / fp->pool_total_allocs;
         fprintf(stderr, "  Promotion:    %.1f%% of flows got socket_cookie\n", promo_rate);
     }
-#endif /* HAVE_THREADING */
 
     /* ── Network Layer (XDP) ─────────────────────────────────────────── */
     xdp_stats_t xdp = {0};
@@ -680,23 +670,19 @@ static void print_shutdown_stats(void) {
 
 /* Master cleanup function registered with atexit() */
 static void cleanup_all_resources(void) {
-#ifdef HAVE_THREADING
     /* Shutdown threading first (waits for workers to drain) */
     if (g_threading_initialized) {
         threading_shutdown(&g_threading);
     }
-#endif
 
     /* Print all statistics while data structures are still alive */
     print_shutdown_stats();
 
-#ifdef HAVE_THREADING
     /* Now safe to free threading resources */
     if (g_threading_initialized) {
         threading_cleanup(&g_threading);
         g_threading_initialized = false;
     }
-#endif
 
     /* Cleanup probe handler (ring buffer) */
     if (g_probe_initialized) {
@@ -759,7 +745,6 @@ static void setup_signals(void) {
  * All event processing now uses multi-threaded process_worker_event().
  */
 
-#ifdef HAVE_THREADING
 /* ============================================================================
  * Multi-Threaded Event Processing
  *
@@ -920,7 +905,6 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
                     display_name, event->pid, event->data_len);
     }
 }
-#endif /* HAVE_THREADING */
 
 /* Print usage */
 static void print_usage(const char *prog) {
@@ -941,11 +925,9 @@ static void print_usage(const char *prog) {
     printf("  -d              Debug mode (verbose output)\n");
     printf("  --show-libs     Show all discovered SSL libraries\n");
     printf("  -C              Disable colored output\n");
-#ifdef HAVE_THREADING
     printf("\nThreading Options:\n");
     printf("  -t, --threads N Worker threads (0=auto, default: auto)\n");
     printf("                  Auto: max(1, CPUs-3), capped at 16\n");
-#endif
     printf("  -v, --version   Show version\n");
     printf("  -h, --help      Show this help\n");
     printf("\nExamples:\n");
@@ -968,9 +950,7 @@ int main(int argc, char **argv) {
     bool debug_mode = false;
     bool show_libs = false;        /* Show all discovered libraries */
 
-#ifdef HAVE_THREADING
     int num_threads = 0;           /* 0 = auto-detect based on CPU count */
-#endif
 
     /* Filter options */
     char target_comm[64] = {0};
@@ -1054,7 +1034,6 @@ int main(int argc, char **argv) {
             use_openssl = use_gnutls = false;
         } else if (strcmp(argv[i], "--show-libs") == 0) {
             show_libs = true;
-#ifdef HAVE_THREADING
         } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--threads") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Error: %s requires a number argument\n", argv[i]);
@@ -1068,7 +1047,6 @@ int main(int argc, char **argv) {
                 return 1;
             }
             num_threads = (int)threads;
-#endif
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -1231,7 +1209,6 @@ int main(int argc, char **argv) {
     if (bpf_loader_xdp_init(&g_loader, debug_mode, &xdp_err) == 0) {
         g_xdp_initialized = true;
 
-#ifdef HAVE_THREADING
         /* Initialize XDP dispatcher context for event handling */
         memset(&g_xdp_dispatcher, 0, sizeof(g_xdp_dispatcher));
 
@@ -1243,7 +1220,6 @@ int main(int argc, char **argv) {
             printf("  %s[DEBUG]%s XDP event callback not registered (ringbuf unavailable)\n",
                    display_color(C_YELLOW), display_color(C_RESET));
         }
-#endif
 
         /* Auto-attach to all suitable network interfaces
          * Attach regardless of callback status - provides packet visibility */
@@ -1633,7 +1609,6 @@ int main(int argc, char **argv) {
     }
     /* Note: IPC filtering is always on (BPF kernel-level + userspace heuristics) */
 
-#ifdef HAVE_THREADING
     /* Initialize threading (required for Phase 3.6+ architecture) */
     if (threading_init(&g_threading, num_threads, false) == 0) {
         g_threading_initialized = true;
@@ -1647,11 +1622,6 @@ int main(int argc, char **argv) {
                 display_color(C_RED), display_color(C_RESET));
         return 1;  /* atexit handler will cleanup */
     }
-#else
-    fprintf(stderr, "%sError:%s spliff requires HAVE_THREADING support\n",
-            display_color(C_RED), display_color(C_RESET));
-    return 1;
-#endif
 
     if (probe_handler_setup_ringbuf(&g_handler, bpf_loader_get_object(&g_loader)) < 0) {
         fprintf(stderr, "%sError:%s Cannot setup ring buffer\n",
@@ -1720,7 +1690,6 @@ int main(int argc, char **argv) {
      *   - EINTR:         Harmless (continue loop)
      */
 
-#ifdef HAVE_THREADING
     /* Start multi-threaded event processing */
     if (threading_start(&g_threading, &g_handler) != 0) {
         fprintf(stderr, "%sError:%s Failed to start threading\n",
@@ -1760,7 +1729,6 @@ int main(int argc, char **argv) {
         usleep(50000);  /* 50ms between XDP polls */
     }
     /* Shutdown handled by cleanup_all_resources via atexit */
-#endif
 
     printf("\n%sDone.%s\n", display_color(C_GREEN), display_color(C_RESET));
 

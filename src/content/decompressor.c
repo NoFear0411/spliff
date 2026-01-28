@@ -49,24 +49,15 @@
  * zlib-ng in native mode uses zng_ prefixed functions to avoid symbol
  * collisions with system zlib. These macros provide a unified interface.
  *----------------------------------------------------------------------------*/
-#ifdef HAVE_ZLIB_NG
 #include <zlib-ng.h>
 /* Native zlib-ng API uses zng_ prefix */
 #define z_stream        zng_stream
 #define inflateInit2    zng_inflateInit2
 #define inflate         zng_inflate
 #define inflateEnd      zng_inflateEnd
-#else
-#include <zlib.h>
-#endif
 
-#ifdef HAVE_ZSTD
 #include <zstd.h>
-#endif
-
-#ifdef HAVE_BROTLI
 #include <brotli/decode.h>
-#endif
 
 /**
  * @brief Initialize the decompression system
@@ -119,20 +110,14 @@ int decompress_gzip(const uint8_t *in, int in_len, uint8_t *out, int out_len) {
 }
 
 int decompress_zstd(const uint8_t *in, int in_len, uint8_t *out, int out_len) {
-#ifdef HAVE_ZSTD
     size_t result = ZSTD_decompress(out, out_len, in, in_len);
     if (ZSTD_isError(result)) {
         return -1;
     }
     return (int)result;
-#else
-    (void)in; (void)in_len; (void)out; (void)out_len;
-    return -1;
-#endif
 }
 
 int decompress_brotli(const uint8_t *in, int in_len, uint8_t *out, int out_len) {
-#ifdef HAVE_BROTLI
     size_t decoded_size = out_len;
     BrotliDecoderResult result = BrotliDecoderDecompress(
         in_len, in, &decoded_size, out);
@@ -140,10 +125,6 @@ int decompress_brotli(const uint8_t *in, int in_len, uint8_t *out, int out_len) 
         return (int)decoded_size;
     }
     return -1;
-#else
-    (void)in; (void)in_len; (void)out; (void)out_len;
-    return -1;
-#endif
 }
 
 /**
@@ -165,11 +146,7 @@ int decompress_brotli(const uint8_t *in, int in_len, uint8_t *out, int out_len) 
  * @see decompress_zstd()
  */
 bool have_zstd_support(void) {
-#ifdef HAVE_ZSTD
     return true;
-#else
-    return false;
-#endif
 }
 
 /**
@@ -184,11 +161,7 @@ bool have_zstd_support(void) {
  * @see decompress_brotli()
  */
 bool have_brotli_support(void) {
-#ifdef HAVE_BROTLI
     return true;
-#else
-    return false;
-#endif
 }
 
 /** @} */ /* End of decomp_support group */
