@@ -1217,6 +1217,40 @@ void worker_cleanup_h2_streams_for_connection(worker_state_t *state,
  */
 
 /**
+ * @brief Aggregate threading statistics snapshot
+ *
+ * Consolidated view of all threading subsystem counters,
+ * collected via atomic loads for thread-safe access.
+ * Used by the centralized shutdown statistics printer.
+ */
+typedef struct {
+    /* Dispatcher totals */
+    uint64_t events_dispatched;     /**< Events routed to workers */
+    uint64_t events_dropped;        /**< Events dropped (queues full) */
+
+    /* Worker aggregates */
+    uint64_t total_processed;       /**< Total events processed */
+    uint64_t total_dropped;         /**< Total events dropped by workers */
+    uint64_t total_sleep_cycles;    /**< Total NAPI sleep cycles */
+    uint64_t total_deferred_ok;     /**< Total deferred retry successes */
+    uint64_t total_deferred_fail;   /**< Total deferred retry failures */
+    int      num_workers;           /**< Number of active workers */
+
+    /* Per-worker breakdown (debug) */
+    uint64_t worker_processed[MAX_WORKERS];    /**< Per-worker events */
+    uint64_t worker_dropped[MAX_WORKERS];      /**< Per-worker drops */
+    uint64_t worker_deferred_ok[MAX_WORKERS];  /**< Per-worker retry ok */
+    uint64_t worker_deferred_fail[MAX_WORKERS]; /**< Per-worker retry fail */
+
+    /* Output thread */
+    uint64_t messages_written;      /**< Messages written to stdout */
+    uint64_t bytes_written;         /**< Bytes written to stdout */
+
+    /* Flow pool (from shared pool architecture) */
+    flow_pool_stats_t flow_pool;    /**< Pool and index statistics */
+} threading_stats_t;
+
+/**
  * @brief Get object pool statistics
  *
  * @param[in]  pool     Pool to query
@@ -1258,6 +1292,17 @@ void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
  * @param[out] bytes    Bytes written (optional)
  */
 void output_get_stats(output_ctx_t *ctx, uint64_t *messages, uint64_t *bytes);
+
+/**
+ * @brief Get aggregate threading statistics
+ *
+ * Collects statistics from dispatcher, all workers, output thread,
+ * and flow pool into a single snapshot structure.
+ *
+ * @param[in]  mgr   Threading manager
+ * @param[out] stats Output statistics structure
+ */
+void threading_get_aggregate_stats(threading_mgr_t *mgr, threading_stats_t *stats);
 
 /** @} */ /* end threading_stats group */
 

@@ -2,6 +2,28 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.7] - 2026-01-28
+
+### Added
+- **Centralized Session Statistics**: All shutdown metrics displayed from a single function in main.c
+  - Unified report replaces scattered printing across `manager.c`, `flow_context.c`, and `main.c`
+  - All stats shown unconditionally in every build (no `-d` debug flag required)
+  - Production-grade visibility: event pipeline, per-worker breakdown, flow pool analytics,
+    XDP classification, sockops events, and SSL probe counters
+  - Human-readable byte formatting for output size (KB/MB/GB)
+  - ANSI color highlighting for warnings and CPU efficiency status
+
+### Changed
+- **Statistics Architecture**: Modules now expose getter-only APIs; printing centralized in main.c
+  - New `threading_stats_t` aggregate struct and `threading_get_aggregate_stats()` getter
+  - `threading_print_stats()` and `flow_manager_print_stats()` reduced to no-ops
+  - Cleanup ordering: stats collected after `threading_shutdown()` but before `threading_cleanup()`
+
+### Technical Details
+- Modified: `threading.h`, `manager.c`, `flow_context.c`, `main.c`
+- New type: `threading_stats_t` (aggregates dispatcher + workers + output + flow pool)
+- New function: `threading_get_aggregate_stats()`, `print_shutdown_stats()`, `format_bytes()`
+
 ## [0.9.6] - 2026-01-26
 
 ### Added

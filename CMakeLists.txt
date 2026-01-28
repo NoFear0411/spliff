@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(spliff
-    VERSION 0.9.5
+    VERSION 0.9.7
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C

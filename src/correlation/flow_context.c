@@ -1256,53 +1256,7 @@ void flow_manager_get_stats(flow_manager_t *mgr, flow_pool_stats_t *stats) {
 }
 
 void flow_manager_print_stats(flow_manager_t *mgr, bool debug_mode) {
-    if (!mgr) {
-        return;
-    }
-
-    flow_pool_stats_t stats;
-    flow_manager_get_stats(mgr, &stats);
-
-    fprintf(stderr, "\n=== Flow Pool Statistics ===\n");
-
-    /* Pool utilization */
-    double util_pct = stats.pool_capacity > 0
-        ? 100.0 * stats.pool_allocated / stats.pool_capacity
-        : 0.0;
-    double peak_pct = stats.pool_capacity > 0
-        ? 100.0 * stats.pool_peak / stats.pool_capacity
-        : 0.0;
-
-    fprintf(stderr, "Pool: %lu/%lu active (%.1f%%), peak %lu (%.1f%%)\n",
-            stats.pool_allocated, stats.pool_capacity, util_pct,
-            stats.pool_peak, peak_pct);
-
-    /* Lifetime stats */
-    fprintf(stderr, "Lifetime: %lu allocs, %lu frees\n",
-            stats.pool_total_allocs, stats.pool_total_frees);
-
-    /* Index statistics (debug mode) */
-    if (debug_mode) {
-        fprintf(stderr, "\n--- Index Statistics ---\n");
-
-        /* Cookie index */
-        uint64_t cookie_total = stats.cookie_hits + stats.cookie_misses;
-        double cookie_hit_rate = cookie_total > 0
-            ? 100.0 * stats.cookie_hits / cookie_total
-            : 0.0;
-        fprintf(stderr, "Cookie index: %lu entries, %lu hits (%.1f%%), %lu misses\n",
-                stats.cookie_count, stats.cookie_hits, cookie_hit_rate,
-                stats.cookie_misses);
-
-        /* Shadow index */
-        fprintf(stderr, "Shadow index: %lu entries, %lu hits, %lu promotions\n",
-                stats.shadow_count, stats.shadow_hits, stats.shadow_promotions);
-
-        /* Promotion rate - how often we go from shadow to cookie */
-        if (stats.pool_total_allocs > 0) {
-            double promo_rate = 100.0 * stats.shadow_promotions / stats.pool_total_allocs;
-            fprintf(stderr, "XDP correlation: %.1f%% of flows got socket_cookie\n",
-                    promo_rate);
-        }
-    }
+    /* No-op: stats printing is now centralized in main.c print_shutdown_stats() */
+    (void)mgr;
+    (void)debug_mode;
 }
