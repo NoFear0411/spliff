@@ -41,7 +41,6 @@
 #endif
 /** @endcond */
 
-#if defined(HAVE_VECTORSCAN) || defined(HAVE_HYPERSCAN)
 #include <hs/hs.h>
 #include <threads.h>  /* C23 thread-local storage */
 
@@ -269,126 +268,9 @@ flow_proto_t proto_detect_and_init(flow_context_t *restrict ctx,
 }
 
 const char *proto_detector_engine_name(void) {
-#if defined(HAVE_VECTORSCAN)
     return "vectorscan";
-#else
-    return "hyperscan";
-#endif
 }
 
 bool proto_detector_is_nfa_engine(void) {
     return true;
 }
-
-#else /* Fallback: No vectorscan/hyperscan */
-
-/*============================================================================
- * Manual Fallback Implementation
- *============================================================================*/
-
-/**
- * @brief Fallback initialization (no-op)
- */
-int proto_detector_init(void) {
-    fprintf(stderr, "[DETECTOR] Using manual fallback (vectorscan not available)\n");
-    return 0;
-}
-
-/**
- * @brief Fallback cleanup (no-op)
- */
-void proto_detector_cleanup(void) {
-    /* Nothing to clean up in fallback mode */
-}
-
-/**
- * @brief Fallback thread cleanup (no-op)
- */
-void proto_detector_thread_cleanup(void) {
-    /* Nothing to clean up in fallback mode */
-}
-
-/**
- * @brief Manual protocol detection
- *
- * Uses existing http1_is_request(), http2_is_preface() etc.
- * This is O(n) but not as optimized as vectorscan's NFA.
- */
-proto_detect_result_t proto_detect(const uint8_t *restrict data, size_t len) {
-    if (!data || len == 0) {
-        return PROTO_DETECT_UNKNOWN;
-    }
-
-    /* HTTP/1.x detection */
-    if (http1_is_request(data, len)) {
-        return PROTO_DETECT_HTTP1_REQ;
-    }
-    if (http1_is_response(data, len)) {
-        return PROTO_DETECT_HTTP1_RSP;
-    }
-
-    /* HTTP/2 detection */
-    if (http2_is_preface(data, len)) {
-        return PROTO_DETECT_HTTP2;
-    }
-
-    /* TLS detection (simple check for ContentType + Version) */
-    if (len >= 3 &&
-        (data[0] == 0x16 || data[0] == 0x17) &&  /* Handshake or AppData */
-        data[1] == 0x03 &&                        /* SSL/TLS major version */
-        data[2] <= 0x03) {                        /* Minor version 0-3 */
-        return PROTO_DETECT_TLS;
-    }
-
-    /* WebSocket frame detection (FIN + opcode with mask) */
-    if (len >= 2 &&
-        (data[0] >= 0x81 && data[0] <= 0x8a) &&  /* FIN + text/binary/ping/pong */
-        (data[1] & 0x80)) {                       /* Mask bit set */
-        return PROTO_DETECT_WEBSOCKET;
-    }
-
-    return PROTO_DETECT_UNKNOWN;
-}
-
-flow_proto_t proto_detect_and_init(flow_context_t *restrict ctx,
-                                    const uint8_t *restrict data,
-                                    size_t len) {
-    if (!ctx) {
-        return FLOW_PROTO_UNKNOWN;
-    }
-
-    /* Already detected - return cached value */
-    if (ctx->proto != FLOW_PROTO_UNKNOWN) {
-        return ctx->proto;
-    }
-
-    /* Run manual detection */
-    proto_detect_result_t result = proto_detect(data, len);
-
-    /* Map to flow protocol */
-    switch (result) {
-        case PROTO_DETECT_HTTP1_REQ:
-        case PROTO_DETECT_HTTP1_RSP:
-            ctx->proto = FLOW_PROTO_HTTP1;
-            break;
-
-        case PROTO_DETECT_HTTP2:
-            ctx->proto = FLOW_PROTO_HTTP2;
-            break;
-
-        default:
-            break;
-    }
-
-    return ctx->proto;
-}
-
-const char *proto_detector_engine_name(void) {
-    return "manual";
-}
-
-bool proto_detector_is_nfa_engine(void) {
-    return false;
-}
-
-#endif /* HAVE_VECTORSCAN || HAVE_HYPERSCAN */
