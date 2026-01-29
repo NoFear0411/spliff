@@ -1,8 +1,12 @@
 # spliff Release Workflow
 #
-# Creates releases with binary packages when a version tag is pushed.
-# Builds for: Fedora 43, AlmaLinux 10/9, Ubuntu 24.04, Debian Bookworm, Arch
-# Publishes .deb/.rpm packages to GitHub Releases
+# Creates signed RPM releases when a version tag is pushed.
+# Builds for: Fedora 43/42 (dynamic), AlmaLinux 10/9 (static vectorscan)
+# Publishes signed .rpm packages with detached GPG signatures to GitHub Releases
+#
+# Caching strategy:
+# - DNF package cache: Avoids re-downloading packages (~2-3 min savings)
+# - Vectorscan static build: Avoids recompiling from source (~10 min savings)
 
 name: Release
 
@@ -11,27 +15,87 @@ on:
     tags:
       - 'v*'
 
+env:
+  VECTORSCAN_VERSION: "5.4.12"
+
 jobs:
+  # ==========================================================================
+  # Check which distros already have artifacts in the release
+  # ==========================================================================
+  check-existing:
+    name: Check Existing Artifacts
+    runs-on: ubuntu-latest
+    outputs:
+      fedora-43: ${{ steps.check.outputs.fedora-43 }}
+      fedora-42: ${{ steps.check.outputs.fedora-42 }}
+      almalinux-10: ${{ steps.check.outputs.almalinux-10 }}
+      almalinux-9: ${{ steps.check.outputs.almalinux-9 }}
+    steps:
+      - name: Check for existing release artifacts
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+
+          # Get list of assets in existing release (if any)
+          ASSETS=$(gh release view "$TAG" --repo ${{ github.repository }} --json assets -q '.assets[].name' 2>/dev/null || echo "")
+
+          # Check each distro
+          for distro in fedora-43 fedora-42 almalinux-10 almalinux-9; do
+            if echo "$ASSETS" | grep -q "fc43" && [ "$distro" = "fedora-43" ]; then
+              echo "$distro=skip" >> $GITHUB_OUTPUT
+            elif echo "$ASSETS" | grep -q "fc42" && [ "$distro" = "fedora-42" ]; then
+              echo "$distro=skip" >> $GITHUB_OUTPUT
+            elif echo "$ASSETS" | grep -q "el10" && [ "$distro" = "almalinux-10" ]; then
+              echo "$distro=skip" >> $GITHUB_OUTPUT
+            elif echo "$ASSETS" | grep -q "el9" && [ "$distro" = "almalinux-9" ]; then
+              echo "$distro=skip" >> $GITHUB_OUTPUT
+            else
+              echo "$distro=build" >> $GITHUB_OUTPUT
+            fi
+          done
+
+          echo "=== Build decisions ==="
+          cat $GITHUB_OUTPUT
+
   # ==========================================================================
   # Fedora 43 (Full feature support - primary build target)
   # ==========================================================================
   build-fedora-43:
     name: Build (Fedora 43)
+    needs: check-existing
+    if: needs.check-existing.outputs.fedora-43 == 'build'
     runs-on: ubuntu-latest
     container: fedora:43
 
     steps:
+      - name: Setup DNF cache directory
+        run: mkdir -p /var/cache/dnf /var/cache/libdnf5
+
+      - name: Cache DNF packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/dnf
+            /var/cache/libdnf5
+          key: dnf-fedora-43-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            dnf-fedora-43-
+
       - name: Install dependencies
         run: |
-          dnf install -y \
+          dnf clean metadata || true
+          dnf install -y --setopt=keepcache=True \
             git cmake make pkg-config \
-            gcc gcc-c++ clang llvm \
-            libbpf-devel elfutils-libelf-devel zlib-devel \
+            gcc gcc-c++ clang llvm bpftool \
+            libbpf-devel elfutils-libelf-devel zlib-ng-devel \
             llhttp-devel libnghttp2-devel \
             ck-devel \
             libzstd-devel brotli-devel \
             libxdp-devel userspace-rcu-devel \
             jemalloc-devel pcre2-devel \
+            vectorscan-devel \
             rpm-build
 
       - name: Checkout
@@ -60,21 +124,38 @@ jobs:
   # ==========================================================================
   build-fedora-42:
     name: Build (Fedora 42)
+    needs: check-existing
+    if: needs.check-existing.outputs.fedora-42 == 'build'
     runs-on: ubuntu-latest
     container: fedora:42
 
     steps:
+      - name: Setup DNF cache directory
+        run: mkdir -p /var/cache/dnf /var/cache/libdnf5
+
+      - name: Cache DNF packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/dnf
+            /var/cache/libdnf5
+          key: dnf-fedora-42-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            dnf-fedora-42-
+
       - name: Install dependencies
         run: |
-          dnf install -y \
+          dnf clean metadata || true
+          dnf install -y --setopt=keepcache=True \
             git cmake make pkg-config \
-            gcc gcc-c++ clang llvm \
-            libbpf-devel elfutils-libelf-devel zlib-devel \
+            gcc gcc-c++ clang llvm bpftool \
+            libbpf-devel elfutils-libelf-devel zlib-ng-devel \
             llhttp-devel libnghttp2-devel \
             ck-devel \
             libzstd-devel brotli-devel \
             libxdp-devel userspace-rcu-devel \
             jemalloc-devel pcre2-devel \
+            vectorscan-devel \
             rpm-build
 
       - name: Checkout
@@ -99,47 +180,101 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # AlmaLinux 10 (RHEL 10 Compatible)
+  # AlmaLinux 10 (RHEL 10 Compatible - static vectorscan)
   # ==========================================================================
   build-alma10:
     name: Build (AlmaLinux 10)
+    needs: check-existing
+    if: needs.check-existing.outputs.almalinux-10 == 'build'
     runs-on: ubuntu-latest
     container: almalinux:10
 
     steps:
+      - name: Setup DNF cache directory
+        run: mkdir -p /var/cache/dnf
+
+      - name: Cache DNF packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/dnf
+          key: dnf-alma10-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            dnf-alma10-
+
       - name: Enable EPEL and CRB
         run: |
-          dnf install -y epel-release
+          dnf clean metadata
+          dnf install -y --setopt=keepcache=True epel-release
           dnf config-manager --set-enabled crb || true
+          dnf config-manager --set-enabled epel || true
+          dnf makecache
+          echo "=== Enabled repositories ==="
+          dnf repolist enabled
 
       - name: Install dependencies
         run: |
-          dnf install -y --allowerasing \
+          dnf makecache --refresh
+          dnf install -y --setopt=keepcache=True --allowerasing \
             git cmake make pkg-config curl \
-            gcc gcc-c++ clang llvm \
-            elfutils-libelf-devel zlib-devel \
+            gcc gcc-c++ clang llvm bpftool \
+            libbpf-devel elfutils-libelf-devel zlib-ng-devel \
             llhttp-devel libnghttp2-devel \
+            ck-devel libxdp-devel \
             libzstd-devel brotli-devel \
             userspace-rcu-devel pcre2-devel \
             jemalloc-devel \
-            rpm-build
+            rpm-build \
+            boost-devel sqlite-devel glibc-devel \
+            python3-devel libpcap-devel pcre2-devel
+          # Install colm, colm-devel (provides libfsm), and ragel together from EPEL 10.2
+          dnf install -y \
+            https://dl.fedoraproject.org/pub/epel/10/Everything/x86_64/Packages/c/colm-0.14.7-10.el10_2.x86_64.rpm \
+            https://dl.fedoraproject.org/pub/epel/10/Everything/x86_64/Packages/c/colm-devel-0.14.7-10.el10_2.x86_64.rpm \
+            https://dl.fedoraproject.org/pub/epel/10/Everything/x86_64/Packages/r/ragel-7.0.4-8.el10_2.x86_64.rpm
 
-      - name: Build libbpf from source
+      - name: Cache vectorscan build
+        id: cache-vectorscan
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/include/hs
+            /usr/local/lib64/libhs.a
+            /usr/local/lib64/libhs_runtime.a
+            /usr/local/lib64/pkgconfig/libhs.pc
+          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-static-v2
+
+      - name: Build vectorscan from source (static)
+        if: steps.cache-vectorscan.outputs.cache-hit != 'true'
         run: |
           cd /tmp
-          curl -sL https://github.com/libbpf/libbpf/archive/refs/tags/v1.4.0.tar.gz | tar xz
-          cd libbpf-1.4.0/src
-          make -j$(nproc)
-          make install
-          ldconfig
+          curl -sL https://github.com/VectorCamp/vectorscan/archive/refs/tags/vectorscan/${VECTORSCAN_VERSION}.tar.gz | tar xz
+          cd vectorscan-vectorscan-${VECTORSCAN_VERSION}
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_STATIC_LIBS=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DFAT_RUNTIME=ON \
+            -DBUILD_AVX2=ON \
+            -DBUILD_AVX512=ON \
+            -DBUILD_AVX512VBMI=ON \
+            -DPCRE_SOURCE=pcre2
+          cmake --build build -j$(nproc)
+          cmake --install build
+
+      - name: Update library cache
+        run: ldconfig
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure (Release)
+      - name: Configure (Release, static vectorscan)
         run: |
-          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig
-          cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DENABLE_XDP=OFF
+          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH}
+          cmake -B build-release \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_SANITIZERS=OFF \
+            -DENABLE_STATIC_LIBS=ON
 
       - name: Build
         run: cmake --build build-release --parallel
@@ -157,47 +292,95 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # AlmaLinux 9 (RHEL 9 Compatible)
+  # AlmaLinux 9 (RHEL 9 Compatible - static vectorscan)
   # ==========================================================================
   build-alma9:
     name: Build (AlmaLinux 9)
+    needs: check-existing
+    if: needs.check-existing.outputs.almalinux-9 == 'build'
     runs-on: ubuntu-latest
     container: almalinux:9
 
     steps:
+      - name: Setup DNF cache directory
+        run: mkdir -p /var/cache/dnf
+
+      - name: Cache DNF packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/dnf
+          key: dnf-alma9-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            dnf-alma9-
+
       - name: Enable EPEL and CRB
         run: |
-          dnf install -y epel-release
+          dnf clean metadata
+          dnf install -y --setopt=keepcache=True epel-release
           dnf config-manager --set-enabled crb || true
+          dnf config-manager --set-enabled epel || true
+          dnf makecache
+          echo "=== Enabled repositories ==="
+          dnf repolist enabled
 
       - name: Install dependencies
         run: |
-          dnf install -y --allowerasing \
+          dnf makecache --refresh
+          dnf install -y --setopt=keepcache=True --allowerasing \
             git cmake make pkg-config curl \
-            gcc gcc-c++ clang llvm \
-            elfutils-libelf-devel zlib-devel \
+            gcc gcc-c++ clang llvm bpftool \
+            libbpf-devel elfutils-libelf-devel zlib-ng-devel \
             llhttp-devel libnghttp2-devel \
+            ck-devel libxdp-devel \
             libzstd-devel brotli-devel \
             userspace-rcu-devel pcre2-devel \
             jemalloc-devel \
-            rpm-build
+            rpm-build \
+            boost-devel ragel sqlite-devel glibc-devel \
+            python3-devel libpcap-devel pcre-devel
 
-      - name: Build libbpf from source
+      - name: Cache vectorscan build
+        id: cache-vectorscan
+        uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/include/hs
+            /usr/local/lib64/libhs.a
+            /usr/local/lib64/libhs_runtime.a
+            /usr/local/lib64/pkgconfig/libhs.pc
+          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-static-v2
+
+      - name: Build vectorscan from source (static)
+        if: steps.cache-vectorscan.outputs.cache-hit != 'true'
         run: |
           cd /tmp
-          curl -sL https://github.com/libbpf/libbpf/archive/refs/tags/v1.4.0.tar.gz | tar xz
-          cd libbpf-1.4.0/src
-          make -j$(nproc)
-          make install
-          ldconfig
+          curl -sL https://github.com/VectorCamp/vectorscan/archive/refs/tags/vectorscan/${VECTORSCAN_VERSION}.tar.gz | tar xz
+          cd vectorscan-vectorscan-${VECTORSCAN_VERSION}
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_STATIC_LIBS=ON \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DFAT_RUNTIME=ON \
+            -DBUILD_AVX2=ON \
+            -DBUILD_AVX512=ON \
+            -DBUILD_AVX512VBMI=ON
+          cmake --build build -j$(nproc)
+          cmake --install build
+
+      - name: Update library cache
+        run: ldconfig
 
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure (Release)
+      - name: Configure (Release, static vectorscan)
         run: |
-          export PKG_CONFIG_PATH=/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig
-          cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DENABLE_XDP=OFF
+          export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH}
+          cmake -B build-release \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_SANITIZERS=OFF \
+            -DENABLE_STATIC_LIBS=ON
 
       - name: Build
         run: cmake --build build-release --parallel
@@ -215,213 +398,18 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # Ubuntu 24.04 LTS (Noble)
-  # ==========================================================================
-  build-ubuntu:
-    name: Build (Ubuntu 24.04)
-    runs-on: ubuntu-latest
-    container: ubuntu:24.04
-
-    steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            git cmake make pkg-config curl ca-certificates \
-            gcc g++ clang llvm \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libnghttp2-dev \
-            libzstd-dev libbrotli-dev \
-            libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev \
-            dpkg-dev file
-        env:
-          DEBIAN_FRONTEND: noninteractive
-
-      - name: Build llhttp from source
-        run: |
-          cd /tmp
-          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
-          cd llhttp-release-v9.2.1
-          cmake -B build -DBUILD_SHARED_LIBS=ON
-          cmake --build build
-          cmake --install build
-          ldconfig
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Create DEB package
-        run: cd build-release && cpack -G DEB
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-ubuntu-24.04
-          path: |
-            build-release/spliff
-            build-release/*.deb
-          retention-days: 7
-
-  # ==========================================================================
-  # Debian 13 (Trixie) - Full feature support with native packages
-  # ==========================================================================
-  build-debian-13:
-    name: Build (Debian 13)
-    runs-on: ubuntu-latest
-    container: debian:trixie
-
-    steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            git cmake make pkg-config curl ca-certificates \
-            gcc g++ clang llvm \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libllhttp-dev libnghttp2-dev \
-            libck-dev \
-            libzstd-dev libbrotli-dev \
-            libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev \
-            dpkg-dev file
-        env:
-          DEBIAN_FRONTEND: noninteractive
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Create DEB package
-        run: cd build-release && cpack -G DEB
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-debian-13
-          path: |
-            build-release/spliff
-            build-release/*.deb
-          retention-days: 7
-
-  # ==========================================================================
-  # Debian 12 (Bookworm) - llhttp built from source
-  # ==========================================================================
-  build-debian-12:
-    name: Build (Debian 12)
-    runs-on: ubuntu-latest
-    container: debian:bookworm
-
-    steps:
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y \
-            git cmake make pkg-config curl ca-certificates \
-            gcc g++ clang llvm \
-            libbpf-dev libelf-dev zlib1g-dev \
-            libnghttp2-dev \
-            libzstd-dev libbrotli-dev \
-            libxdp-dev liburcu-dev \
-            libjemalloc-dev libpcre2-dev \
-            dpkg-dev file
-        env:
-          DEBIAN_FRONTEND: noninteractive
-
-      - name: Build llhttp from source
-        run: |
-          cd /tmp
-          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
-          cd llhttp-release-v9.2.1
-          cmake -B build -DBUILD_SHARED_LIBS=ON
-          cmake --build build
-          cmake --install build
-          ldconfig
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Create DEB package
-        run: cd build-release && cpack -G DEB
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-debian-12
-          path: |
-            build-release/spliff
-            build-release/*.deb
-          retention-days: 7
-
-  # ==========================================================================
-  # Arch Linux (Rolling Release) - Binary only, no package
-  # ==========================================================================
-  build-arch:
-    name: Build (Arch Linux)
-    runs-on: ubuntu-latest
-    container: archlinux:latest
-
-    steps:
-      - name: Install dependencies
-        run: |
-          pacman -Syu --noconfirm \
-            git cmake make pkg-config curl \
-            gcc clang llvm \
-            libbpf libelf zlib \
-            libnghttp2 \
-            zstd brotli \
-            xdp-tools liburcu \
-            jemalloc pcre2
-
-      - name: Build llhttp from source
-        run: |
-          cd /tmp
-          curl -sL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.2.1.tar.gz | tar xz
-          cd llhttp-release-v9.2.1
-          cmake -B build -DBUILD_SHARED_LIBS=ON
-          cmake --build build
-          cmake --install build
-          ldconfig
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure (Release)
-        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
-
-      - name: Build
-        run: cmake --build build-release --parallel
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: spliff-arch
-          path: build-release/spliff
-          retention-days: 7
-
-  # ==========================================================================
-  # Create GitHub Release with Packages
+  # Create GitHub Release with Signed Packages
   # ==========================================================================
   release:
     name: Create Release
-    needs: [build-fedora-43, build-fedora-42, build-alma10, build-alma9, build-ubuntu, build-debian-13, build-debian-12, build-arch]
+    needs: [check-existing, build-fedora-43, build-fedora-42, build-alma10, build-alma9]
+    if: |
+      always() && (
+        needs.build-fedora-43.result == 'success' ||
+        needs.build-fedora-42.result == 'success' ||
+        needs.build-alma10.result == 'success' ||
+        needs.build-alma9.result == 'success'
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -480,7 +468,6 @@ jobs:
           path: artifacts
 
       - name: Prepare release assets
-        id: assets
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p release
@@ -494,15 +481,59 @@ jobs:
             fi
           done
 
-          # Copy all packages (already have version in filename from CPack)
-          find artifacts -name '*.deb' -exec cp {} release/ \;
+          # Copy all RPM packages
           find artifacts -name '*.rpm' -exec cp {} release/ \;
 
-          # Generate checksums
-          cd release
-          sha256sum * > SHA256SUMS.txt
-
           echo "Release assets:"
+          ls -la release/
+
+      - name: Install signing tools
+        run: sudo apt-get update && sudo apt-get install -y rpm gnupg2
+
+      - name: Sign RPMs (if GPG key configured)
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$GPG_PRIVATE_KEY" ]; then
+            echo "GPG_PRIVATE_KEY not configured, skipping signing"
+            exit 0
+          fi
+
+          # Import GPG key
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          GPG_KEY_ID=$(gpg --list-keys --with-colons | grep '^pub' | head -1 | cut -d: -f5)
+
+          # Configure rpmmacros
+          echo "%_signature gpg" >> ~/.rpmmacros
+          echo "%_gpg_name ${GPG_KEY_ID}" >> ~/.rpmmacros
+          echo "%_gpg_path ${HOME}/.gnupg" >> ~/.rpmmacros
+          echo "%__gpg_sign_cmd %{__gpg} gpg --batch --pinentry-mode loopback --passphrase ${GPG_PASSPHRASE} --no-armor --no-secmem-warning -u \"%{_gpg_name}\" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}" >> ~/.rpmmacros
+
+          cd release
+
+          # Sign each RPM with rpmsign
+          for rpm in *.rpm; do
+            [ -f "$rpm" ] || continue
+            rpmsign --addsign "$rpm"
+          done
+
+          # Create detached ASCII signatures for all release assets
+          for file in *; do
+            [ -f "$file" ] && [ "${file##*.}" != "asc" ] && \
+              gpg --batch --passphrase "${GPG_PASSPHRASE}" --pinentry-mode loopback \
+                --detach-sign --armor --output "${file}.asc" "$file"
+          done
+
+      - name: Generate checksums
+        run: |
+          cd release
+          # Generate checksums for all files except SHA256SUMS.txt itself
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -exec sha256sum {} + > SHA256SUMS.txt || true
+          echo "=== SHA256SUMS.txt contents ==="
+          cat SHA256SUMS.txt
+          echo ""
+          echo "=== Release assets ==="
           ls -la
 
       - name: Create Release

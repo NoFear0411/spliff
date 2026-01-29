@@ -22,6 +22,10 @@ option(USE_VECTORSCAN "Use vectorscan/hyperscan for O(n) protocol detection" ON)
 option(USE_ZLIB_NG "Use zlib-ng for SIMD-accelerated decompression" ON)
 option(USE_MIMALLOC "Use mimalloc instead of jemalloc (lower latency)" OFF)
 
+# Packaging options (CI release builds)
+option(ENABLE_STATIC_LIBS "Statically link vectorscan for portable RPMs" OFF)
+option(ENABLE_FULL_STATIC "Statically link all libraries for portable binary" OFF)
+
 # ============================================================================
 # C23 Standard Configuration
 # ============================================================================
@@ -210,6 +214,14 @@ message(STATUS "BPF target architecture: ${BPF_ARCH}")
 # ============================================================================
 
 find_package(PkgConfig REQUIRED)
+
+# Static linking support for portable RPMs (vectorscan only)
+if(ENABLE_STATIC_LIBS)
+    set(SPLIFF_STATIC_KEYWORD "STATIC")
+    message(STATUS "Static linking: enabled for vectorscan")
+else()
+    set(SPLIFF_STATIC_KEYWORD "")
+endif()
 
 # --- Core BPF dependencies ---
 pkg_check_modules(LIBBPF REQUIRED IMPORTED_TARGET libbpf)
@@ -429,7 +441,7 @@ endif()
 # Falls back to hyperscan, then pcre2
 if(USE_VECTORSCAN)
     # Try vectorscan first (portable, works without AVX-512)
-    pkg_check_modules(VECTORSCAN IMPORTED_TARGET vectorscan)
+    pkg_check_modules(VECTORSCAN IMPORTED_TARGET ${SPLIFF_STATIC_KEYWORD} vectorscan)
     if(VECTORSCAN_FOUND)
         message(STATUS "Found vectorscan: ${VECTORSCAN_VERSION} (O(n) NFA engine)")
         set(PATTERN_TARGET PkgConfig::VECTORSCAN)
@@ -442,12 +454,17 @@ if(USE_VECTORSCAN)
             message(STATUS "Found vectorscan via direct search (O(n) NFA engine)")
             add_library(VECTORSCAN_TARGET INTERFACE IMPORTED)
             target_include_directories(VECTORSCAN_TARGET INTERFACE ${VECTORSCAN_INCLUDE_DIR})
-            target_link_libraries(VECTORSCAN_TARGET INTERFACE ${VECTORSCAN_LIBRARY})
+            # Static vectorscan needs C++ standard library and math library
+            if(ENABLE_STATIC_LIBS)
+                target_link_libraries(VECTORSCAN_TARGET INTERFACE ${VECTORSCAN_LIBRARY} stdc++ m)
+            else()
+                target_link_libraries(VECTORSCAN_TARGET INTERFACE ${VECTORSCAN_LIBRARY})
+            endif()
             set(PATTERN_TARGET VECTORSCAN_TARGET)
             set(HAVE_VECTORSCAN TRUE)
         else()
             # Try Intel hyperscan as fallback
-            pkg_check_modules(HYPERSCAN IMPORTED_TARGET hyperscan)
+            pkg_check_modules(HYPERSCAN IMPORTED_TARGET ${SPLIFF_STATIC_KEYWORD} hyperscan)
             if(HYPERSCAN_FOUND)
                 message(STATUS "Found hyperscan: ${HYPERSCAN_VERSION} (O(n) NFA engine)")
                 set(PATTERN_TARGET PkgConfig::HYPERSCAN)
@@ -589,30 +606,85 @@ target_include_directories(spliff PRIVATE
     ${CMAKE_BINARY_DIR}
 )
 
-# Link all required libraries
-target_link_libraries(spliff PRIVATE
-    # Core BPF
-    PkgConfig::LIBBPF
-    PkgConfig::LIBELF
-    # Compression (zlib-ng or zlib)
-    ${ZLIB_TARGET}
-    PkgConfig::ZSTD
-    PkgConfig::BROTLI
-    # HTTP parsing
-    PkgConfig::LLHTTP
-    PkgConfig::NGHTTP2
-    # Threading and concurrency
-    PkgConfig::CK
-    PkgConfig::LIBXDP
-    PkgConfig::LIBURCU
-    # Memory allocator (mimalloc or jemalloc)
-    ${ALLOCATOR_TARGET}
-    # Pattern matching (vectorscan, hyperscan, or pcre2)
-    ${PATTERN_TARGET}
-    PkgConfig::PCRE2
-    # POSIX threads
-    pthread
-)
+# Full static linking support for portable binary
+if(ENABLE_FULL_STATIC)
+    message(STATUS "Full static linking: enabled")
+    # Use -static for all libraries except glibc
+    # glibc static linking has NSS/DNS issues, so we link it dynamically
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc")
+
+    # Find static libraries explicitly
+    find_library(LIBBPF_STATIC NAMES libbpf.a PATHS /usr/lib64 /usr/lib)
+    find_library(LIBELF_STATIC NAMES libelf.a PATHS /usr/lib64 /usr/lib)
+    find_library(ZLIB_NG_STATIC NAMES libz-ng.a PATHS /usr/lib64 /usr/lib)
+    find_library(ZSTD_STATIC NAMES libzstd.a PATHS /usr/lib64 /usr/lib)
+    find_library(BROTLIDEC_STATIC NAMES libbrotlidec.a PATHS /usr/lib64 /usr/lib)
+    find_library(BROTLICOMMON_STATIC NAMES libbrotlicommon.a PATHS /usr/lib64 /usr/lib)
+    find_library(LLHTTP_STATIC NAMES libllhttp.a PATHS /usr/lib64 /usr/lib)
+    find_library(NGHTTP2_STATIC NAMES libnghttp2.a PATHS /usr/lib64 /usr/lib)
+    find_library(CK_STATIC NAMES libck.a PATHS /usr/lib64 /usr/lib)
+    find_library(XDP_STATIC NAMES libxdp.a PATHS /usr/lib64 /usr/lib)
+    find_library(URCU_STATIC NAMES liburcu-memb.a PATHS /usr/lib64 /usr/lib)
+    find_library(URCU_COMMON_STATIC NAMES liburcu-common.a PATHS /usr/lib64 /usr/lib)
+    find_library(JEMALLOC_STATIC NAMES libjemalloc.a PATHS /usr/lib64 /usr/lib)
+    find_library(PCRE2_STATIC NAMES libpcre2-8.a PATHS /usr/lib64 /usr/lib)
+    find_library(HS_STATIC NAMES libhs.a PATHS /usr/local/lib64 /usr/local/lib /usr/lib64 /usr/lib)
+    find_library(HS_RUNTIME_STATIC NAMES libhs_runtime.a PATHS /usr/local/lib64 /usr/local/lib /usr/lib64 /usr/lib)
+
+    # Link static libraries
+    target_link_libraries(spliff PRIVATE
+        # Use whole-archive for some libraries to ensure all symbols are included
+        -Wl,--whole-archive
+        ${LIBBPF_STATIC}
+        -Wl,--no-whole-archive
+        ${LIBELF_STATIC}
+        ${ZLIB_NG_STATIC}
+        ${ZSTD_STATIC}
+        ${BROTLIDEC_STATIC}
+        ${BROTLICOMMON_STATIC}
+        ${LLHTTP_STATIC}
+        ${NGHTTP2_STATIC}
+        ${CK_STATIC}
+        ${XDP_STATIC}
+        ${URCU_STATIC}
+        ${URCU_COMMON_STATIC}
+        ${JEMALLOC_STATIC}
+        ${HS_STATIC}
+        ${HS_RUNTIME_STATIC}
+        ${PCRE2_STATIC}
+        # System libraries (dynamic)
+        pthread
+        dl
+        m
+        stdc++
+        z
+    )
+else()
+    # Link all required libraries (dynamic)
+    target_link_libraries(spliff PRIVATE
+        # Core BPF
+        PkgConfig::LIBBPF
+        PkgConfig::LIBELF
+        # Compression (zlib-ng or zlib)
+        ${ZLIB_TARGET}
+        PkgConfig::ZSTD
+        PkgConfig::BROTLI
+        # HTTP parsing
+        PkgConfig::LLHTTP
+        PkgConfig::NGHTTP2
+        # Threading and concurrency
+        PkgConfig::CK
+        PkgConfig::LIBXDP
+        PkgConfig::LIBURCU
+        # Memory allocator (mimalloc or jemalloc)
+        ${ALLOCATOR_TARGET}
+        # Pattern matching (vectorscan, hyperscan, or pcre2)
+        ${PATTERN_TARGET}
+        PkgConfig::PCRE2
+        # POSIX threads
+        pthread
+    )
+endif()
 
 # Compile definitions for all features
 target_compile_definitions(spliff PRIVATE
@@ -760,11 +832,6 @@ install(TARGETS spliff
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-# Install BPF object
-install(FILES ${BPF_OBJECT}
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/spliff
-)
-
 # ============================================================================
 # CPack Configuration for Packaging
 # ============================================================================
@@ -773,7 +840,10 @@ set(CPACK_PACKAGE_NAME "spliff")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
 set(CPACK_PACKAGE_VENDOR "spliff developers")
-set(CPACK_PACKAGE_CONTACT "maintainer@example.com")
+set(CPACK_PACKAGE_CONTACT "9083405+NoFear0411@users.noreply.github.com")
+set(CPACK_PACKAGE_DESCRIPTION "Capture and inspect decrypted HTTPS traffic in real-time using eBPF uprobes. Supports OpenSSL, GnuTLS, NSS, WolfSSL, and BoringSSL with full HTTP/1.1 and HTTP/2 protocol parsing, XDP packet-level flow tracking, and multi-threaded lock-free processing.")
+set(CPACK_RPM_PACKAGE_DESCRIPTION "${CPACK_PACKAGE_DESCRIPTION}")
+set(CPACK_RPM_PACKAGE_URL "https://github.com/NoFear0411/spliff")
 
 # License file
 if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
@@ -801,29 +871,28 @@ endif()
 
 message(STATUS "Detected distribution: ${LINUX_DISTRO} ${LINUX_DISTRO_VERSION}")
 
+# Generate dist tag for RPM naming (e.g., .fc43, .el10)
+set(RPM_DIST_TAG "")
+if(LINUX_DISTRO STREQUAL "fedora")
+    # Strip minor version — Fedora uses major only (e.g., fc43)
+    string(REGEX REPLACE "\\..*" "" _DISTRO_MAJOR "${LINUX_DISTRO_VERSION}")
+    set(RPM_DIST_TAG ".fc${_DISTRO_MAJOR}")
+elseif(LINUX_DISTRO STREQUAL "almalinux" OR
+       LINUX_DISTRO STREQUAL "rocky" OR
+       LINUX_DISTRO STREQUAL "rhel" OR
+       LINUX_DISTRO STREQUAL "centos")
+    string(REGEX REPLACE "\\..*" "" _DISTRO_MAJOR "${LINUX_DISTRO_VERSION}")
+    set(RPM_DIST_TAG ".el${_DISTRO_MAJOR}")
+endif()
+
 # ============================================================================
-# Debian/Ubuntu Package Configuration
+# Debian/Ubuntu Package Configuration (local builds only)
 # ============================================================================
 
 # Standard naming: <name>_<version>-<release>_<arch>.deb
 set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_RELEASE "1")
-
-# Architecture detection
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
-    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "arm64")
-else()
-    set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "${CMAKE_SYSTEM_PROCESSOR}")
-endif()
-
-# Use automatic shared library dependency detection
-# This properly handles different library versions across Debian 12/13, Ubuntu, etc.
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-
-# Fallback dependencies (used if shlibdeps fails or for static builds)
-# Note: Package names vary by version (e.g., liburcu8 vs liburcu8t64)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "libc6")
 set(CPACK_DEBIAN_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
@@ -832,9 +901,9 @@ set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 # RPM Package Configuration (Fedora/RHEL/Alma)
 # ============================================================================
 
-# Standard naming: <name>-<version>-<release>.<arch>.rpm
-set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
-set(CPACK_RPM_PACKAGE_RELEASE "1")
+# Standard naming: <name>-<version>-<release>.<dist>.<arch>.rpm
+set(CPACK_RPM_PACKAGE_RELEASE "1${RPM_DIST_TAG}")
+set(CPACK_RPM_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CPACK_RPM_PACKAGE_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}.rpm")
 set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/System")
 
@@ -842,6 +911,11 @@ set(CPACK_RPM_PACKAGE_GROUP "Applications/System")
 # This handles differences between Fedora 42/43, AlmaLinux 9/10, etc.
 set(CPACK_RPM_PACKAGE_AUTOREQ ON)
 set(CPACK_RPM_PACKAGE_AUTOPROV ON)
+
+# Disable auto-provides when static linking (prevents advertising embedded libs)
+if(ENABLE_STATIC_LIBS)
+    set(CPACK_RPM_PACKAGE_AUTOPROV OFF)
+endif()
 
 # Minimal explicit dependencies (auto-req will add the rest)
 # Note: On AlmaLinux some libs are built from source and won't have packages
@@ -899,6 +973,7 @@ message(STATUS "  LTO:            ${CMAKE_INTERPROCEDURAL_OPTIMIZATION}")
 message(STATUS "  USE_VECTORSCAN: ${USE_VECTORSCAN}")
 message(STATUS "  USE_ZLIB_NG:    ${USE_ZLIB_NG}")
 message(STATUS "  USE_MIMALLOC:   ${USE_MIMALLOC}")
+message(STATUS "  STATIC_LIBS:    ${ENABLE_STATIC_LIBS}")
 message(STATUS "")
 message(STATUS "Features:")
 message(STATUS "  HTTP/1.1:       ON (llhttp)")
