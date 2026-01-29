@@ -718,38 +718,32 @@ set(TEST_COMMON_SOURCES
 # HTTP/1.1 parser tests
 add_executable(test_http1 EXCLUDE_FROM_ALL
     tests/test_http1.c
-    tests/test_common.c
-    ${TEST_COMMON_SOURCES}
+    src/protocol/http1.c
+    src/util/safe_str.c
 )
 target_include_directories(test_http1 PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
-target_link_libraries(test_http1 PRIVATE
-    PkgConfig::LLHTTP
-    PkgConfig::NGHTTP2
-    ${ZLIB_TARGET}
-    PkgConfig::ZSTD
-    PkgConfig::BROTLI
-)
-target_compile_definitions(test_http1 PRIVATE
-    PCRE2_CODE_UNIT_WIDTH=8
-)
+target_link_libraries(test_http1 PRIVATE PkgConfig::LLHTTP PkgConfig::CK)
 add_test(NAME http1_parser_tests COMMAND test_http1)
 
 # HTTP/2 parser tests
 add_executable(test_http2 EXCLUDE_FROM_ALL
     tests/test_http2.c
-    tests/test_common.c
-    ${TEST_COMMON_SOURCES}
+    src/protocol/http2.c
+    src/protocol/http1.c
+    src/output/display.c
+    src/content/decompressor.c
+    src/content/signatures.c
+    src/correlation/flow_context.c
+    src/util/safe_str.c
 )
 target_include_directories(test_http2 PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_http2 PRIVATE
     PkgConfig::LLHTTP
     PkgConfig::NGHTTP2
+    PkgConfig::CK
     ${ZLIB_TARGET}
     PkgConfig::ZSTD
     PkgConfig::BROTLI
-)
-target_compile_definitions(test_http2 PRIVATE
-    PCRE2_CODE_UNIT_WIDTH=8
 )
 add_test(NAME http2_parser_tests COMMAND test_http2)
 
@@ -767,9 +761,88 @@ target_link_libraries(test_xdp PRIVATE
 )
 add_test(NAME xdp_structure_tests COMMAND test_xdp)
 
+# Safe string tests (P0 - security foundation)
+add_executable(test_safe_str EXCLUDE_FROM_ALL
+    tests/test_safe_str.c
+    src/util/safe_str.c
+)
+target_include_directories(test_safe_str PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+add_test(NAME safe_str_tests COMMAND test_safe_str)
+
+# Flow context tests (P0 - core state management)
+add_executable(test_flow_context EXCLUDE_FROM_ALL
+    tests/test_flow_context.c
+    src/correlation/flow_context.c
+    src/util/safe_str.c
+    src/protocol/http2.c
+)
+target_include_directories(test_flow_context PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_flow_context PRIVATE
+    PkgConfig::NGHTTP2
+    PkgConfig::CK
+)
+add_test(NAME flow_context_tests COMMAND test_flow_context)
+
+# Decompressor tests (P1 - content handling)
+add_executable(test_decompressor EXCLUDE_FROM_ALL
+    tests/test_decompressor.c
+    src/content/decompressor.c
+)
+target_include_directories(test_decompressor PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_decompressor PRIVATE
+    ${ZLIB_TARGET}
+    PkgConfig::ZSTD
+    PkgConfig::BROTLI
+)
+add_test(NAME decompressor_tests COMMAND test_decompressor)
+
+# Protocol detector tests (P1 - vectorscan patterns)
+add_executable(test_detector EXCLUDE_FROM_ALL
+    tests/test_detector.c
+    src/protocol/detector.c
+    src/protocol/http1.c
+    src/protocol/http2.c
+    src/util/safe_str.c
+    src/output/display.c
+    src/content/decompressor.c
+    src/content/signatures.c
+)
+target_include_directories(test_detector PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_detector PRIVATE
+    ${PATTERN_TARGET}
+    PkgConfig::LLHTTP
+    PkgConfig::NGHTTP2
+    PkgConfig::CK
+    ${ZLIB_TARGET}
+    PkgConfig::ZSTD
+    PkgConfig::BROTLI
+)
+target_compile_definitions(test_detector PRIVATE
+    PCRE2_CODE_UNIT_WIDTH=8
+)
+add_test(NAME detector_tests COMMAND test_detector)
+
+# WebSocket parser tests (P2 - protocol handling)
+add_executable(test_websocket EXCLUDE_FROM_ALL
+    tests/test_websocket.c
+    src/protocol/websocket.c
+)
+target_include_directories(test_websocket PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+add_test(NAME websocket_tests COMMAND test_websocket)
+
+# Display module tests (P3 - output formatting)
+add_executable(test_display EXCLUDE_FROM_ALL
+    tests/test_display.c
+    src/output/display.c
+    src/content/signatures.c
+)
+target_include_directories(test_display PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+add_test(NAME display_tests COMMAND test_display)
+
 # Custom target to build all tests
+# Note: test_http1 and test_http2 need API updates for current codebase
 add_custom_target(build_tests
-    DEPENDS test_http1 test_http2 test_xdp
+    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_flow_context test_decompressor test_detector test_websocket test_display
     COMMENT "Building all test executables..."
 )
 

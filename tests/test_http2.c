@@ -1,22 +1,18 @@
-/*
- * SPDX-License-Identifier: GPL-3.0-only
+/**
+ * @file test_http2.c
+ * @brief Unit tests for HTTP/2 protocol parsing (nghttp2)
  *
- * spliff - eBPF-based SSL/TLS traffic sniffer
- * Copyright (C) 2025-2026 spliff authors
+ * Tests the HTTP/2 module's public API:
+ * - http2_init/cleanup lifecycle
+ * - http2_is_preface detection
+ * - http2_frame_name lookup
+ * - http2_is_valid_frame_header validation
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, version 3 of the License.
+ * Note: Session/stream management is in flow_context.c (see test_flow_context.c)
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
- *
- * test_http2.c - Unit tests for nghttp2-based HTTP/2 parser
+ * @author spliff authors
+ * @copyright 2025-2026 spliff authors
+ * @license GPL-3.0-only
  */
 
 #include <stdio.h>
@@ -26,6 +22,9 @@
 #include "../src/include/spliff.h"
 #include "../src/protocol/http2.h"
 
+/* Stub global config for http2.c verbose output */
+config_t g_config = {0};
+
 #define TEST(name) printf("TEST: %s... ", name)
 #define PASS() printf("\033[32mPASS\033[0m\n")
 #define FAIL(msg) do { printf("\033[31mFAIL: %s\033[0m\n", msg); failures++; } while(0)
@@ -33,10 +32,10 @@
 static int failures = 0;
 
 /* HTTP/2 connection preface (client) */
-static const uint8_t H2_CLIENT_PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+static const char H2_CLIENT_PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 #define H2_CLIENT_PREFACE_LEN 24
 
-/* Build an HTTP/2 frame header */
+/* Build an HTTP/2 frame header (9 bytes) */
 static void build_frame_header(uint8_t *buf, uint32_t length, uint8_t type,
                                 uint8_t flags, uint32_t stream_id) {
     buf[0] = (length >> 16) & 0xff;
@@ -50,7 +49,10 @@ static void build_frame_header(uint8_t *buf, uint32_t length, uint8_t type,
     buf[8] = stream_id & 0xff;
 }
 
-/* Test HTTP/2 initialization and cleanup */
+/* ============================================================================
+ * Lifecycle Tests
+ * ============================================================================ */
+
 static void test_init_cleanup(void) {
     TEST("http2_init/cleanup");
 
@@ -60,9 +62,9 @@ static void test_init_cleanup(void) {
         return;
     }
 
-    /* Should be able to init again after cleanup */
     http2_cleanup();
 
+    /* Should be able to init again after cleanup */
     result = http2_init();
     if (result < 0) {
         FAIL("http2_init failed after cleanup");
@@ -73,17 +75,19 @@ static void test_init_cleanup(void) {
     PASS();
 }
 
-/* Test HTTP/2 client preface detection */
-static void test_is_preface(void) {
-    TEST("http2_is_preface");
+/* ============================================================================
+ * Preface Detection Tests
+ * ============================================================================ */
 
-    /* Valid preface */
-    if (!http2_is_preface(H2_CLIENT_PREFACE, H2_CLIENT_PREFACE_LEN)) {
+static void test_is_preface(void) {
+    TEST("http2_is_preface valid");
+
+    if (!http2_is_preface((const uint8_t *)H2_CLIENT_PREFACE, H2_CLIENT_PREFACE_LEN)) {
         FAIL("Failed to detect valid preface");
         return;
     }
 
-    /* Preface with extra data after */
+    /* Preface with trailing data */
     uint8_t preface_plus[32];
     memcpy(preface_plus, H2_CLIENT_PREFACE, H2_CLIENT_PREFACE_LEN);
     memset(preface_plus + H2_CLIENT_PREFACE_LEN, 0, 8);
@@ -92,31 +96,55 @@ static void test_is_preface(void) {
         return;
     }
 
+    PASS();
+}
+
+static void test_is_preface_negative(void) {
+    TEST("http2_is_preface negative cases");
+
     /* Too short */
-    if (http2_is_preface(H2_CLIENT_PREFACE, 10)) {
+    if (http2_is_preface((const uint8_t *)H2_CLIENT_PREFACE, 10)) {
         FAIL("False positive on short data");
         return;
     }
 
-    /* Invalid preface */
-    const uint8_t invalid[] = "GET / HTTP/1.1\r\nHost: foo\r\n\r\n";
-    if (http2_is_preface(invalid, sizeof(invalid) - 1)) {
-        FAIL("False positive on HTTP/1.1 request");
+    /* HTTP/1.1 request */
+    const char *http1 = "GET / HTTP/1.1\r\nHost: foo\r\n\r\n";
+    if (http2_is_preface((const uint8_t *)http1, strlen(http1))) {
+        FAIL("False positive on HTTP/1.1");
         return;
     }
 
-    /* HTTP/2 response (not preface) */
-    uint8_t settings_frame[9];
-    build_frame_header(settings_frame, 0, H2_FRAME_SETTINGS, 0, 0);
-    if (http2_is_preface(settings_frame, sizeof(settings_frame))) {
+    /* SETTINGS frame (not preface) */
+    uint8_t settings[9];
+    build_frame_header(settings, 0, H2_FRAME_SETTINGS, 0, 0);
+    if (http2_is_preface(settings, sizeof(settings))) {
         FAIL("False positive on SETTINGS frame");
+        return;
+    }
+
+    /* Corrupted preface */
+    uint8_t corrupted[24];
+    memcpy(corrupted, H2_CLIENT_PREFACE, 24);
+    corrupted[10] = 'X';
+    if (http2_is_preface(corrupted, 24)) {
+        FAIL("False positive on corrupted preface");
+        return;
+    }
+
+    /* Zero length */
+    if (http2_is_preface((const uint8_t *)"", 0)) {
+        FAIL("False positive on empty data");
         return;
     }
 
     PASS();
 }
 
-/* Test HTTP/2 frame type names */
+/* ============================================================================
+ * Frame Name Tests
+ * ============================================================================ */
+
 static void test_frame_names(void) {
     TEST("http2_frame_name");
 
@@ -148,8 +176,7 @@ static void test_frame_names(void) {
     }
 
     /* Unknown frame type */
-    const char *unknown = http2_frame_name(99);
-    if (strcmp(unknown, "UNKNOWN") != 0) {
+    if (strcmp(http2_frame_name(99), "UNKNOWN") != 0) {
         FAIL("Unknown type should return 'UNKNOWN'");
         return;
     }
@@ -157,295 +184,48 @@ static void test_frame_names(void) {
     PASS();
 }
 
-/* Test session tracking */
-static void test_session_tracking(void) {
-    TEST("http2_has_session");
+/* ============================================================================
+ * Frame Header Validation Tests
+ * ============================================================================ */
 
-    http2_init();
-
-    /* No session initially */
-    if (http2_has_session(12345, 0)) {
-        FAIL("Session exists before creation");
-        http2_cleanup();
-        return;
-    }
-
-    /* Note: Sessions are created internally by http2_process_frame
-     * We can't easily test this without mocking BPF events */
-
-    http2_cleanup();
-    PASS();
-}
-
-/* Test stream management */
-static void test_stream_management(void) {
-    TEST("http2_get_stream");
-
-    http2_init();
-
-    /* Create a stream */
-    h2_stream_t *stream1 = http2_get_stream(1000, 0, 1, true);
-    if (!stream1) {
-        FAIL("Failed to create stream");
-        http2_cleanup();
-        return;
-    }
-
-    if (stream1->pid != 1000 || stream1->stream_id != 1) {
-        FAIL("Stream has wrong PID or stream_id");
-        http2_cleanup();
-        return;
-    }
-
-    /* Get same stream (no create) */
-    h2_stream_t *stream1_again = http2_get_stream(1000, 0, 1, false);
-    if (stream1_again != stream1) {
-        FAIL("Should return same stream pointer");
-        http2_cleanup();
-        return;
-    }
-
-    /* Create another stream for same PID */
-    h2_stream_t *stream3 = http2_get_stream(1000, 0, 3, true);
-    if (!stream3 || stream3 == stream1) {
-        FAIL("Failed to create second stream");
-        http2_cleanup();
-        return;
-    }
-
-    /* Create stream for different PID */
-    h2_stream_t *stream_other = http2_get_stream(2000, 0, 1, true);
-    if (!stream_other || stream_other == stream1) {
-        FAIL("Failed to create stream for different PID");
-        http2_cleanup();
-        return;
-    }
-
-    /* Non-existent stream without create */
-    h2_stream_t *nonexistent = http2_get_stream(9999, 0, 99, false);
-    if (nonexistent) {
-        FAIL("Should return NULL for non-existent stream");
-        http2_cleanup();
-        return;
-    }
-
-    /* Free a stream */
-    http2_free_stream(1000, 0, 1);
-    h2_stream_t *freed = http2_get_stream(1000, 0, 1, false);
-    if (freed) {
-        FAIL("Stream should be freed");
-        http2_cleanup();
-        return;
-    }
-
-    /* Stream 3 should still exist */
-    h2_stream_t *still_exists = http2_get_stream(1000, 0, 3, false);
-    if (!still_exists) {
-        FAIL("Other stream should still exist");
-        http2_cleanup();
-        return;
-    }
-
-    http2_cleanup();
-    PASS();
-}
-
-/* Test frame header parsing */
-static void test_frame_header_format(void) {
-    TEST("Frame header format");
+static void test_frame_validation_valid(void) {
+    TEST("http2_is_valid_frame_header valid frames");
 
     uint8_t frame[9];
 
-    /* SETTINGS frame on stream 0 */
-    build_frame_header(frame, 0, H2_FRAME_SETTINGS, 0x01, 0);
-    if (frame[0] != 0 || frame[1] != 0 || frame[2] != 0) {
-        FAIL("Wrong length encoding");
-        return;
-    }
-    if (frame[3] != H2_FRAME_SETTINGS) {
-        FAIL("Wrong type");
-        return;
-    }
-    if (frame[4] != 0x01) {
-        FAIL("Wrong flags");
-        return;
-    }
-    if (frame[5] != 0 || frame[6] != 0 || frame[7] != 0 || frame[8] != 0) {
-        FAIL("Wrong stream ID");
-        return;
-    }
-
-    /* HEADERS frame on stream 1 with length 256 */
-    build_frame_header(frame, 256, H2_FRAME_HEADERS, 0x25, 1);
-    if (frame[0] != 0 || frame[1] != 1 || frame[2] != 0) {
-        FAIL("Wrong length encoding for 256");
-        return;
-    }
-    if (frame[3] != H2_FRAME_HEADERS) {
-        FAIL("Wrong type for HEADERS");
-        return;
-    }
-    if (frame[8] != 1) {
-        FAIL("Wrong stream ID for stream 1");
-        return;
-    }
-
-    /* Large length (16384 = max default frame size) */
-    build_frame_header(frame, 16384, H2_FRAME_DATA, 0x00, 3);
-    uint32_t decoded_len = ((uint32_t)frame[0] << 16) |
-                           ((uint32_t)frame[1] << 8) |
-                           (uint32_t)frame[2];
-    if (decoded_len != 16384) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Wrong decoded length: %u", decoded_len);
-        FAIL(buf);
-        return;
-    }
-
-    PASS();
-}
-
-/* Test stream ID validation (odd = client-initiated, even = server-initiated) */
-static void test_stream_id_rules(void) {
-    TEST("Stream ID rules");
-
-    http2_init();
-
-    /* Client-initiated streams are odd */
-    h2_stream_t *client_stream = http2_get_stream(1000, 0, 1, true);
-    if (!client_stream) {
-        FAIL("Failed to create client stream");
-        http2_cleanup();
-        return;
-    }
-
-    /* Stream 3, 5, 7 are also valid client streams */
-    for (int id = 3; id <= 7; id += 2) {
-        h2_stream_t *s = http2_get_stream(1000, 0, id, true);
-        if (!s) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "Failed to create client stream %d", id);
-            FAIL(buf);
-            http2_cleanup();
-            return;
-        }
-    }
-
-    /* Server-initiated streams are even (but stream 0 is connection-level) */
-    h2_stream_t *server_stream = http2_get_stream(1000, 0, 2, true);
-    if (!server_stream) {
-        FAIL("Failed to create server stream");
-        http2_cleanup();
-        return;
-    }
-
-    http2_cleanup();
-    PASS();
-}
-
-/* Test frame header validation (for mid-stream join recovery) */
-static void test_frame_validation(void) {
-    TEST("http2_is_valid_frame_header");
-
-    uint8_t frame[9];
-
-    /* Valid SETTINGS frame on stream 0 */
+    /* SETTINGS on stream 0 */
     build_frame_header(frame, 0, H2_FRAME_SETTINGS, 0x00, 0);
-    if (!http2_is_valid_frame_header(frame)) {
-        FAIL("Valid SETTINGS frame rejected");
+    if (!http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Valid SETTINGS rejected");
         return;
     }
 
-    /* Valid HEADERS frame on stream 1 with typical length */
+    /* HEADERS on stream 1 */
     build_frame_header(frame, 256, H2_FRAME_HEADERS, 0x25, 1);
-    if (!http2_is_valid_frame_header(frame)) {
-        FAIL("Valid HEADERS frame rejected");
+    if (!http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Valid HEADERS rejected");
         return;
     }
 
-    /* Valid DATA frame with max default size (16384) */
+    /* DATA with max default size (16384) */
     build_frame_header(frame, 16384, H2_FRAME_DATA, 0x00, 3);
-    if (!http2_is_valid_frame_header(frame)) {
-        FAIL("Valid DATA frame (16KB) rejected");
+    if (!http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Valid DATA (16KB) rejected");
         return;
     }
 
-    /* Valid frame at max sane length (64KB) */
+    /* Max sane length (64KB) */
     build_frame_header(frame, H2_MAX_SANE_FRAME_LEN, H2_FRAME_DATA, 0x01, 5);
-    if (!http2_is_valid_frame_header(frame)) {
-        FAIL("Valid 64KB DATA frame rejected");
+    if (!http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Valid 64KB DATA rejected");
         return;
     }
 
-    /* INVALID: Frame length too large (over 64KB) */
-    build_frame_header(frame, H2_MAX_SANE_FRAME_LEN + 1, H2_FRAME_DATA, 0x00, 1);
-    if (http2_is_valid_frame_header(frame)) {
-        FAIL("Oversized frame should be rejected");
-        return;
-    }
-
-    /* INVALID: Frame length way too large (8MB - typical corruption value) */
-    build_frame_header(frame, 8978441, H2_FRAME_DATA, 0x00, 1);
-    if (http2_is_valid_frame_header(frame)) {
-        FAIL("Huge frame (8MB) should be rejected");
-        return;
-    }
-
-    /* INVALID: Unknown frame type (> 9) */
-    build_frame_header(frame, 100, 99, 0x00, 1);
-    if (http2_is_valid_frame_header(frame)) {
-        FAIL("Unknown frame type 99 should be rejected");
-        return;
-    }
-
-    /* INVALID: Unknown frame type (223 - from debug output) */
-    build_frame_header(frame, 100, 223, 0x3d, 1);
-    if (http2_is_valid_frame_header(frame)) {
-        FAIL("Unknown frame type 223 should be rejected");
-        return;
-    }
-
-    /* INVALID: Stream ID too large (billions - garbage value) */
-    build_frame_header(frame, 100, H2_FRAME_HEADERS, 0x25, 0x7FFFFFFF);
-    if (http2_is_valid_frame_header(frame)) {
-        FAIL("Huge stream ID should be rejected");
-        return;
-    }
-
-    /* INVALID: Stream ID from debug output (1061814757) */
-    build_frame_header(frame, 100, H2_FRAME_DATA, 0x00, 1061814757);
-    if (http2_is_valid_frame_header(frame)) {
-        FAIL("Garbage stream ID 1061814757 should be rejected");
-        return;
-    }
-
-    /* Valid: Stream 0 for connection-level frames */
-    build_frame_header(frame, 4, H2_FRAME_WINDOW_UPDATE, 0x00, 0);
-    if (!http2_is_valid_frame_header(frame)) {
-        FAIL("Valid WINDOW_UPDATE on stream 0 rejected");
-        return;
-    }
-
-    /* Valid: All frame types 0-9 should be accepted with correct stream_id
-     * Per HTTP/2 spec:
-     *   - SETTINGS (4), PING (6), GOAWAY (7) require stream_id=0
-     *   - DATA (0), HEADERS (1), PRIORITY (2), RST_STREAM (3), PUSH_PROMISE (5), CONTINUATION (9) require stream_id>0
-     *   - WINDOW_UPDATE (8) can be on any stream
-     */
+    /* All valid frame types */
     for (int type = 0; type <= H2_MAX_VALID_FRAME_TYPE; type++) {
-        uint32_t stream_id;
-        switch (type) {
-        case 0x04: /* SETTINGS */
-        case 0x06: /* PING */
-        case 0x07: /* GOAWAY */
-            stream_id = 0;  /* Connection-level frames */
-            break;
-        default:
-            stream_id = 1;  /* Stream-specific frames */
-            break;
-        }
+        uint32_t stream_id = (type == 4 || type == 6 || type == 7) ? 0 : 1;
         build_frame_header(frame, 10, (uint8_t)type, 0x00, stream_id);
-        if (!http2_is_valid_frame_header(frame)) {
+        if (!http2_is_valid_frame_header(frame, 9)) {
             char buf[64];
             snprintf(buf, sizeof(buf), "Valid frame type %d rejected", type);
             FAIL(buf);
@@ -456,69 +236,154 @@ static void test_frame_validation(void) {
     PASS();
 }
 
-/* Test multiple sessions */
-static void test_multiple_pids(void) {
-    TEST("Multiple PID sessions");
+static void test_frame_validation_invalid(void) {
+    TEST("http2_is_valid_frame_header invalid frames");
 
-    http2_init();
+    uint8_t frame[9];
 
-    /* Create streams for multiple PIDs */
-    uint32_t pids[] = { 1001, 1002, 1003, 1004, 1005 };
-    for (size_t i = 0; i < sizeof(pids)/sizeof(pids[0]); i++) {
-        h2_stream_t *s = http2_get_stream(pids[i], 0, 1, true);
-        if (!s) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "Failed for PID %u", pids[i]);
-            FAIL(buf);
-            http2_cleanup();
-            return;
-        }
-        if (s->pid != pids[i]) {
-            FAIL("Stream has wrong PID");
-            http2_cleanup();
-            return;
-        }
-    }
-
-    /* Verify each PID's stream is independent */
-    for (size_t i = 0; i < sizeof(pids)/sizeof(pids[0]); i++) {
-        h2_stream_t *s = http2_get_stream(pids[i], 0, 1, false);
-        if (!s || s->pid != pids[i]) {
-            FAIL("Stream lookup failed or wrong PID");
-            http2_cleanup();
-            return;
-        }
-    }
-
-    /* Free one and verify others unaffected */
-    http2_free_stream(1003, 0, 1);
-    if (http2_get_stream(1003, 0, 1, false)) {
-        FAIL("Freed stream still exists");
-        http2_cleanup();
-        return;
-    }
-    if (!http2_get_stream(1002, 0, 1, false) || !http2_get_stream(1004, 0, 1, false)) {
-        FAIL("Adjacent streams affected by free");
-        http2_cleanup();
+    /* Oversized frame (> 64KB) */
+    build_frame_header(frame, H2_MAX_SANE_FRAME_LEN + 1, H2_FRAME_DATA, 0x00, 1);
+    if (http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Oversized frame should be rejected");
         return;
     }
 
-    http2_cleanup();
+    /* Huge frame (8MB - corruption) */
+    build_frame_header(frame, 8978441, H2_FRAME_DATA, 0x00, 1);
+    if (http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Huge frame should be rejected");
+        return;
+    }
+
+    /* Unknown frame type (99) */
+    build_frame_header(frame, 100, 99, 0x00, 1);
+    if (http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Unknown type 99 should be rejected");
+        return;
+    }
+
+    /* Garbage frame type (223) */
+    build_frame_header(frame, 100, 223, 0x3d, 1);
+    if (http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Garbage type 223 should be rejected");
+        return;
+    }
+
+    /* Huge stream ID */
+    build_frame_header(frame, 100, H2_FRAME_HEADERS, 0x25, 0x7FFFFFFF);
+    if (http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Huge stream ID should be rejected");
+        return;
+    }
+
+    /* Garbage stream ID from corruption */
+    build_frame_header(frame, 100, H2_FRAME_DATA, 0x00, 1061814757);
+    if (http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Garbage stream ID should be rejected");
+        return;
+    }
+
     PASS();
 }
 
+static void test_frame_validation_buffer_size(void) {
+    TEST("http2_is_valid_frame_header buffer size");
+
+    uint8_t frame[32];
+    build_frame_header(frame, 0, H2_FRAME_SETTINGS, 0x00, 0);
+
+    /* Buffer too small */
+    if (http2_is_valid_frame_header(frame, 8)) {
+        FAIL("Should reject buffer < 9 bytes");
+        return;
+    }
+
+    if (http2_is_valid_frame_header(frame, 0)) {
+        FAIL("Should reject empty buffer");
+        return;
+    }
+
+    /* Exactly 9 bytes */
+    if (!http2_is_valid_frame_header(frame, 9)) {
+        FAIL("Should accept exactly 9 bytes");
+        return;
+    }
+
+    /* Larger buffer */
+    if (!http2_is_valid_frame_header(frame, sizeof(frame))) {
+        FAIL("Should accept larger buffer");
+        return;
+    }
+
+    PASS();
+}
+
+/* ============================================================================
+ * Frame Header Encoding Tests
+ * ============================================================================ */
+
+static void test_frame_header_encoding(void) {
+    TEST("Frame header encoding");
+
+    uint8_t frame[9];
+
+    /* SETTINGS with flags */
+    build_frame_header(frame, 0, H2_FRAME_SETTINGS, 0x01, 0);
+    if (frame[3] != H2_FRAME_SETTINGS || frame[4] != 0x01) {
+        FAIL("Wrong type/flags encoding");
+        return;
+    }
+
+    /* Length 256 */
+    build_frame_header(frame, 256, H2_FRAME_HEADERS, 0x25, 1);
+    if (frame[0] != 0 || frame[1] != 1 || frame[2] != 0) {
+        FAIL("Wrong length encoding for 256");
+        return;
+    }
+
+    /* Length 16384 */
+    build_frame_header(frame, 16384, H2_FRAME_DATA, 0x00, 3);
+    uint32_t decoded = ((uint32_t)frame[0] << 16) |
+                       ((uint32_t)frame[1] << 8) |
+                       (uint32_t)frame[2];
+    if (decoded != 16384) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Wrong decoded length: %u", decoded);
+        FAIL(buf);
+        return;
+    }
+
+    /* Stream ID */
+    build_frame_header(frame, 0, H2_FRAME_DATA, 0x00, 100);
+    uint32_t stream_id = ((uint32_t)(frame[5] & 0x7f) << 24) |
+                         ((uint32_t)frame[6] << 16) |
+                         ((uint32_t)frame[7] << 8) |
+                         (uint32_t)frame[8];
+    if (stream_id != 100) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Wrong stream ID: %u", stream_id);
+        FAIL(buf);
+        return;
+    }
+
+    PASS();
+}
+
+/* ============================================================================
+ * Main
+ * ============================================================================ */
+
 int main(void) {
-    printf("\n=== HTTP/2 Parser Tests (nghttp2) ===\n\n");
+    printf("=== HTTP/2 Parser Tests (nghttp2) ===\n\n");
 
     test_init_cleanup();
     test_is_preface();
+    test_is_preface_negative();
     test_frame_names();
-    test_session_tracking();
-    test_stream_management();
-    test_frame_header_format();
-    test_stream_id_rules();
-    test_frame_validation();
-    test_multiple_pids();
+    test_frame_validation_valid();
+    test_frame_validation_invalid();
+    test_frame_validation_buffer_size();
+    test_frame_header_encoding();
 
     printf("\n");
     if (failures == 0) {
