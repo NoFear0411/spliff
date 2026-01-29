@@ -1,5 +1,6 @@
 # Build outputs
 build/
+build-release/
 obj/
 *.o
 *.a
@@ -8,8 +9,16 @@ obj/
 
 # Executables
 sslsniff
+spliff
 test_http1
 test_http2
+test_safe_str
+test_flow_context
+test_decompressor
+test_detector
+test_websocket
+test_display
+test_xdp
 
 # CMake generated files
 CMakeCache.txt

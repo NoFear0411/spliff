@@ -256,6 +256,36 @@ Documentation includes:
 - Lock-free data structure explanations
 - Per-module API reference with parameters and return values
 
+### Testing
+
+Build and run the unit test suite (148 tests):
+
+```bash
+# Build all tests
+cmake --build build-release --target build_tests
+
+# Run individual tests
+./build-release/test_http1       # HTTP/1.x parsing (10 tests)
+./build-release/test_http2       # HTTP/2 parsing (8 tests)
+./build-release/test_safe_str    # Memory-safe strings (30 tests)
+./build-release/test_flow_context # Flow correlation (24 tests)
+./build-release/test_decompressor # Compression (21 tests)
+./build-release/test_detector    # Protocol detection (18 tests)
+./build-release/test_websocket   # WebSocket frames (22 tests)
+./build-release/test_display     # Output formatting (15 tests)
+```
+
+| Test Module | Tests | Coverage |
+|-------------|-------|----------|
+| test_http1 | 10 | HTTP/1.x request/response parsing with llhttp |
+| test_http2 | 8 | HTTP/2 preface, frames, validation with nghttp2 |
+| test_safe_str | 30 | Memory-safe string operations (strcpy, strcat, memcpy) |
+| test_flow_context | 24 | Dual-index correlation, flow pools, stream management |
+| test_decompressor | 21 | gzip, deflate, zstd, brotli compression |
+| test_detector | 18 | Vectorscan protocol detection patterns |
+| test_websocket | 22 | RFC 6455 frame parsing, masking, fragmentation |
+| test_display | 15 | Color output, latency formatting, timestamps |
+
 ### CMake Options
 
 ```bash
