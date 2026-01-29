@@ -180,14 +180,16 @@ install: release
 # Package Targets
 # ============================================================================
 
-# Create Debian package (.deb)
+# Create Debian package (.deb) - local dev build (dynamic linking)
+# Production signed packages: git tag v0.9.x && git push --tags
 package-deb: release
 	@echo "==> Creating Debian package..."
 	@cd $(BUILD_DIR_RELEASE) && cpack -G DEB
 	@echo "==> Package created in $(BUILD_DIR_RELEASE)/"
 	@ls -la $(BUILD_DIR_RELEASE)/*.deb 2>/dev/null || true
 
-# Create RPM package (.rpm)
+# Create RPM package (.rpm) - local dev build (dynamic linking)
+# Production signed packages: git tag v0.9.x && git push --tags
 package-rpm: release
 	@echo "==> Creating RPM package..."
 	@cd $(BUILD_DIR_RELEASE) && cpack -G RPM
