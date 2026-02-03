@@ -42,6 +42,7 @@
 #include "decompressor.h"
 #include <string.h>
 #include <strings.h>
+#include <limits.h>  /* INT_MAX for overflow checks */
 
 /*----------------------------------------------------------------------------
  * zlib-ng Native API Support
@@ -120,6 +121,14 @@ int decompress_zstd(const uint8_t *in, int in_len, uint8_t *out, int out_len) {
     if (ZSTD_isError(result)) {
         return -1;
     }
+    /*
+     * FIX: Check for overflow before casting size_t to int.
+     * If decompressed size exceeds INT_MAX, the cast would produce
+     * a negative or truncated value, causing incorrect behavior.
+     */
+    if (result > (size_t)INT_MAX) {
+        return -2;  /* Decompressed size too large */
+    }
     return (int)result;
 }
 
@@ -128,6 +137,14 @@ int decompress_brotli(const uint8_t *in, int in_len, uint8_t *out, int out_len) 
     BrotliDecoderResult result = BrotliDecoderDecompress(
         in_len, in, &decoded_size, out);
     if (result == BROTLI_DECODER_RESULT_SUCCESS) {
+        /*
+         * FIX: Check for overflow before casting size_t to int.
+         * If decompressed size exceeds INT_MAX, the cast would produce
+         * a negative or truncated value, causing incorrect behavior.
+         */
+        if (decoded_size > (size_t)INT_MAX) {
+            return -2;  /* Decompressed size too large */
+        }
         return (int)decoded_size;
     }
     return -1;
@@ -150,9 +167,15 @@ int decompress_brotli(const uint8_t *in, int in_len, uint8_t *out, int out_len) 
  * @return true if HAVE_ZSTD was defined at compile time
  *
  * @see decompress_zstd()
+ *
+ * @note FIX M4: Use compile-time conditional instead of hardcoded true.
  */
 bool have_zstd_support(void) {
+#ifdef HAVE_ZSTD
     return true;
+#else
+    return false;
+#endif
 }
 
 /**
@@ -165,9 +188,15 @@ bool have_zstd_support(void) {
  * @return true if HAVE_BROTLI was defined at compile time
  *
  * @see decompress_brotli()
+ *
+ * @note FIX M4: Use compile-time conditional instead of hardcoded true.
  */
 bool have_brotli_support(void) {
+#ifdef HAVE_BROTLI
     return true;
+#else
+    return false;
+#endif
 }
 
 /** @} */ /* End of decomp_support group */
@@ -201,6 +230,16 @@ const char *compress_type_name(compress_type_t type) {
 
 int decompress_body(const uint8_t *data, int len, const char *encoding,
                    uint8_t *decomp_buf, int decomp_buf_size) {
+    /*
+     * FIX: Check for buffer underflow.
+     * If decomp_buf_size < 2, we can't reserve a byte for null termination
+     * and have any room for decompressed data. The subtraction of 1 below
+     * would cause underflow with size 0 or 1.
+     */
+    if (decomp_buf_size < 2) {
+        return -1;
+    }
+
     compress_type_t ctype = COMPRESS_NONE;
 
     /* Determine compression from header */

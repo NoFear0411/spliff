@@ -670,6 +670,14 @@ static void worker_loop(worker_ctx_t *ctx) {
                 if (atomic_compare_exchange_strong(&event->flow_ctx->home_worker_id,
                                                     &expected, my_id)) {
                     /*
+                     * FIX: Add acquire fence after successful CAS.
+                     * Ensures we observe any writes from previous owner (if any)
+                     * before we start initializing parser state. Prevents race
+                     * where we might see stale/partial initialization state.
+                     */
+                    atomic_thread_fence(memory_order_acquire);
+
+                    /*
                      * Successfully claimed - we are the home worker.
                      * Initialize protocol-specific state that requires
                      * single-writer ownership (e.g., HTTP/2 nghttp2 session).
@@ -737,7 +745,11 @@ static void worker_loop(worker_ctx_t *ctx) {
                     }
                 } else {
                     /* Flow already owned - check if we are the owner */
-                    uint32_t home = atomic_load(&event->flow_ctx->home_worker_id);
+                    /*
+                     * FIX: Use memory_order_acquire to ensure we see any writes
+                     * performed by the worker that claimed ownership.
+                     */
+                    uint32_t home = atomic_load_explicit(&event->flow_ctx->home_worker_id, memory_order_acquire);
                     if (home == my_id) {
                         /*
                          * We own this flow - check for late parser initialization.
@@ -806,6 +818,14 @@ static void worker_loop(worker_ctx_t *ctx) {
                             uint32_t expected = home;
                             if (atomic_compare_exchange_strong(&event->flow_ctx->home_worker_id,
                                                                &expected, my_id)) {
+                                /*
+                                 * FIX: Add acquire fence after successful re-homing CAS.
+                                 * Ensures we observe any partial initialization by original
+                                 * owner before we continue initialization. Prevents double-init
+                                 * race where original owner's writes weren't visible.
+                                 */
+                                atomic_thread_fence(memory_order_acquire);
+
                                 /* Successfully re-homed - we now own this flow */
                                 if (g_config.debug_mode) {
                                     fprintf(stderr, "[Worker %u] Re-homed flow_id=%u from worker %u\n",

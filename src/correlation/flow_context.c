@@ -351,6 +351,19 @@ void flow_manager_cleanup(flow_manager_t *mgr) {
         }
     }
 
+    /*
+     * FIX: Also collect flows from deferred queue.
+     * Flows in the deferred queue have been removed from cookie_index/shadow_index
+     * but not yet freed. Without this, they leak at shutdown.
+     */
+    {
+        flow_context_t *deferred_ctx = mgr->pool.deferred_head;
+        while (deferred_ctx) {
+            ADD_UNIQUE_FLOW(deferred_ctx);
+            deferred_ctx = deferred_ctx->list_next;
+        }
+    }
+
     #undef ADD_UNIQUE_FLOW
 
     /* Now free all collected flows */
@@ -726,7 +739,12 @@ int flow_h2_session_init(flow_context_t *ctx, nghttp2_session_callbacks *cbs,
     }
 
     ctx->parser.h2.reassembly_capacity = 65536;
-    ctx->parser.h2.reassembly_buf = malloc(ctx->parser.h2.reassembly_capacity);
+    /*
+     * FIX: Use cache-line aligned allocation for HTTP/2 reassembly buffer.
+     * This improves performance by avoiding false sharing on multi-core systems
+     * and ensures proper alignment for SIMD operations in memcpy.
+     */
+    ctx->parser.h2.reassembly_buf = aligned_alloc(64, ctx->parser.h2.reassembly_capacity);
     if (!ctx->parser.h2.reassembly_buf) {
         nghttp2_hd_inflate_del(ctx->parser.h2.inflater);
         nghttp2_session_del(ctx->parser.h2.session);
@@ -1020,7 +1038,14 @@ int flow_txn_alloc_body(flow_transaction_t *txn, size_t capacity) {
         capacity = 4096;
     }
 
-    txn->body_buf = malloc(capacity);
+    /*
+     * FIX: Use cache-line aligned allocation for transaction body buffer.
+     * This improves performance by avoiding false sharing and ensures
+     * proper alignment for SIMD operations. Round up capacity to be
+     * a multiple of 64 for aligned_alloc requirements.
+     */
+    size_t aligned_capacity = (capacity + 63) & ~(size_t)63;
+    txn->body_buf = aligned_alloc(64, aligned_capacity);
     if (!txn->body_buf) {
         return -1;
     }

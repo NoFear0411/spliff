@@ -46,6 +46,11 @@ enum event_type {
 
 /**
  * @brief SSL data event from BPF (must match BPF side)
+ *
+ * @warning This structure MUST match struct ssl_data_event in spliff.bpf.c.
+ * Any changes to field order, types, or sizes will break BPF-userspace
+ * communication. The _Static_assert below verifies structure size at
+ * compile time.
  */
 typedef struct ssl_data_event {
     uint64_t timestamp_ns;   /**< Event timestamp in nanoseconds */
@@ -56,11 +61,19 @@ typedef struct ssl_data_event {
     uint32_t tid;            /**< Thread ID */
     uint32_t uid;            /**< User ID */
     uint32_t len;            /**< Requested data length */
-    int32_t buf_filled;      /**< Actual bytes captured (-1 on error) */
+    uint32_t buf_filled;     /**< Actual bytes captured (matches BPF __u32) */
     uint32_t event_type;     /**< EVENT_SSL_READ, EVENT_SSL_WRITE, EVENT_HANDSHAKE */
     char comm[TASK_COMM_LEN]; /**< Process command name */
     uint8_t data[MAX_BUF_SIZE]; /**< Captured data buffer */
 } ssl_data_event_t;
+
+/**
+ * FIX M5: Compile-time verification of structure size match.
+ * Expected size: 8*4 + 4*6 + 16 + 16384 = 32 + 24 + 16 + 16384 = 16456 bytes
+ * This catches any layout changes that would cause BPF-userspace mismatch.
+ */
+_Static_assert(sizeof(ssl_data_event_t) == 16456,
+    "ssl_data_event_t size mismatch! Must match BPF struct ssl_data_event in spliff.bpf.c");
 
 /* Event callback function type */
 typedef void (*event_callback_t)(const ssl_data_event_t *event, void *ctx);
