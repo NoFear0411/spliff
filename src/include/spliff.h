@@ -32,6 +32,33 @@
 #include <stdio.h>
 
 /**
+ * @defgroup c23_compat C23 Compatibility
+ * @brief Compatibility macros for C23 features on older compilers
+ * @{
+ */
+
+/**
+ * @brief C23 nullptr compatibility for older compilers (GCC < 13, Clang < 16)
+ *
+ * C23 introduced the nullptr keyword. For compilers that don't support it,
+ * we define it as ((void*)0) which is functionally equivalent.
+ */
+#if !defined(__cplusplus) && !defined(nullptr)
+#  if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+     /* C23 or later - nullptr is a keyword */
+#  elif defined(__GNUC__) && __GNUC__ >= 13
+     /* GCC 13+ supports nullptr as extension */
+#  elif defined(__clang__) && __clang_major__ >= 16
+     /* Clang 16+ supports nullptr as extension */
+#  else
+     /* Older compilers - define nullptr as NULL equivalent */
+#    define nullptr ((void*)0)
+#  endif
+#endif
+
+/** @} */ /* end of c23_compat group */
+
+/**
  * @defgroup version Version Information
  * @brief Version constants and macros for spliff
  * @{

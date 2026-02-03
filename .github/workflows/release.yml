@@ -4,12 +4,13 @@
 # Builds for: Fedora 43/42 (dynamic), AlmaLinux 10/9 (static vectorscan)
 # Publishes signed .rpm packages with detached GPG signatures to GitHub Releases
 #
-# Pipeline: check-existing → build (4x parallel) → test → sign → publish
+# Pipeline: build (4x parallel) → test → sign → publish
 #
-# Caching strategy:
-# - DNF package cache: Avoids re-downloading packages (~2-3 min savings)
-# - Vectorscan static build: Avoids recompiling from source (~10 min savings)
-#   Uses restore-keys fallback to persist cache across releases
+# Caching strategy (https://github.com/docker/bake-action/issues/96):
+# - GitHub Actions cache is scoped per branch, not accessible across tags
+# - This workflow runs on BOTH main branch AND tags
+# - Main branch builds populate the cache (no release created)
+# - Tag builds access the cache from main, then sign and publish
 #
 # Security:
 # - GPG key imported via crazy-max/ghaction-import-gpg (no shell exposure)
@@ -20,8 +21,11 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  workflow_dispatch:
 
 env:
   VECTORSCAN_VERSION: "5.4.12"
@@ -44,6 +48,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # On main branch: always build all distros (to populate cache)
+          # On tag: check if artifacts already exist in release
+          if [[ "$GITHUB_REF" == refs/heads/* ]]; then
+            echo "Main branch build - building all distros to populate cache"
+            for distro in fedora-43 fedora-42 almalinux-10 almalinux-9; do
+              echo "$distro=build" >> $GITHUB_OUTPUT
+            done
+            echo "=== Build decisions (main branch) ==="
+            cat $GITHUB_OUTPUT
+            exit 0
+          fi
+
           TAG=${GITHUB_REF#refs/tags/}
 
           # Get list of assets in existing release (if any)
@@ -64,7 +80,7 @@ jobs:
             fi
           done
 
-          echo "=== Build decisions ==="
+          echo "=== Build decisions (tag release) ==="
           cat $GITHUB_OUTPUT
 
   # ==========================================================================
@@ -240,24 +256,28 @@ jobs:
             https://dl.fedoraproject.org/pub/epel/10/Everything/x86_64/Packages/c/colm-devel-0.14.7-10.el10_2.x86_64.rpm \
             https://dl.fedoraproject.org/pub/epel/10/Everything/x86_64/Packages/r/ragel-7.0.4-8.el10_2.x86_64.rpm
 
-      - name: Cache vectorscan build
+      - name: Restore vectorscan cache
         id: cache-vectorscan
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             /usr/local/include/hs
             /usr/local/lib64/libhs.a
             /usr/local/lib64/libhs_runtime.a
             /usr/local/lib64/pkgconfig/libhs.pc
-          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-static-v3
-          restore-keys: |
-            vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-static-
-            vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-
-            vectorscan-5.4-el10-
+          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-static
 
       - name: Build vectorscan from source (static)
-        if: steps.cache-vectorscan.outputs.cache-hit != 'true'
+        id: build-vectorscan
         run: |
+          # Check if vectorscan was restored from cache
+          if [ -f /usr/local/lib64/libhs.a ] && [ -f /usr/local/include/hs/hs.h ]; then
+            echo "✓ vectorscan already installed (restored from cache), skipping build"
+            echo "built=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Building vectorscan from source..."
+          echo "built=true" >> $GITHUB_OUTPUT
           cd /tmp
           curl -sL https://github.com/VectorCamp/vectorscan/archive/refs/tags/vectorscan/${VECTORSCAN_VERSION}.tar.gz | tar xz
           cd vectorscan-vectorscan-${VECTORSCAN_VERSION}
@@ -273,6 +293,17 @@ jobs:
             -DPCRE_SOURCE=pcre2
           cmake --build build -j$(nproc)
           cmake --install build
+
+      - name: Save vectorscan cache
+        if: steps.build-vectorscan.outputs.built == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /usr/local/include/hs
+            /usr/local/lib64/libhs.a
+            /usr/local/lib64/libhs_runtime.a
+            /usr/local/lib64/pkgconfig/libhs.pc
+          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-static
 
       - name: Update library cache
         run: ldconfig
@@ -351,24 +382,28 @@ jobs:
             boost-devel ragel sqlite-devel glibc-devel \
             python3-devel libpcap-devel pcre-devel
 
-      - name: Cache vectorscan build
+      - name: Restore vectorscan cache
         id: cache-vectorscan
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             /usr/local/include/hs
             /usr/local/lib64/libhs.a
             /usr/local/lib64/libhs_runtime.a
             /usr/local/lib64/pkgconfig/libhs.pc
-          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-static-v3
-          restore-keys: |
-            vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-static-
-            vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-
-            vectorscan-5.4-el9-
+          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-static
 
       - name: Build vectorscan from source (static)
-        if: steps.cache-vectorscan.outputs.cache-hit != 'true'
+        id: build-vectorscan
         run: |
+          # Check if vectorscan was restored from cache
+          if [ -f /usr/local/lib64/libhs.a ] && [ -f /usr/local/include/hs/hs.h ]; then
+            echo "✓ vectorscan already installed (restored from cache), skipping build"
+            echo "built=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Building vectorscan from source..."
+          echo "built=true" >> $GITHUB_OUTPUT
           cd /tmp
           curl -sL https://github.com/VectorCamp/vectorscan/archive/refs/tags/vectorscan/${VECTORSCAN_VERSION}.tar.gz | tar xz
           cd vectorscan-vectorscan-${VECTORSCAN_VERSION}
@@ -383,6 +418,17 @@ jobs:
             -DBUILD_AVX512VBMI=ON
           cmake --build build -j$(nproc)
           cmake --install build
+
+      - name: Save vectorscan cache
+        if: steps.build-vectorscan.outputs.built == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /usr/local/include/hs
+            /usr/local/lib64/libhs.a
+            /usr/local/lib64/libhs_runtime.a
+            /usr/local/lib64/pkgconfig/libhs.pc
+          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-static
 
       - name: Update library cache
         run: ldconfig
@@ -419,7 +465,9 @@ jobs:
   test:
     name: Test Artifacts
     needs: [build-fedora-43, build-fedora-42, build-alma10, build-alma9]
+    # Only run test/sign/publish on tag pushes (main branch builds only populate cache)
     if: |
+      startsWith(github.ref, 'refs/tags/') &&
       always() && (
         needs.build-fedora-43.result == 'success' ||
         needs.build-fedora-42.result == 'success' ||
@@ -481,6 +529,7 @@ jobs:
   sign:
     name: Sign Packages
     needs: [test]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     container: fedora:43
 
@@ -561,7 +610,8 @@ jobs:
           gpg-connect-agent /bye  # This starts the agent with new config
 
           # Get the keygrip (required for gpg-preset-passphrase)
-          KEYGRIP=$(gpg --with-keygrip --list-secret-keys "$GPG_KEYID" | grep -A1 '^\s*sec' | grep Keygrip | awk '{print $3}')
+          # Use -m1 to get first keygrip (the signing key), ignore subkey keygrip
+          KEYGRIP=$(gpg --with-keygrip --list-secret-keys "$GPG_KEYID" | grep -m1 'Keygrip' | awk '{print $3}')
           if [ -z "$KEYGRIP" ]; then
             echo "ERROR: Could not determine keygrip for $GPG_KEYID"
             gpg --with-keygrip --list-secret-keys "$GPG_KEYID"
@@ -674,6 +724,7 @@ jobs:
   publish:
     name: Publish Release
     needs: [sign]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write

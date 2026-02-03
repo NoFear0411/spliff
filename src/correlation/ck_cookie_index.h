@@ -25,6 +25,7 @@
 #ifndef CK_COOKIE_INDEX_H
 #define CK_COOKIE_INDEX_H
 
+#include "../include/spliff.h"  /* For C23 nullptr compatibility */
 #include <ck_hs.h>
 #include <stdint.h>
 #include <stdbool.h>
