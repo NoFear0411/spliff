@@ -1302,6 +1302,11 @@ void bpf_loader_sockops_detach(bpf_loader_t *loader, bool debug) {
     }
 }
 
+/* Check if sock_ops is attached */
+bool bpf_loader_sockops_is_attached(bpf_loader_t *loader) {
+    return loader && loader->xdp.sockops_link != NULL;
+}
+
 /* Detach XDP program from a specific interface */
 int bpf_loader_xdp_detach(bpf_loader_t *loader, const char *ifname, bool debug) {
     if (!loader || !ifname) {
@@ -1396,7 +1401,12 @@ struct ring_buffer *bpf_loader_xdp_get_ring_buffer(bpf_loader_t *loader) {
 /* Poll XDP ring buffer for events */
 int bpf_loader_xdp_poll(bpf_loader_t *loader, int timeout_ms) {
     if (!loader || !loader->xdp.xdp_rb) return -1;
-    return ring_buffer__poll(loader->xdp.xdp_rb, timeout_ms);
+    int count = ring_buffer__poll(loader->xdp.xdp_rb, timeout_ms);
+    /* Debug: Log poll result when events are received */
+    if (g_config.debug_mode && count > 0) {
+        fprintf(stderr, "[DEBUG] XDP poll returned %d events\n", count);
+    }
+    return count;
 }
 
 /**

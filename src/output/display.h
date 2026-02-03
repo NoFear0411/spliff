@@ -42,6 +42,9 @@
 #include <stddef.h>
 #include "../include/spliff.h"
 
+/* Forward declaration for flow context (avoid circular include) */
+struct flow_context;
+
 /**
  * @defgroup display Display and Output
  * @brief Console output formatting functions
@@ -250,26 +253,29 @@ void display_body(const uint8_t *data, size_t len, const char *content_type);
 void display_body_hex(const uint8_t *data, size_t len, const char *content_type);
 
 /**
- * @brief Display TLS handshake event
+ * @brief Display TLS handshake event with optional flow correlation
  *
  * Outputs a formatted TLS handshake completion event with:
  * - Timestamp
  * - Lock emoji (🔒)
  * - Handshake status (complete)
  * - Handshake duration
+ * - Network endpoint info (if XDP correlation available)
  * - Process name and PID
+ * - Correlation ID (for linking to HTTP traffic)
  *
  * In-progress events (result < 0) are silently skipped to avoid
  * noise from WANT_READ/WANT_WRITE retries.
  *
- * @param[in] pid      Process ID that completed handshake
- * @param[in] comm     Process command name
- * @param[in] delta_ns Handshake duration in nanoseconds
- * @param[in] result   Handshake result (0 or 1 = success, < 0 = skip)
+ * @param[in] pid       Process ID that completed handshake
+ * @param[in] comm      Process command name
+ * @param[in] delta_ns  Handshake duration in nanoseconds
+ * @param[in] result    Handshake result (0 or 1 = success, < 0 = skip)
+ * @param[in] flow_ctx  Optional flow context for network info (may be NULL)
  *
  * @par Example Output:
  * @code
- * 10:30:45.123 🔒 TLS handshake complete [45.2ms] curl (1234)
+ * 10:30:45.123 🔒 TLS handshake complete [45.2ms] 192.168.1.100:54321 → 93.184.216.34:443 curl (1234) #a1b2
  * @endcode
  *
  * @note Different SSL libraries use different return value conventions:
@@ -277,7 +283,28 @@ void display_body_hex(const uint8_t *data, size_t len, const char *content_type)
  *       - NSS: 0=success, -1=failure
  *       - GnuTLS: 0=success, negative=error
  */
-void display_handshake(uint32_t pid, const char *comm, uint64_t delta_ns, int result);
+void display_handshake_ex(uint32_t pid, const char *comm, uint64_t delta_ns,
+                          int result, const struct flow_context *flow_ctx);
+
+/**
+ * @brief Display HPACK decode error for HTTP/2 streams
+ *
+ * Outputs a formatted error message when HPACK decoding fails for an
+ * HTTP/2 stream. Shows request URL if available from partial decode.
+ *
+ * @param[in] stream_id HTTP/2 stream ID
+ * @param[in] host      Host header value (may be NULL/empty)
+ * @param[in] path      Request path (may be NULL/empty)
+ * @param[in] pid       Process ID
+ * @param[in] comm      Process command name
+ *
+ * @par Example Output:
+ * @code
+ * 10:30:45.123 ← [HPACK decode error] https://example.com/api [stream 1] curl (1234)
+ * @endcode
+ */
+void display_hpack_error(int32_t stream_id, const char *host, const char *path,
+                         uint32_t pid, const char *comm);
 
 /** @} */ /* end of display group */
 

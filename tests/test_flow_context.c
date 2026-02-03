@@ -24,6 +24,9 @@
 #include "../src/include/spliff.h"
 #include "../src/correlation/flow_context.h"
 
+/* Global config for linked source files */
+config_t g_config = {0};
+
 #define TEST(name) printf("TEST: %s... ", name)
 #define PASS() printf("\033[32mPASS\033[0m\n")
 #define FAIL(msg) do { printf("\033[31mFAIL: %s\033[0m\n", msg); failures++; } while(0)

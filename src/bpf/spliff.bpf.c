@@ -396,6 +396,7 @@ struct {
 #define FLOW_FLAG_NEEDS_PCRE2  0x01  // Ambiguous: send payload to userspace
 #define FLOW_FLAG_HAS_UPROBE   0x02  // SSL_set_fd populated cookie_to_ssl
 #define FLOW_FLAG_TERMINATED   0x04  // FIN/RST seen, pending cleanup
+#define FLOW_FLAG_EVENT_EMITTED 0x08 // FLOW_NEW event sent to userspace
 
 // Timeout for zombie flow cleanup (userspace sweeper checks last_seen_ns)
 #define FLOW_TIMEOUT_NS (30ULL * 1000000000ULL)  // 30 seconds
@@ -3035,6 +3036,11 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
     }
     // else: payload too small to classify, leave as CAT_UNKNOWN
 
+    // DEBUG: Print XDP flow_key before lookup
+    bpf_printk("XDP FKEY: saddr=0x%x daddr=0x%x", fkey.saddr, fkey.daddr);
+    bpf_printk("XDP FKEY: sport=0x%x dport=0x%x proto=%u ver=%u",
+               fkey.sport, fkey.dport, fkey.protocol, fkey.ip_version);
+
     // -------------------------------------------------------------------------
     // Now safe to do map lookups (classification already done above)
     // -------------------------------------------------------------------------
@@ -3052,6 +3058,8 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
     struct flow_cookie_entry *cookie_entry = bpf_map_lookup_elem(&flow_cookie_map, &fkey);
     if (cookie_entry) {
         cookie = cookie_entry->socket_cookie;
+        // DEBUG: Found cookie in map
+        bpf_printk("XDP LOOKUP: HIT cookie=%llu", cookie);
     } else {
         /* Cookie not cached yet - sock_ops may not have run for this flow.
          * This happens for: mid-connection captures, packets before socket setup,
@@ -3059,6 +3067,9 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
          * Classification still works, but correlation with uprobes limited. */
         if (stats)
             stats->cookie_failures++;
+        // DEBUG: Cookie miss
+        bpf_printk("XDP LOOKUP: MISS for key saddr=0x%x daddr=0x%x sport=0x%x",
+                   fkey.saddr, fkey.daddr, fkey.sport);
     }
 
     // Determine if userspace PCRE2-JIT is needed for ambiguous traffic
@@ -3068,6 +3079,11 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
     // Update or create flow state
     if (!fs) {
         // New flow without SYN (mid-connection capture or missed SYN)
+        // Set EVENT_EMITTED flag if we have a cookie and will classify
+        __u8 init_flags = needs_pcre2 ? FLOW_FLAG_NEEDS_PCRE2 : 0;
+        if (category != CAT_UNKNOWN && cookie != 0) {
+            init_flags |= FLOW_FLAG_EVENT_EMITTED;
+        }
         struct flow_state new_fs = {
             .socket_cookie = cookie,
             .first_seen_ns = now,
@@ -3077,7 +3093,7 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
             .category = category,
             .state = (category != CAT_UNKNOWN) ? FLOW_STATE_CLASSIFIED : FLOW_STATE_AMBIGUOUS,
             .direction = xdp_infer_direction(fkey.sport, fkey.dport),
-            .flags = needs_pcre2 ? FLOW_FLAG_NEEDS_PCRE2 : 0,
+            .flags = init_flags,
         };
         bpf_map_update_elem(&flow_states, &fkey, &new_fs, BPF_ANY);
         fs = bpf_map_lookup_elem(&flow_states, &fkey);
@@ -3086,33 +3102,54 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
             stats->flows_created++;
 
         is_new_classification = (category != CAT_UNKNOWN);
+        bpf_printk("XDP NEW FLOW: cat=%d cookie=%llu emit=%d",
+                   category, cookie, is_new_classification);
     } else if (fs->state == FLOW_STATE_PENDING) {
         // First data packet on pending flow - classify now
         fs->socket_cookie = cookie;
         fs->category = category;
         fs->state = (category != CAT_UNKNOWN) ? FLOW_STATE_CLASSIFIED : FLOW_STATE_AMBIGUOUS;
         fs->flags = needs_pcre2 ? FLOW_FLAG_NEEDS_PCRE2 : 0;
+        if (category != CAT_UNKNOWN && cookie != 0) {
+            fs->flags |= FLOW_FLAG_EVENT_EMITTED;
+        }
         fs->pkt_count++;
         fs->byte_count += payload_len;
         fs->last_seen_ns = now;
 
         is_new_classification = (category != CAT_UNKNOWN);
+        bpf_printk("XDP PENDING->CLASS: cat=%d cookie=%llu emit=%d",
+                   category, cookie, is_new_classification);
     } else {
         // Existing classified/ambiguous flow - update stats
         fs->pkt_count++;
         fs->byte_count += payload_len;
         fs->last_seen_ns = now;
 
-        // Check if we got a valid cookie for a flow that previously had none.
-        // This happens when sockops runs after FLOW_NEW was emitted with cookie=0.
-        // We need to notify userspace so it can update its flow_cache.
+        // Check if we should emit event:
+        // 1. Cookie discovered for flow that had none (sockops ran late)
+        // 2. Cookie exists but EVENT_EMITTED never set (flow created before cookie)
+        bool need_emit = false;
         if (fs->socket_cookie == 0 && cookie != 0) {
+            // Case 1: Cookie arrived late - update and emit
             fs->socket_cookie = cookie;
-            // Trigger event emission to update userspace cache
+            need_emit = true;
+            bpf_printk("XDP LATE COOKIE: cookie=%llu for existing flow", cookie);
+        } else if (cookie != 0 && !(fs->flags & FLOW_FLAG_EVENT_EMITTED)) {
+            // Case 2: Flow has cookie but never emitted event
+            // This happens when flow was created by SYN (no payload) then
+            // data arrives later. We need to emit so userspace knows about it.
+            need_emit = true;
+            bpf_printk("XDP DEFERRED EMIT: cookie=%llu state=%d cat=%d",
+                       cookie, fs->state, fs->category);
+        }
+
+        if (need_emit) {
+            fs->flags |= FLOW_FLAG_EVENT_EMITTED;
             is_new_classification = true;
         }
 
-        // Don't re-emit if already classified and not needing update
+        // Don't re-emit if already emitted and not needing PCRE2
         if (!is_new_classification && fs->state == FLOW_STATE_CLASSIFIED && !needs_pcre2)
             return XDP_PASS;
     }
@@ -3132,6 +3169,9 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
     // Only emit if: newly classified OR needs PCRE2-JIT analysis
     if (!is_new_classification && !needs_pcre2)
         return XDP_PASS;
+
+    bpf_printk("XDP EMIT: is_new=%d needs_pcre2=%d cookie=%llu cat=%d",
+               is_new_classification, needs_pcre2, cookie, category);
 
     // Use cached 'data_end' from function start - never re-read ctx
     long ret = 0;
@@ -3196,6 +3236,9 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
             evt->payload_off = (__u8 *)payload - (__u8 *)data;
 
             ret = bpf_ringbuf_output(&xdp_events, evt, sizeof(*evt), 0);
+            if (ret == 0) {
+                bpf_printk("XDP FLOW_NEW SENT: cookie=%llu cat=%d", cookie, category);
+            }
         }
     }
 
@@ -3304,30 +3347,54 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
     /**
      * @brief Port byte order handling for flow_key
      *
-     * Per eBPF documentation:
-     * - remote_port: __u32 in network byte order
-     * - local_port: __u32 in host byte order (kernel API asymmetry)
+     * Per kernel bpf_sock_ops structure (from eBPF docs):
+     * - remote_port: __be32 containing port - use bpf_ntohl() to get host order
+     * - local_port: __u32 in HOST byte order - use directly
      *
-     * XDP stores ports in network byte order from TCP headers.
-     * Convert both to network order for consistent map lookups.
+     * CRITICAL: Do NOT shift >> 16 after bpf_ntohl()! The port value is in the
+     * lower 16 bits after conversion, not the upper bits. Shifting destroys it!
+     *
+     * XDP reads ports directly from TCP headers as __be16 (network byte order).
+     * For consistent map lookups, convert extracted ports to __be16 with bpf_htons().
+     *
+     * Build key from OUTGOING PACKET perspective to match XDP:
+     * - saddr = local_ip (our IP = packet source when we send)
+     * - daddr = remote_ip (peer IP = packet destination when we send)
+     * - sport = local_port (our port)
+     * - dport = remote_port (peer port)
+     *
+     * This ensures XDP lookup on an outgoing packet matches forward key,
+     * and incoming packet matches reverse key.
      */
-    __u16 rport_host = (__u16)bpf_ntohl(remote_port);
-    __u16 lport_host = (__u16)local_port;
-    __u16 sport_net = bpf_htons(rport_host);
-    __u16 dport_net = bpf_htons(lport_host);
+    // DEBUG: Print raw input values
+    bpf_printk("SOCKOPS RAW: op=%u family=%u", op, family);
+    bpf_printk("SOCKOPS RAW: local_ip4=0x%x remote_ip4=0x%x", local_ip4, remote_ip4);
+    bpf_printk("SOCKOPS RAW: local_port=%u(0x%x) remote_port=%u(0x%x)",
+               local_port, local_port, remote_port, remote_port);
+
+    // Port extraction FIX: remote_port has port in UPPER 16 bits as __be16
+    // The lower 16 bits are zero, so we need to shift right to extract the port
+    __u16 rport_net = (__u16)(remote_port >> 16);      // Upper 16 bits contain port
+    __u16 lport_net = bpf_htons((__u16)local_port);    // local_port is host order → __be16
+
+    bpf_printk("SOCKOPS CONV: rport_net=0x%x lport_net=0x%x", rport_net, lport_net);
 
     if (family == AF_INET) {
-        fkey.saddr = remote_ip4;
-        fkey.daddr = local_ip4;
-        fkey.sport = sport_net;
-        fkey.dport = dport_net;
+        // Build from OUTGOING packet perspective (us → peer)
+        // Raw sockops IP values are already in XDP-compatible format (network byte order)
+        // Do NOT apply bpf_htonl - that byte-swaps and breaks the match
+        fkey.saddr = local_ip4;    // Our IP - raw value matches XDP format
+        fkey.daddr = remote_ip4;   // Peer IP - raw value matches XDP format
+        fkey.sport = lport_net;    // Our port
+        fkey.dport = rport_net;    // Peer port
         fkey.ip_version = 4;
     } else if (family == AF_INET6) {
         // XOR-hash 128-bit addresses to 32-bit (matches XDP algorithm)
-        fkey.saddr = rip6_0 ^ rip6_1 ^ rip6_2 ^ rip6_3;
-        fkey.daddr = lip6_0 ^ lip6_1 ^ lip6_2 ^ lip6_3;
-        fkey.sport = sport_net;
-        fkey.dport = dport_net;
+        // Build from OUTGOING packet perspective
+        fkey.saddr = lip6_0 ^ lip6_1 ^ lip6_2 ^ lip6_3;  // Our IP hash
+        fkey.daddr = rip6_0 ^ rip6_1 ^ rip6_2 ^ rip6_3;  // Peer IP hash
+        fkey.sport = lport_net;
+        fkey.dport = rport_net;
         fkey.ip_version = 6;
     } else {
         return 0;  // Unknown address family
@@ -3335,17 +3402,23 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
 
     fkey.protocol = IPPROTO_TCP_VAL;
 
-    // Build reverse flow key (for bidirectional handling)
+    // DEBUG: Print final flow_key values
+    bpf_printk("SOCKOPS FKEY: saddr=0x%x daddr=0x%x", fkey.saddr, fkey.daddr);
+    bpf_printk("SOCKOPS FKEY: sport=0x%x dport=0x%x proto=%u ver=%u",
+               fkey.sport, fkey.dport, fkey.protocol, fkey.ip_version);
+
+    // Build reverse flow key (for INCOMING packets: peer → us)
     struct flow_key reverse_fkey = {
-        .saddr = fkey.daddr,
-        .daddr = fkey.saddr,
-        .sport = fkey.dport,
-        .dport = fkey.sport,
+        .saddr = fkey.daddr,     // Peer IP (packet source when receiving)
+        .daddr = fkey.saddr,     // Our IP (packet destination when receiving)
+        .sport = fkey.dport,     // Peer port
+        .dport = fkey.sport,     // Our port
         .protocol = IPPROTO_TCP_VAL,
         .ip_version = fkey.ip_version
     };
 
     if (is_cleanup) {
+        bpf_printk("SOCKOPS CLEANUP: deleting cookie entries");
         bpf_map_delete_elem(&flow_cookie_map, &fkey);
         bpf_map_delete_elem(&flow_cookie_map, &reverse_fkey);
         return 0;
@@ -3354,6 +3427,7 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
     // Get socket cookie for new connections
     __u64 socket_cookie = bpf_get_socket_cookie(skops);
     if (socket_cookie == 0) {
+        bpf_printk("SOCKOPS ERROR: bpf_get_socket_cookie returned 0");
         return 0;
     }
 
@@ -3365,6 +3439,9 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
 
     bpf_map_update_elem(&flow_cookie_map, &fkey, &entry, BPF_ANY);
     bpf_map_update_elem(&flow_cookie_map, &reverse_fkey, &entry, BPF_ANY);
+
+    // DEBUG: Confirm map update with cookie
+    bpf_printk("SOCKOPS STORE: cookie=%llu stored OK", socket_cookie);
 
     return 0;
 }

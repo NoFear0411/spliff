@@ -84,6 +84,8 @@ These are architectural or design constraints rather than bugs.
 - **QUIC/HTTP/3**: Not yet supported (planned for v0.11.0).
 - **Kernel Requirements**: Requires Linux 5.x+ with BTF support (`CONFIG_DEBUG_INFO_BTF=y`).
 
+- **XDP Classification Timing** (v0.9.9): Some HTTP messages may show `[XDP:?]` with a single checkmark instead of `[XDP:TLS] ✓✓`. This occurs because XDP classification depends on seeing protocol data in packets - the first packet (SYN/ACK) has no payload. XDP needs a data packet with TLS record header or HTTP signature to classify. This is by design: single checkmark means App-layer confirmed, XDP pending/unavailable. Not a bug.
+
 ---
 
 ## Resolved Issues

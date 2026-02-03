@@ -539,6 +539,18 @@ const char *bpf_loader_xdp_mode_name(xdp_mode_t mode);
 bool bpf_loader_xdp_is_active(bpf_loader_t *loader);
 
 /**
+ * Check if sock_ops program is attached for socket cookie caching.
+ *
+ * The sock_ops program runs at TCP connection establishment and caches
+ * socket cookies for XDP-SSL correlation. If not attached, XDP events
+ * will have cookie_failures and correlation will fail.
+ *
+ * @param loader   BPF loader
+ * @return true if sock_ops attached, false otherwise
+ */
+bool bpf_loader_sockops_is_attached(bpf_loader_t *loader);
+
+/**
  * Get last XDP error (for functions that don't have err_out parameter).
  *
  * @param loader   BPF loader

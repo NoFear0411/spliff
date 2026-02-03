@@ -50,9 +50,12 @@
  */
 
 #include "threading.h"
+#include "xdp_ring.h"
+#include "deferred.h"
 #include "../protocol/http1.h"
 #include "../protocol/http2.h"
 #include "../protocol/detector.h"
+#include "../util/safe_str.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -130,6 +133,65 @@ static inline void drain_eventfd(int fd) {
 }
 
 /** @} */ /* end worker_epoll */
+
+/**
+ * @defgroup worker_xdp XDP Event Handling
+ * @brief Process XDP events from SPSC ring before SSL events
+ * @{
+ */
+
+/**
+ * @brief Handle XDP event from SPSC ring
+ *
+ * Single-Writer Architecture: The dispatcher has already created/looked up
+ * the flow and populated XDP metadata. Workers just verify the generation
+ * and decrement inflight counter.
+ *
+ * @param[in] event XDP event from ring (includes pre-resolved flow_ctx)
+ * @param[in] ctx_arg Worker context (worker_ctx_t*)
+ */
+static void worker_handle_xdp_event(const xdp_ring_event_t *event, void *ctx_arg) {
+    worker_ctx_t *ctx = (worker_ctx_t *)ctx_arg;
+    if (!ctx || !event) {
+        return;
+    }
+
+    flow_context_t *flow = event->flow_ctx;
+
+    /*
+     * Single-Writer Architecture: Flow was pre-resolved by dispatcher.
+     * Workers do NOT call flow_get_or_create() - that would race.
+     *
+     * Just verify generation hasn't changed (flow wasn't freed and reused).
+     */
+    if (flow) {
+        /* Generation check: detect stale pointers */
+        if (flow->generation != event->expected_gen) {
+            /* Flow was freed and reallocated - ignore stale event */
+            if (g_config.debug_mode) {
+                fprintf(stderr, "[Worker %d] XDP: STALE flow_ctx (gen %u != expected %u)\n",
+                        ctx->worker_id, flow->generation, event->expected_gen);
+            }
+            /* Decrement inflight (dispatcher incremented it) */
+            atomic_fetch_sub_explicit(&flow->inflight_events, 1, memory_order_release);
+            return;
+        }
+
+        /* Update timestamp - metadata was already populated by dispatcher */
+        flow->last_seen_ns = event->timestamp_ns;
+
+        if (g_config.debug_mode) {
+            fprintf(stderr, "[Worker %d] XDP: flow_id=%u cookie=%llu processed\n",
+                    ctx->worker_id, flow->self_id,
+                    (unsigned long long)event->socket_cookie);
+        }
+
+        /* Decrement inflight counter (dispatcher incremented it) */
+        atomic_fetch_sub_explicit(&flow->inflight_events, 1, memory_order_release);
+    }
+}
+
+/** @} */ /* end worker_xdp */
 
 /**
  * @defgroup worker_retry Cookie Retry Queue
@@ -282,6 +344,24 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
         return -1;
     }
 
+    /* Allocate XDP SPSC ring (Phase 3 fix for XDP correlation timing) */
+    ctx->xdp_ring = aligned_alloc(64, sizeof(xdp_ring_t));
+    if (!ctx->xdp_ring) {
+        fprintf(stderr, "Worker %d: failed to allocate XDP ring\n", worker_id);
+        worker_cleanup_epoll(ctx);
+        close(ctx->wakeup_fd);
+        return -1;
+    }
+    /* Share the worker's wakeup_fd for instant XDP event signaling */
+    if (xdp_ring_init(ctx->xdp_ring, ctx->wakeup_fd) != 0) {
+        fprintf(stderr, "Worker %d: failed to init XDP ring\n", worker_id);
+        free(ctx->xdp_ring);
+        ctx->xdp_ring = NULL;
+        worker_cleanup_epoll(ctx);
+        close(ctx->wakeup_fd);
+        return -1;
+    }
+
     /* Initialize input ring (dispatcher -> worker)
      * Note: aligned_alloc requires size to be a multiple of alignment */
     size_t in_buf_size = sizeof(ck_ring_buffer_t) * (EVENT_RING_SIZE + 1);
@@ -346,6 +426,19 @@ int worker_init(worker_ctx_t *ctx, int worker_id) {
     ctx->retry_tick = 0;
     memset(ctx->deferred_slots, 0, sizeof(ctx->deferred_slots));
 
+    /* Initialize deferred display queue (XDP correlation) */
+    if (deferred_queue_init(&ctx->deferred, DEFERRED_PREALLOC_ENTRIES) != 0) {
+        fprintf(stderr, "Worker %d: failed to init deferred display queue\n", worker_id);
+        worker_state_cleanup(&ctx->state);
+        pool_destroy(&ctx->output_pool);
+        pool_destroy(&ctx->event_pool);
+        free(ctx->out_buffer);
+        free(ctx->in_buffer);
+        worker_cleanup_epoll(ctx);
+        close(ctx->wakeup_fd);
+        return -1;
+    }
+
     /* Initialize atomics */
     atomic_store(&ctx->events_processed, 0);
     atomic_store(&ctx->events_dropped, 0);
@@ -371,6 +464,16 @@ void worker_cleanup(worker_ctx_t *ctx) {
     if (!ctx) {
         return;
     }
+
+    /* Cleanup XDP SPSC ring */
+    if (ctx->xdp_ring) {
+        xdp_ring_cleanup(ctx->xdp_ring);
+        free(ctx->xdp_ring);
+        ctx->xdp_ring = NULL;
+    }
+
+    /* Cleanup deferred display queue */
+    deferred_queue_cleanup(&ctx->deferred);
 
     /* Cleanup per-worker state */
     worker_state_cleanup(&ctx->state);
@@ -445,6 +548,37 @@ static void worker_drain_queues(worker_ctx_t *ctx) {
     }
 }
 
+/* Forward declarations from state.c */
+extern void worker_move_dying_to_shadow(worker_state_t *state, h2_connection_local_t *slot);
+extern int worker_cleanup_deferred(worker_state_t *state);
+
+/**
+ * @brief Check for DYING connections and move to shadow queue
+ *
+ * Scans connection pool for connections marked DYING by dispatcher
+ * and moves their resources to the shadow queue. This is O(N) but
+ * the pool is small (16 slots) and only needs to run occasionally.
+ *
+ * @param[in] state Worker state
+ * @return Number of connections moved to shadow queue
+ */
+static int worker_check_dying_connections(worker_state_t *state) {
+    if (!state->h2_connections) return 0;
+
+    int moved = 0;
+    h2_connection_local_t *conns = (h2_connection_local_t *)state->h2_connections;
+
+    for (int i = 0; i < state->h2_connection_capacity; i++) {
+        h2_conn_state_t current = atomic_load_explicit(&conns[i].state,
+                                                        memory_order_relaxed);
+        if (current == H2_CONN_STATE_DYING) {
+            worker_move_dying_to_shadow(state, &conns[i]);
+            moved++;
+        }
+    }
+    return moved;
+}
+
 /**
  * @brief NAPI-style main worker processing loop
  *
@@ -461,6 +595,11 @@ static void worker_drain_queues(worker_ctx_t *ctx) {
  * Events with valid socket_cookie but NULL flow_info are deferred
  * to the retry queue. The queue is processed on each iteration.
  *
+ * @par Atomic State Machine Integration:
+ * At the end of each iteration (before sleeping), checks for DYING
+ * connections and moves them to shadow queue. During quiet phase,
+ * cleans up one session from shadow queue (amortized cleanup).
+ *
  * @param[in] ctx Worker context
  */
 static void worker_loop(worker_ctx_t *ctx) {
@@ -470,7 +609,23 @@ static void worker_loop(worker_ctx_t *ctx) {
         int work_done = 0;
         worker_event_t *event;
 
-        /* Process events up to NAPI budget */
+        /*
+         * === PHASE 3 FIX: Process XDP events FIRST ===
+         *
+         * XDP events arrive via SPSC ring from dispatcher. Processing them
+         * BEFORE SSL events ensures FLOW_FLAG_HAS_XDP is set when HTTP
+         * messages are parsed and displayed.
+         *
+         * This fixes the timing race where workers checked HAS_XDP before
+         * the dispatcher had polled XDP events from the ring buffer.
+         */
+        if (ctx->xdp_ring) {
+            size_t xdp_count = xdp_ring_pop_all(ctx->xdp_ring,
+                                                 worker_handle_xdp_event, ctx);
+            work_done += (int)xdp_count;
+        }
+
+        /* Process SSL events up to NAPI budget */
         while (work_done < NAPI_BUDGET &&
                ck_ring_dequeue_spsc(&ctx->in_ring, ctx->in_buffer, &event)) {
 
@@ -701,11 +856,44 @@ static void worker_loop(worker_ctx_t *ctx) {
                             }
                         } else {
                             /*
-                             * Parser already initialized - misrouted but can process.
-                             * This should be rare (transient routing during setup).
+                             * Parser already initialized but we're not the home worker.
+                             * llhttp and nghttp2 are NOT thread-safe - concurrent access
+                             * to the same parser from multiple workers causes corruption.
+                             *
+                             * CRITICAL: We must NOT process parser-based protocols locally.
+                             * Defer the event for the home worker to process.
                              */
+                            if (event->flow_ctx->proto == FLOW_PROTO_HTTP1 ||
+                                event->flow_ctx->proto == FLOW_PROTO_HTTP2) {
+                                /* Defer to home worker - parser is not thread-safe */
+                                if (defer_event_for_retry(ctx, event) == 0) {
+                                    if (g_config.debug_mode) {
+                                        fprintf(stderr, "[Worker %u] Deferred misrouted parser event for flow_id=%u "
+                                                "(home=%u)\n", my_id, event->flow_ctx->self_id, home);
+                                    }
+                                    if (inflight_flow_ctx) {
+                                        atomic_fetch_sub_explicit(
+                                            &inflight_flow_ctx->inflight_events,
+                                            1, memory_order_release);
+                                    }
+                                    continue; /* Skip process_worker_event, will retry later */
+                                }
+                                /* Defer failed - DROP rather than risk parser corruption */
+                                atomic_fetch_add(&ctx->events_dropped, 1);
+                                if (g_config.debug_mode) {
+                                    fprintf(stderr, "[Worker %u] DROPPED misrouted parser event for flow_id=%u "
+                                            "(defer queue full)\n", my_id, event->flow_ctx->self_id);
+                                }
+                                if (inflight_flow_ctx) {
+                                    atomic_fetch_sub_explicit(
+                                        &inflight_flow_ctx->inflight_events,
+                                        1, memory_order_release);
+                                }
+                                continue; /* Skip process_worker_event */
+                            }
+                            /* Non-parser protocols (raw TLS, etc.) can process locally */
                             if (g_config.debug_mode) {
-                                fprintf(stderr, "[Worker %u] Misrouted event for flow_id=%u "
+                                fprintf(stderr, "[Worker %u] Misrouted non-parser event for flow_id=%u "
                                         "(home=%u) - processing locally\n",
                                         my_id, event->flow_ctx->self_id, home);
                             }
@@ -731,6 +919,13 @@ static void worker_loop(worker_ctx_t *ctx) {
         /* Process deferred events ready for retry */
         work_done += process_deferred_batch(ctx);
 
+        /* Drain deferred display queue (XDP correlation) */
+        uint64_t now_ns = get_time_ns();
+        work_done += deferred_drain(&ctx->deferred, now_ns);
+
+        /* Check for DYING connections and move to shadow queue */
+        worker_check_dying_connections(&ctx->state);
+
         /* Update events processed counter */
         if (work_done > 0) {
             atomic_fetch_add(&ctx->events_processed, work_done);
@@ -738,6 +933,9 @@ static void worker_loop(worker_ctx_t *ctx) {
 
         /* NAPI decision: sleep only if caught up with traffic */
         if (work_done < NAPI_BUDGET) {
+            /* QUIET PHASE: Amortized cleanup with backpressure */
+            worker_cleanup_deferred(&ctx->state);
+
             /* Select timeout based on queue state */
             int timeout = (atomic_load(&ctx->deferred_count) > 0)
                          ? EPOLL_RETRY_TIMEOUT_MS   /* Short timeout for fast retry */

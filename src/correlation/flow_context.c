@@ -19,6 +19,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <net/if.h>  /* For if_indextoname() */
 
 /*============================================================================
  * Hash Functions
@@ -210,554 +211,51 @@ void flow_pool_drain_deferred(flow_pool_t *pool, uint64_t now) {
     }
 }
 
-/*============================================================================
- * Cookie Index Implementation
- *============================================================================*/
-
-/** Empty slot marker (cookie=0 is valid for "unknown") */
-#define COOKIE_SLOT_EMPTY   UINT64_MAX
-#define COOKIE_SLOT_DELETED (UINT64_MAX - 1)
-
-/** Shadow index empty slot marker */
-#define SHADOW_SLOT_EMPTY   0
-
-/*--- Cookie index: internal insert into a specific bucket array ---*/
-
-static int cookie_insert_into(cookie_entry_t *buckets, size_t capacity,
-                               uint64_t cookie, flow_context_t *ctx) {
-    size_t start = hash_cookie(cookie) % capacity;
-    size_t pos = start;
-
-    do {
-        cookie_entry_t *entry = &buckets[pos];
-
-        if (entry->cookie == COOKIE_SLOT_EMPTY ||
-            entry->cookie == COOKIE_SLOT_DELETED) {
-            entry->cookie = cookie;
-            entry->ctx = ctx;
-            return 1;  /* New entry inserted */
-        }
-
-        if (entry->cookie == cookie) {
-            entry->ctx = ctx;
-            return 0;  /* Updated existing */
-        }
-
-        pos = (pos + 1) % capacity;
-    } while (pos != start);
-
-    return -1;  /* Table full */
-}
-
-/*--- Cookie index: internal lookup in a specific bucket array ---*/
-
-static flow_context_t *cookie_lookup_in(cookie_entry_t *buckets, size_t capacity,
-                                         uint64_t cookie) {
-    size_t start = hash_cookie(cookie) % capacity;
-    size_t pos = start;
-
-    do {
-        cookie_entry_t *entry = &buckets[pos];
-
-        if (entry->cookie == COOKIE_SLOT_EMPTY) {
-            return NULL;
-        }
-
-        if (entry->cookie == cookie) {
-            return entry->ctx;
-        }
-
-        pos = (pos + 1) % capacity;
-    } while (pos != start);
-
-    return NULL;
-}
-
-/*--- Cookie index: incremental migration ---*/
-
-static void cookie_index_migrate_batch(cookie_index_t *idx, size_t batch) {
-    if (__builtin_expect(!idx->old_buckets, 1)) {
-        return;  /* Fast path: no migration in progress */
-    }
-
-    size_t migrated = 0;
-    while (migrated < batch && idx->migrate_pos < idx->old_capacity) {
-        cookie_entry_t *src = &idx->old_buckets[idx->migrate_pos++];
-        if (src->cookie != COOKIE_SLOT_EMPTY &&
-            src->cookie != COOKIE_SLOT_DELETED) {
-            cookie_insert_into(idx->buckets, idx->capacity,
-                               src->cookie, src->ctx);
-            migrated++;
-        }
-    }
-
-    if (idx->migrate_pos >= idx->old_capacity) {
-        free(idx->old_buckets);
-        idx->old_buckets = NULL;
-        idx->old_capacity = 0;
-        idx->migrate_pos = 0;
-    }
-}
-
-/*--- Cookie index: grow (start migration) ---*/
-
-static int cookie_index_grow(cookie_index_t *idx) {
-    size_t new_capacity = idx->capacity * 2;
-
-    cookie_entry_t *new_buckets = calloc(new_capacity, sizeof(cookie_entry_t));
-    if (!new_buckets) {
-        return -1;
-    }
-
-    /* Mark all new slots as empty */
-    for (size_t i = 0; i < new_capacity; i++) {
-        new_buckets[i].cookie = COOKIE_SLOT_EMPTY;
-        new_buckets[i].ctx = NULL;
-    }
-
-    /* Old table becomes migration source */
-    idx->old_buckets = idx->buckets;
-    idx->old_capacity = idx->capacity;
-    idx->migrate_pos = 0;
-
-    /* New table becomes active */
-    idx->buckets = new_buckets;
-    idx->capacity = new_capacity;
-
-    return 0;
-}
-
-/*--- Cookie index: public API ---*/
-
-int cookie_index_init(cookie_index_t *idx, size_t capacity) {
-    if (!idx || capacity == 0) {
-        return -1;
-    }
-
-    memset(idx, 0, sizeof(*idx));
-
-    idx->buckets = calloc(capacity, sizeof(cookie_entry_t));
-    if (!idx->buckets) {
-        return -1;
-    }
-
-    idx->capacity = capacity;
-
-    for (size_t i = 0; i < capacity; i++) {
-        idx->buckets[i].cookie = COOKIE_SLOT_EMPTY;
-        idx->buckets[i].ctx = NULL;
-    }
-
-    atomic_store(&idx->count, 0);
-    atomic_store(&idx->hits, 0);
-    atomic_store(&idx->misses, 0);
-
-    return 0;
-}
-
-void cookie_index_cleanup(cookie_index_t *idx) {
-    if (!idx) {
-        return;
-    }
-    free(idx->buckets);
-    idx->buckets = NULL;
-    free(idx->old_buckets);
-    idx->old_buckets = NULL;
-    idx->capacity = 0;
-    idx->old_capacity = 0;
-}
-
-int cookie_index_insert(cookie_index_t *idx, uint64_t cookie, flow_context_t *ctx) {
-    if (!idx || !idx->buckets || cookie == COOKIE_SLOT_EMPTY ||
-        cookie == COOKIE_SLOT_DELETED) {
-        return -1;
-    }
-
-    /* Drive incremental migration forward */
-    if (idx->old_buckets) {
-        /* Adaptive: under pressure? migrate faster */
-        size_t batch = FLOW_INDEX_GROW_BATCH;
-        if (atomic_load(&idx->count) * 4 >= idx->capacity * 3) {
-            batch = FLOW_INDEX_GROW_BATCH * 4;  /* 32 — urgent */
-        }
-        cookie_index_migrate_batch(idx, batch);
-    }
-
-    /* Check load factor — grow if NOT already migrating */
-    if (!idx->old_buckets &&
-        atomic_load(&idx->count) * 4 >= idx->capacity * 3) {
-        cookie_index_grow(idx);
-    }
-
-    /* Insert into active table */
-    int result = cookie_insert_into(idx->buckets, idx->capacity, cookie, ctx);
-    if (result == 1) {
-        atomic_fetch_add(&idx->count, 1);
-    }
-    return (result >= 0) ? 0 : -1;
-}
-
-flow_context_t *cookie_index_lookup(cookie_index_t *idx, uint64_t cookie) {
-    if (!idx || !idx->buckets || cookie == COOKIE_SLOT_EMPTY ||
-        cookie == COOKIE_SLOT_DELETED) {
-        return NULL;
-    }
-
-    /* Drive migration (both insert and lookup drive it) */
-    if (idx->old_buckets) {
-        cookie_index_migrate_batch(idx, FLOW_INDEX_GROW_BATCH);
-    }
-
-    /* Search active table first */
-    flow_context_t *result = cookie_lookup_in(idx->buckets, idx->capacity, cookie);
-    if (result) {
-        atomic_fetch_add(&idx->hits, 1);
-        return result;
-    }
-
-    /* Search old table if migrating */
-    if (idx->old_buckets) {
-        result = cookie_lookup_in(idx->old_buckets, idx->old_capacity, cookie);
-        if (result) {
-            atomic_fetch_add(&idx->hits, 1);
-            return result;
-        }
-    }
-
-    atomic_fetch_add(&idx->misses, 1);
-    return NULL;
-}
-
-void cookie_index_remove(cookie_index_t *idx, uint64_t cookie) {
-    if (!idx || !idx->buckets || cookie == COOKIE_SLOT_EMPTY ||
-        cookie == COOKIE_SLOT_DELETED) {
+void flow_pool_force_drain(flow_pool_t *pool) {
+    if (!pool) {
         return;
     }
 
-    /* Try active table */
-    size_t start = hash_cookie(cookie) % idx->capacity;
-    size_t pos = start;
-    do {
-        cookie_entry_t *entry = &idx->buckets[pos];
-        if (entry->cookie == COOKIE_SLOT_EMPTY) {
-            break;
-        }
-        if (entry->cookie == cookie) {
-            entry->cookie = COOKIE_SLOT_DELETED;
-            entry->ctx = NULL;
-            atomic_fetch_sub(&idx->count, 1);
-            return;
-        }
-        pos = (pos + 1) % idx->capacity;
-    } while (pos != start);
-
-    /* Try old table if migrating */
-    if (idx->old_buckets) {
-        start = hash_cookie(cookie) % idx->old_capacity;
-        pos = start;
-        do {
-            cookie_entry_t *entry = &idx->old_buckets[pos];
-            if (entry->cookie == COOKIE_SLOT_EMPTY) {
-                return;
-            }
-            if (entry->cookie == cookie) {
-                entry->cookie = COOKIE_SLOT_DELETED;
-                entry->ctx = NULL;
-                atomic_fetch_sub(&idx->count, 1);
-                return;
-            }
-            pos = (pos + 1) % idx->old_capacity;
-        } while (pos != start);
+    /* Free all active flows immediately (no grace period) */
+    flow_context_t *ctx = pool->active_head;
+    while (ctx) {
+        flow_context_t *next = ctx->list_next;
+        flow_free_resources(ctx);
+        free(ctx);
+        ctx = next;
     }
+    pool->active_head = NULL;
+
+    /* Free all deferred flows immediately (no grace period) */
+    ctx = pool->deferred_head;
+    while (ctx) {
+        flow_context_t *next = ctx->list_next;
+        flow_free_resources(ctx);
+        free(ctx);
+        ctx = next;
+    }
+    pool->deferred_head = NULL;
+    pool->deferred_tail = NULL;
 }
 
 /*============================================================================
- * Shadow Index Implementation
+ * CK Hash Set Index Operations
+ *
+ * The custom hash table implementations have been replaced with thread-safe
+ * CK hs wrappers. See ck_cookie_index.c and ck_shadow_index.c.
+ *
+ * Old code removed (lines 244-820 of original):
+ * - cookie_insert_into(), cookie_lookup_in(), cookie_index_migrate_batch()
+ * - cookie_index_grow(), cookie_index_init(), cookie_index_cleanup()
+ * - cookie_index_insert(), cookie_index_lookup(), cookie_index_remove()
+ * - shadow_insert_into(), shadow_lookup_in(), shadow_index_migrate_batch()
+ * - shadow_index_grow(), shadow_index_init(), shadow_index_cleanup()
+ * - shadow_index_insert(), shadow_index_lookup(), shadow_index_remove()
+ * - shadow_find_by_cookie()
  *============================================================================*/
 
-/*--- Shadow index: internal insert into a specific bucket array ---*/
-
-static int shadow_insert_into(shadow_entry_t *buckets, size_t capacity,
-                               uint32_t pid, uint64_t ssl_ctx,
-                               flow_context_t *ctx) {
-    size_t start = hash_shadow_key(pid, ssl_ctx) % capacity;
-    size_t pos = start;
-
-    do {
-        shadow_entry_t *entry = &buckets[pos];
-
-        if (entry->pid == SHADOW_SLOT_EMPTY) {
-            entry->pid = pid;
-            entry->ssl_ctx = ssl_ctx;
-            entry->ctx = ctx;
-            return 1;  /* New entry */
-        }
-
-        if (entry->pid == pid && entry->ssl_ctx == ssl_ctx) {
-            entry->ctx = ctx;
-            return 0;  /* Updated */
-        }
-
-        pos = (pos + 1) % capacity;
-    } while (pos != start);
-
-    return -1;  /* Table full */
-}
-
-/*--- Shadow index: internal lookup in a specific bucket array ---*/
-
-static flow_context_t *shadow_lookup_in(shadow_entry_t *buckets, size_t capacity,
-                                         uint32_t pid, uint64_t ssl_ctx) {
-    size_t start = hash_shadow_key(pid, ssl_ctx) % capacity;
-    size_t pos = start;
-
-    do {
-        shadow_entry_t *entry = &buckets[pos];
-
-        if (entry->pid == SHADOW_SLOT_EMPTY) {
-            return NULL;
-        }
-
-        if (entry->pid == pid && entry->ssl_ctx == ssl_ctx) {
-            return entry->ctx;
-        }
-
-        pos = (pos + 1) % capacity;
-    } while (pos != start);
-
-    return NULL;
-}
-
-/*--- Shadow index: incremental migration ---*/
-
-static void shadow_index_migrate_batch(shadow_index_t *idx, size_t batch) {
-    if (__builtin_expect(!idx->old_buckets, 1)) {
-        return;
-    }
-
-    size_t migrated = 0;
-    while (migrated < batch && idx->migrate_pos < idx->old_capacity) {
-        shadow_entry_t *src = &idx->old_buckets[idx->migrate_pos++];
-        if (src->pid != SHADOW_SLOT_EMPTY) {
-            shadow_insert_into(idx->buckets, idx->capacity,
-                               src->pid, src->ssl_ctx, src->ctx);
-            migrated++;
-        }
-    }
-
-    if (idx->migrate_pos >= idx->old_capacity) {
-        free(idx->old_buckets);
-        idx->old_buckets = NULL;
-        idx->old_capacity = 0;
-        idx->migrate_pos = 0;
-    }
-}
-
-/*--- Shadow index: grow (start migration) ---*/
-
-static int shadow_index_grow(shadow_index_t *idx) {
-    size_t new_capacity = idx->capacity * 2;
-
-    shadow_entry_t *new_buckets = calloc(new_capacity, sizeof(shadow_entry_t));
-    if (!new_buckets) {
-        return -1;
-    }
-
-    /* pid=0 means empty (calloc already zeroed, SHADOW_SLOT_EMPTY == 0) */
-
-    idx->old_buckets = idx->buckets;
-    idx->old_capacity = idx->capacity;
-    idx->migrate_pos = 0;
-
-    idx->buckets = new_buckets;
-    idx->capacity = new_capacity;
-
-    return 0;
-}
-
-/*--- Shadow index: public API ---*/
-
-int shadow_index_init(shadow_index_t *idx, size_t capacity) {
-    if (!idx || capacity == 0) {
-        return -1;
-    }
-
-    memset(idx, 0, sizeof(*idx));
-
-    idx->buckets = calloc(capacity, sizeof(shadow_entry_t));
-    if (!idx->buckets) {
-        return -1;
-    }
-
-    idx->capacity = capacity;
-    /* calloc zeroed everything; pid=0 (SHADOW_SLOT_EMPTY) marks empty slots */
-
-    atomic_store(&idx->count, 0);
-    atomic_store(&idx->hits, 0);
-    atomic_store(&idx->promotions, 0);
-
-    return 0;
-}
-
-void shadow_index_cleanup(shadow_index_t *idx) {
-    if (!idx) {
-        return;
-    }
-    free(idx->buckets);
-    idx->buckets = NULL;
-    free(idx->old_buckets);
-    idx->old_buckets = NULL;
-    idx->capacity = 0;
-    idx->old_capacity = 0;
-}
-
-int shadow_index_insert(shadow_index_t *idx, uint32_t pid,
-                        uint64_t ssl_ctx, flow_context_t *ctx) {
-    if (!idx || !idx->buckets || pid == SHADOW_SLOT_EMPTY) {
-        return -1;
-    }
-
-    /* Drive incremental migration */
-    if (idx->old_buckets) {
-        size_t batch = FLOW_INDEX_GROW_BATCH;
-        if (atomic_load(&idx->count) * 4 >= idx->capacity * 3) {
-            batch = FLOW_INDEX_GROW_BATCH * 4;
-        }
-        shadow_index_migrate_batch(idx, batch);
-    }
-
-    /* Check load factor */
-    if (!idx->old_buckets &&
-        atomic_load(&idx->count) * 4 >= idx->capacity * 3) {
-        shadow_index_grow(idx);
-    }
-
-    /* Insert into active table */
-    int result = shadow_insert_into(idx->buckets, idx->capacity,
-                                     pid, ssl_ctx, ctx);
-    if (result == 1) {
-        atomic_fetch_add(&idx->count, 1);
-    }
-    return (result >= 0) ? 0 : -1;
-}
-
-flow_context_t *shadow_index_lookup(shadow_index_t *idx, uint32_t pid,
-                                     uint64_t ssl_ctx) {
-    if (!idx || !idx->buckets) {
-        return NULL;
-    }
-
-    /* Drive migration */
-    if (idx->old_buckets) {
-        shadow_index_migrate_batch(idx, FLOW_INDEX_GROW_BATCH);
-    }
-
-    /* Search active table first */
-    flow_context_t *result = shadow_lookup_in(idx->buckets, idx->capacity,
-                                               pid, ssl_ctx);
-    if (result) {
-        atomic_fetch_add(&idx->hits, 1);
-        return result;
-    }
-
-    /* Search old table if migrating */
-    if (idx->old_buckets) {
-        result = shadow_lookup_in(idx->old_buckets, idx->old_capacity,
-                                   pid, ssl_ctx);
-        if (result) {
-            atomic_fetch_add(&idx->hits, 1);
-            return result;
-        }
-    }
-
-    return NULL;
-}
-
-void shadow_index_remove(shadow_index_t *idx, uint32_t pid, uint64_t ssl_ctx) {
-    if (!idx || !idx->buckets) {
-        return;
-    }
-
-    /* Remove from active table using backward-shift deletion */
-    size_t start = hash_shadow_key(pid, ssl_ctx) % idx->capacity;
-    size_t pos = start;
-
-    do {
-        shadow_entry_t *entry = &idx->buckets[pos];
-
-        if (entry->pid == SHADOW_SLOT_EMPTY) {
-            break;
-        }
-
-        if (entry->pid == pid && entry->ssl_ctx == ssl_ctx) {
-            /* Found - clear slot and rehash subsequent entries */
-            entry->pid = SHADOW_SLOT_EMPTY;
-            entry->ssl_ctx = 0;
-            entry->ctx = NULL;
-            atomic_fetch_sub(&idx->count, 1);
-
-            /* Backward-shift: rehash subsequent entries to maintain probe chain */
-            size_t rehash_pos = (pos + 1) % idx->capacity;
-            while (idx->buckets[rehash_pos].pid != SHADOW_SLOT_EMPTY) {
-                shadow_entry_t tmp = idx->buckets[rehash_pos];
-                idx->buckets[rehash_pos].pid = SHADOW_SLOT_EMPTY;
-                idx->buckets[rehash_pos].ssl_ctx = 0;
-                idx->buckets[rehash_pos].ctx = NULL;
-                atomic_fetch_sub(&idx->count, 1);
-
-                /* Re-insert (increments count back) */
-                shadow_insert_into(idx->buckets, idx->capacity,
-                                    tmp.pid, tmp.ssl_ctx, tmp.ctx);
-                atomic_fetch_add(&idx->count, 1);
-
-                rehash_pos = (rehash_pos + 1) % idx->capacity;
-            }
-            return;
-        }
-
-        pos = (pos + 1) % idx->capacity;
-    } while (pos != start);
-
-    /* Try old table if migrating */
-    if (idx->old_buckets) {
-        start = hash_shadow_key(pid, ssl_ctx) % idx->old_capacity;
-        pos = start;
-
-        do {
-            shadow_entry_t *entry = &idx->old_buckets[pos];
-
-            if (entry->pid == SHADOW_SLOT_EMPTY) {
-                return;
-            }
-
-            if (entry->pid == pid && entry->ssl_ctx == ssl_ctx) {
-                entry->pid = SHADOW_SLOT_EMPTY;
-                entry->ssl_ctx = 0;
-                entry->ctx = NULL;
-                atomic_fetch_sub(&idx->count, 1);
-
-                /* Backward-shift in old table */
-                size_t rehash_pos = (pos + 1) % idx->old_capacity;
-                while (idx->old_buckets[rehash_pos].pid != SHADOW_SLOT_EMPTY) {
-                    shadow_entry_t tmp = idx->old_buckets[rehash_pos];
-                    idx->old_buckets[rehash_pos].pid = SHADOW_SLOT_EMPTY;
-                    idx->old_buckets[rehash_pos].ssl_ctx = 0;
-                    idx->old_buckets[rehash_pos].ctx = NULL;
-                    atomic_fetch_sub(&idx->count, 1);
-
-                    shadow_insert_into(idx->old_buckets, idx->old_capacity,
-                                        tmp.pid, tmp.ssl_ctx, tmp.ctx);
-                    atomic_fetch_add(&idx->count, 1);
-
-                    rehash_pos = (rehash_pos + 1) % idx->old_capacity;
-                }
-                return;
-            }
-
-            pos = (pos + 1) % idx->old_capacity;
-        } while (pos != start);
-    }
-}
+#include "ck_cookie_index.h"
+#include "ck_shadow_index.h"
 
 /*============================================================================
  * Flow Manager Implementation
@@ -775,15 +273,15 @@ int flow_manager_init(flow_manager_t *mgr) {
         return -1;
     }
 
-    /* Initialize cookie index with initial capacity */
-    if (cookie_index_init(&mgr->cookie_idx, FLOW_INDEX_INITIAL_CAPACITY) != 0) {
+    /* Initialize CK cookie index with initial capacity */
+    if (ck_cookie_index_init(&mgr->cookie_idx, FLOW_INDEX_INITIAL_CAPACITY) != 0) {
         flow_pool_cleanup(&mgr->pool);
         return -1;
     }
 
-    /* Initialize shadow index with initial capacity */
-    if (shadow_index_init(&mgr->shadow_idx, FLOW_INDEX_INITIAL_CAPACITY) != 0) {
-        cookie_index_cleanup(&mgr->cookie_idx);
+    /* Initialize CK shadow index with initial capacity */
+    if (ck_shadow_index_init(&mgr->shadow_idx, FLOW_INDEX_INITIAL_CAPACITY) != 0) {
+        ck_cookie_index_cleanup(&mgr->cookie_idx);
         flow_pool_cleanup(&mgr->pool);
         return -1;
     }
@@ -796,9 +294,87 @@ void flow_manager_cleanup(flow_manager_t *mgr) {
         return;
     }
 
-    shadow_index_cleanup(&mgr->shadow_idx);
-    cookie_index_cleanup(&mgr->cookie_idx);
-    flow_pool_cleanup(&mgr->pool);
+    /*
+     * COMPREHENSIVE CLEANUP: Collect all unique flow pointers, then free them.
+     *
+     * With CK hs, we iterate using ck_hs_next() to find all entries.
+     * Flows may exist in both indices, so we deduplicate.
+     */
+
+    /* Estimate max flows from pool stats */
+    uint64_t max_flows = atomic_load(&mgr->pool.total_allocs);
+    if (max_flows == 0) {
+        max_flows = 256;  /* Default estimate */
+    }
+
+    /* Allocate array for unique flow pointers */
+    flow_context_t **flows_to_free = calloc((size_t)max_flows, sizeof(flow_context_t *));
+    size_t flow_count = 0;
+
+    if (!flows_to_free) {
+        /* Fallback: just clean up indices without freeing flows (leak is better than crash) */
+        ck_shadow_index_cleanup(&mgr->shadow_idx);
+        ck_cookie_index_cleanup(&mgr->cookie_idx);
+        return;
+    }
+
+    /* Helper macro to add unique flow pointer */
+    #define ADD_UNIQUE_FLOW(ctx_ptr) do { \
+        if ((ctx_ptr) != NULL) { \
+            bool found = false; \
+            for (size_t _k = 0; _k < flow_count && !found; _k++) { \
+                if (flows_to_free[_k] == (ctx_ptr)) found = true; \
+            } \
+            if (!found && flow_count < (size_t)max_flows) { \
+                flows_to_free[flow_count++] = (ctx_ptr); \
+            } \
+        } \
+    } while (0)
+
+    /* Collect from cookie_index via CK iterator */
+    {
+        ck_hs_iterator_t iter = CK_HS_ITERATOR_INITIALIZER;
+        void *entry_ptr;
+        while (ck_hs_next(&mgr->cookie_idx.hs, &iter, &entry_ptr)) {
+            ck_cookie_entry_t *entry = entry_ptr;
+            ADD_UNIQUE_FLOW(entry->ctx);
+        }
+    }
+
+    /* Collect from shadow_index via CK iterator */
+    {
+        ck_hs_iterator_t iter = CK_HS_ITERATOR_INITIALIZER;
+        void *entry_ptr;
+        while (ck_hs_next(&mgr->shadow_idx.hs, &iter, &entry_ptr)) {
+            ck_shadow_entry_t *entry = entry_ptr;
+            ADD_UNIQUE_FLOW(entry->ctx);
+        }
+    }
+
+    #undef ADD_UNIQUE_FLOW
+
+    /* Now free all collected flows */
+    for (size_t i = 0; i < flow_count; i++) {
+        flow_free_resources(flows_to_free[i]);
+        free(flows_to_free[i]);
+    }
+    free(flows_to_free);
+
+    /* Now clean up the index structures (frees entries and ck_hs) */
+    ck_shadow_index_cleanup(&mgr->shadow_idx);
+    ck_cookie_index_cleanup(&mgr->cookie_idx);
+
+    /* Clear pool lists (flows already freed above) */
+    mgr->pool.active_head = NULL;
+    mgr->pool.deferred_head = NULL;
+    mgr->pool.deferred_tail = NULL;
+}
+
+void flow_manager_force_drain(flow_manager_t *mgr) {
+    if (!mgr) {
+        return;
+    }
+    flow_pool_force_drain(&mgr->pool);
 }
 
 flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
@@ -812,9 +388,9 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
         return NULL;
     }
 
-    /* Try cookie_index first (fast path) */
+    /* Try cookie_index first (fast path) - uses CK hs (SPMC safe) */
     if (cookie != 0) {
-        flow_context_t *ctx = cookie_index_lookup(&mgr->cookie_idx, cookie);
+        flow_context_t *ctx = ck_cookie_index_lookup(&mgr->cookie_idx, cookie);
         if (ctx && atomic_load_explicit(&ctx->active, memory_order_acquire)) {
             /*
              * Verify the cookie-matched flow belongs to this connection.
@@ -837,13 +413,14 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
                 /* Merge SSL data into XDP-only flow if needed */
                 if (ctx->ssl_ctx == 0 && ssl_ctx != 0) {
                     ctx->ssl_ctx = ssl_ctx;
-                    ctx->flags |= FLOW_FLAG_HAS_SSL;
+                    atomic_fetch_or(&ctx->flags, FLOW_FLAG_HAS_SSL);
 
-                    /* Add to shadow_index for future SSL lookups */
-                    if (pid != 0 && !(ctx->flags & FLOW_FLAG_IN_SHADOW)) {
-                        if (shadow_index_insert(&mgr->shadow_idx, pid,
-                                                ssl_ctx, ctx) == 0) {
-                            ctx->flags |= FLOW_FLAG_IN_SHADOW;
+                    /* Add to shadow_index for future SSL lookups
+                     * NOTE: This is a write operation - must be in dispatcher! */
+                    if (pid != 0 && !(atomic_load(&ctx->flags) & FLOW_FLAG_IN_SHADOW)) {
+                        if (ck_shadow_index_insert(&mgr->shadow_idx, pid,
+                                                   ssl_ctx, ctx) == 0) {
+                            atomic_fetch_or(&ctx->flags, FLOW_FLAG_IN_SHADOW);
                         }
                     }
                 }
@@ -858,9 +435,9 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
         }
     }
 
-    /* Fall back to shadow_index */
+    /* Fall back to shadow_index - uses CK hs (SPMC safe) */
     if (pid != 0) {
-        flow_context_t *ctx = shadow_index_lookup(&mgr->shadow_idx, pid, ssl_ctx);
+        flow_context_t *ctx = ck_shadow_index_lookup(&mgr->shadow_idx, pid, ssl_ctx);
         if (ctx && atomic_load_explicit(&ctx->active, memory_order_acquire)) {
             if (path_out) {
                 *path_out = FLOW_PATH_SHADOW;
@@ -900,44 +477,118 @@ flow_context_t *flow_get_or_create(flow_manager_t *mgr, uint64_t cookie,
     ctx->pid = pid;
     ctx->ssl_ctx = ssl_ctx;
 
-    /* Add to shadow_index (always) */
+    /* Add to shadow_index (always) - uses CK hs (single-writer safe) */
     if (pid != 0) {
-        if (shadow_index_insert(&mgr->shadow_idx, pid, ssl_ctx, ctx) == 0) {
-            ctx->flags |= FLOW_FLAG_IN_SHADOW;
+        if (ck_shadow_index_insert(&mgr->shadow_idx, pid, ssl_ctx, ctx) == 0) {
+            atomic_fetch_or(&ctx->flags, FLOW_FLAG_IN_SHADOW);
         }
     }
 
-    /* Add to cookie_index if cookie known */
+    /* Add to cookie_index if cookie known - uses CK hs (single-writer safe) */
     if (cookie != 0) {
-        if (cookie_index_insert(&mgr->cookie_idx, cookie, ctx) == 0) {
-            ctx->flags |= FLOW_FLAG_IN_COOKIE;
+        int insert_result = ck_cookie_index_insert(&mgr->cookie_idx, cookie, ctx);
+        if (insert_result == 0) {
+            atomic_fetch_or(&ctx->flags, FLOW_FLAG_IN_COOKIE);
+        } else {
+            /* CK hs handles growth automatically, but log failures */
+            if (g_config.debug_mode) {
+                fprintf(stderr, "[WARN] ck_cookie_index_insert failed for cookie=%llu (count=%lu)\n",
+                        (unsigned long long)cookie,
+                        (unsigned long)atomic_load(&mgr->cookie_idx.count));
+            }
         }
     }
 
     return ctx;
 }
 
+/*
+ * Promote flow to cookie index - see flow_context.h for API documentation.
+ * Implementation handles Two-Source Race where XDP arrives before SSL has cookie.
+ */
 int flow_promote_cookie(flow_manager_t *mgr, uint32_t pid,
                         uint64_t ssl_ctx, uint64_t cookie) {
     if (!mgr || cookie == 0) {
         return -1;
     }
 
-    /* Find flow by shadow key */
-    flow_context_t *ctx = shadow_index_lookup(&mgr->shadow_idx, pid, ssl_ctx);
-    if (!ctx || !atomic_load_explicit(&ctx->active, memory_order_acquire)) {
+    /* Find SSL flow by shadow key - uses CK hs (SPMC safe) */
+    flow_context_t *ssl_flow = ck_shadow_index_lookup(&mgr->shadow_idx, pid, ssl_ctx);
+    if (!ssl_flow || !atomic_load_explicit(&ssl_flow->active, memory_order_acquire)) {
         return -1;
     }
 
     /* Check if already promoted */
-    if (ctx->socket_cookie != 0) {
+    if (ssl_flow->socket_cookie != 0) {
         return 0;
     }
 
-    /* Update cookie and add to cookie_index */
-    ctx->socket_cookie = cookie;
-    if (cookie_index_insert(&mgr->cookie_idx, cookie, ctx) == 0) {
-        ctx->flags |= FLOW_FLAG_IN_COOKIE;
+    /* Check if an XDP-only flow already has this cookie (Two-Source Race) */
+    flow_context_t *xdp_flow = ck_cookie_index_lookup(&mgr->cookie_idx, cookie);
+
+    /* Debug: log promotion attempt and cookie_index state */
+    if (g_config.debug_mode) {
+        fprintf(stderr, "[DEBUG] SSL PROMOTE: pid=%u ssl_ctx=%llx promoting to cookie=%llu\n",
+                pid, (unsigned long long)ssl_ctx, (unsigned long long)cookie);
+        if (xdp_flow) {
+            fprintf(stderr, "[DEBUG] SSL PROMOTE: FOUND XDP flow_id=%u (flags=%u)\n",
+                    xdp_flow->self_id, atomic_load(&xdp_flow->flags));
+        } else {
+            /* CK hs doesn't expose bucket iteration - just log count */
+            fprintf(stderr, "[DEBUG] SSL PROMOTE: NO XDP flow for cookie=%llu. Index has %lu entries\n",
+                    (unsigned long long)cookie,
+                    (unsigned long)atomic_load(&mgr->cookie_idx.count));
+        }
+    }
+
+    if (xdp_flow && xdp_flow != ssl_flow &&
+        atomic_load_explicit(&xdp_flow->active, memory_order_acquire)) {
+        /*
+         * MERGE: XDP created a flow before SSL got the cookie.
+         * Copy XDP metadata (5-tuple, counters) into SSL flow.
+         */
+        if (atomic_load(&xdp_flow->flags) & FLOW_FLAG_HAS_XDP) {
+            /* Copy 5-tuple */
+            memcpy(&ssl_flow->flow, &xdp_flow->flow, sizeof(flow_key_t));
+
+            /* Copy XDP metadata */
+            ssl_flow->ifindex = xdp_flow->ifindex;
+            ssl_flow->xdp_category = xdp_flow->xdp_category;
+            ssl_flow->first_seen_ns = xdp_flow->first_seen_ns;
+            if (xdp_flow->last_seen_ns > ssl_flow->last_seen_ns) {
+                ssl_flow->last_seen_ns = xdp_flow->last_seen_ns;
+            }
+
+            /* Accumulate traffic counters */
+            ssl_flow->pkts_in += xdp_flow->pkts_in;
+            ssl_flow->pkts_out += xdp_flow->pkts_out;
+            ssl_flow->bytes_in += xdp_flow->bytes_in;
+            ssl_flow->bytes_out += xdp_flow->bytes_out;
+
+            /* Set XDP flag on merged flow (release semantics for workers) */
+            atomic_fetch_or_explicit(&ssl_flow->flags, FLOW_FLAG_HAS_XDP, memory_order_release);
+
+            /* Debug: Log merge event */
+            if (g_config.debug_mode) {
+                fprintf(stderr, "[DEBUG] SSL: MERGE flow_id=%u absorbed XDP flow_id=%u (cookie=%llu)\n",
+                        ssl_flow->self_id, xdp_flow->self_id, (unsigned long long)cookie);
+            }
+        }
+
+        /* Remove orphaned XDP flow from cookie_index - uses CK hs (single-writer safe) */
+        ck_cookie_index_remove(&mgr->cookie_idx, cookie);
+
+        /* Mark XDP flow for deferred free (2-second grace period) */
+        flow_pool_free(&mgr->pool, xdp_flow);
+
+        /* Track merges for statistics */
+        atomic_fetch_add(&mgr->shadow_idx.merges, 1);
+    }
+
+    /* Promote SSL flow to cookie_index - uses CK hs (single-writer safe) */
+    ssl_flow->socket_cookie = cookie;
+    if (ck_cookie_index_insert(&mgr->cookie_idx, cookie, ssl_flow) == 0) {
+        atomic_fetch_or(&ssl_flow->flags, FLOW_FLAG_IN_COOKIE);
         atomic_fetch_add(&mgr->shadow_idx.promotions, 1);
     }
 
@@ -949,14 +600,14 @@ void flow_terminate(flow_manager_t *mgr, flow_context_t *ctx) {
         return;
     }
 
-    /* Remove from cookie_index if present */
-    if ((ctx->flags & FLOW_FLAG_IN_COOKIE) && ctx->socket_cookie != 0) {
-        cookie_index_remove(&mgr->cookie_idx, ctx->socket_cookie);
+    /* Remove from cookie_index if present - uses CK hs (single-writer safe) */
+    if ((atomic_load(&ctx->flags) & FLOW_FLAG_IN_COOKIE) && ctx->socket_cookie != 0) {
+        ck_cookie_index_remove(&mgr->cookie_idx, ctx->socket_cookie);
     }
 
-    /* Remove from shadow_index if present */
-    if ((ctx->flags & FLOW_FLAG_IN_SHADOW) && ctx->pid != 0) {
-        shadow_index_remove(&mgr->shadow_idx, ctx->pid, ctx->ssl_ctx);
+    /* Remove from shadow_index if present - uses CK hs (single-writer safe) */
+    if ((atomic_load(&ctx->flags) & FLOW_FLAG_IN_SHADOW) && ctx->pid != 0) {
+        ck_shadow_index_remove(&mgr->shadow_idx, ctx->pid, ctx->ssl_ctx);
     }
 
     /* Free to pool (deferred) */
@@ -1019,10 +670,22 @@ void flow_update_xdp(flow_context_t *ctx, const xdp_packet_event_t *evt) {
     /* Interface info */
     ctx->ifindex = evt->ifindex;
     ctx->xdp_category = evt->category;
-    ctx->flags |= FLOW_FLAG_HAS_XDP;
+    ctx->xdp_direction = evt->direction;  /* Store direction (1=ingress, 2=egress) */
+
+    /* Convert ifindex to interface name if not already done */
+    if (evt->ifindex > 0 && ctx->ifname[0] == '\0') {
+        if_indextoname(evt->ifindex, ctx->ifname);
+    }
+
+    /*
+     * CRITICAL: Set HAS_XDP flag with release semantics.
+     * Workers use acquire semantics when reading this flag.
+     * This ensures XDP metadata writes above are visible to workers.
+     */
+    atomic_fetch_or_explicit(&ctx->flags, FLOW_FLAG_HAS_XDP, memory_order_release);
 
     /* Update state if we have both views */
-    if ((ctx->flags & FLOW_FLAG_HAS_SSL) && ctx->state == FLOW_STATE_INIT) {
+    if ((atomic_load(&ctx->flags) & FLOW_FLAG_HAS_SSL) && ctx->state == FLOW_STATE_INIT) {
         ctx->state = FLOW_STATE_ACTIVE;
     }
 }
@@ -1112,7 +775,7 @@ int flow_init_parser(flow_context_t *ctx, const char *alpn) {
         return -1;
     }
 
-    if (ctx->flags & FLOW_FLAG_PARSER_INIT) {
+    if (atomic_load(&ctx->flags) & FLOW_FLAG_PARSER_INIT) {
         return 0;
     }
 
@@ -1138,7 +801,7 @@ int flow_init_parser(flow_context_t *ctx, const char *alpn) {
         ctx->proto = FLOW_PROTO_OTHER;
     }
 
-    ctx->flags |= FLOW_FLAG_PARSER_INIT;
+    atomic_fetch_or(&ctx->flags, FLOW_FLAG_PARSER_INIT);
     return 0;
 }
 
@@ -1147,11 +810,15 @@ void flow_free_resources(flow_context_t *ctx) {
         return;
     }
 
+    /*
+     * Free protocol-specific resources based on ctx->proto.
+     *
+     * CRITICAL: The parser field is a UNION - h1 and h2 share memory.
+     * We MUST check proto before accessing union members, otherwise
+     * we interpret h1 data as h2 pointers (or vice versa) and crash.
+     */
     if (ctx->proto == FLOW_PROTO_HTTP2) {
-        for (int32_t i = 0; i < FLOW_MAX_H2_STREAMS; i++) {
-            flow_txn_free_body(&ctx->parser.h2.streams[i]);
-        }
-
+        /* Free HTTP/2 resources */
         if (ctx->parser.h2.session) {
             nghttp2_session_del(ctx->parser.h2.session);
             ctx->parser.h2.session = NULL;
@@ -1168,9 +835,16 @@ void flow_free_resources(flow_context_t *ctx) {
             http2_free_callback_ctx(ctx->parser.h2.callback_ctx);
             ctx->parser.h2.callback_ctx = NULL;
         }
+
+        /* Free H2 stream bodies if any were allocated */
+        for (int32_t i = 0; i < FLOW_MAX_H2_STREAMS; i++) {
+            flow_txn_free_body(&ctx->parser.h2.streams[i]);
+        }
     } else if (ctx->proto == FLOW_PROTO_HTTP1) {
+        /* Free HTTP/1 transaction body if allocated */
         flow_txn_free_body(&ctx->parser.h1.txn);
     }
+    /* FLOW_PROTO_UNKNOWN and FLOW_PROTO_OTHER have no allocated resources */
 
     if (ctx->body.buffer) {
         free(ctx->body.buffer);
@@ -1178,7 +852,7 @@ void flow_free_resources(flow_context_t *ctx) {
     }
 
     ctx->state = FLOW_STATE_CLOSED;
-    ctx->flags = 0;
+    atomic_store(&ctx->flags, 0);
 }
 
 /*============================================================================
@@ -1441,6 +1115,7 @@ void flow_manager_get_stats(flow_manager_t *mgr, flow_pool_stats_t *stats) {
     stats->shadow_count = atomic_load(&mgr->shadow_idx.count);
     stats->shadow_hits = atomic_load(&mgr->shadow_idx.hits);
     stats->shadow_promotions = atomic_load(&mgr->shadow_idx.promotions);
+    stats->shadow_merges = atomic_load(&mgr->shadow_idx.merges);
 }
 
 void flow_manager_print_stats(flow_manager_t *mgr, bool debug_mode) {

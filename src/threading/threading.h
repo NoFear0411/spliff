@@ -57,8 +57,15 @@
 
 #include "../include/spliff.h"
 #include "../bpf/probe_handler.h"
+#include "../bpf/bpf_loader.h"  /* For bpf_loader_t (XDP polling in dispatcher) */
 #include "../protocol/http2.h"  /* For h2_stream_state_t, frame types */
 #include "../correlation/flow_context.h"  /* For flow_manager_t (Shared Pool) */
+
+/**
+ * @brief Per-worker XDP event ring for SPSC delivery
+ * @see xdp_ring.h for full structure definition
+ */
+typedef struct xdp_ring xdp_ring_t;
 
 /**
  * @defgroup threading_config Threading Configuration Constants
@@ -139,6 +146,97 @@
 /** @} */ /* end threading_config group */
 
 /**
+ * @defgroup deferred_queue Deferred Display Queue
+ * @brief Per-worker queue for XDP correlation synchronization
+ *
+ * Implements the "Slide & Flush" strategy with adaptive timeout for
+ * guaranteed XDP correlation on all HTTP output. Messages wait up to
+ * 100ms for XDP data (20ms under load); if it doesn't arrive, they're
+ * displayed with XDP_NOT_FOUND status.
+ *
+ * @par Design Rationale
+ * The User-space Probe (SSL) and XDP program run on different CPU cores
+ * and feed into different ring buffers. HTTP data often arrives in
+ * user-space before XDP updates the flow. This queue synchronizes the
+ * two asynchronous streams.
+ *
+ * @par Thread Safety
+ * Each worker owns its queue (SPSC pattern) - no locks needed.
+ * @{
+ */
+
+/** @brief Maximum entries before force flush triggers */
+#define DEFERRED_QUEUE_MAX_ENTRIES  5000
+
+/** @brief Normal timeout (100ms) */
+#define DEFERRED_TIMEOUT_NORMAL_NS  (100ULL * 1000000)
+
+/** @brief Reduced timeout under load (20ms) - backpressure valve */
+#define DEFERRED_TIMEOUT_LOAD_NS    (20ULL * 1000000)
+
+/** @brief Queue fullness threshold for adaptive timeout (80%) */
+#define DEFERRED_LOAD_THRESHOLD     0.8
+
+/** @brief Batch size for force flush (10% of max) */
+#define DEFERRED_FLUSH_BATCH        500
+
+/** @brief Pre-allocated free list entries per worker */
+#define DEFERRED_PREALLOC_ENTRIES   256
+
+/**
+ * @brief XDP correlation status for deferred messages
+ */
+typedef enum xdp_status {
+    XDP_PENDING = 0,     /**< Waiting for XDP info */
+    XDP_MATCHED,         /**< XDP info arrived in time */
+    XDP_NOT_FOUND,       /**< Timeout - XDP never arrived */
+    XDP_FORCED_FLUSH     /**< Queue overflow - forced display */
+} xdp_status_t;
+
+/**
+ * @brief Deferred display queue entry
+ *
+ * Holds HTTP messages waiting for XDP correlation data.
+ * Uses intrusive linked list for O(1) enqueue/dequeue.
+ */
+typedef struct deferred_msg {
+    http_message_t msg;           /**< Copy of HTTP message data */
+    uint64_t enqueue_ts;          /**< Timestamp when queued (nanoseconds) */
+    flow_context_t *flow_ctx;     /**< Flow context for XDP flag check */
+    uint32_t expected_gen;        /**< Generation counter for stale detection */
+    struct deferred_msg *next;    /**< Next entry in list */
+} deferred_msg_t;
+
+/**
+ * @brief Deferred queue health statistics
+ *
+ * Tracks queue performance for diagnostics. All counters are atomic
+ * for thread-safe aggregation at shutdown.
+ */
+typedef struct deferred_stats {
+    _Atomic uint64_t matched_xdp;     /**< XDP arrived in time */
+    _Atomic uint64_t timed_out;       /**< Timeout reached, no XDP */
+    _Atomic uint64_t forced_flush;    /**< Queue overflow forced display */
+    _Atomic uint64_t total_deferred;  /**< Total messages queued */
+} deferred_stats_t;
+
+/**
+ * @brief Per-worker deferred display queue
+ *
+ * SPSC (Single-Producer Single-Consumer) queue owned by each worker.
+ * No locks needed - only the owning worker accesses the queue.
+ */
+typedef struct deferred_queue {
+    deferred_msg_t *head;         /**< Queue head (oldest entry) */
+    deferred_msg_t *tail;         /**< Queue tail (newest entry) */
+    size_t count;                 /**< Current queue depth */
+    deferred_msg_t *free_list;    /**< Pre-allocated free entries */
+    deferred_stats_t stats;       /**< Health statistics */
+} deferred_queue_t;
+
+/** @} */ /* end deferred_queue */
+
+/**
  * @defgroup threading_forward Forward Declarations
  * @brief External types used by threading module
  * @{
@@ -160,6 +258,73 @@ struct nghttp2_session_callbacks; /**< nghttp2 callback table */
 /* Note: h2_stream_state_t and H2_BODY_BUFFER_SIZE are defined in http2.h */
 
 /**
+ * @brief HTTP/2 connection lifecycle state (atomic state machine)
+ *
+ * Implements a state machine for safe concurrent access between
+ * dispatcher (cleanup by PID) and worker (allocation/use) threads.
+ *
+ * @par State Transitions:
+ * @code
+ *   FREE ──CAS──► INITIALIZING ──CAS──► ACTIVE ──exchange──► DYING
+ *     ▲                │                                        │
+ *     │                │ (CAS fails = race)                     │
+ *     │                ▼                                        ▼
+ *     └────────── self-cleanup                          worker moves to
+ *                                                       shadow queue, then
+ *                                                       slot → FREE
+ * @endcode
+ */
+typedef enum {
+    H2_CONN_STATE_FREE = 0,         /**< Slot available for allocation */
+    H2_CONN_STATE_INITIALIZING,     /**< Worker allocating resources (owns cleanup) */
+    H2_CONN_STATE_ACTIVE,           /**< Connection ready for use */
+    H2_CONN_STATE_DYING             /**< Dispatcher marked for cleanup */
+} h2_conn_state_t;
+
+/**
+ * @brief Deferred cleanup item for shadow queue
+ *
+ * Holds HTTP/2 resources moved from connection slot for amortized cleanup.
+ */
+typedef struct {
+    struct nghttp2_hd_inflater *inflater;   /**< HPACK inflater to free */
+    uint8_t *response_buf;                  /**< Response buffer to free */
+} h2_deferred_cleanup_t;
+
+/**
+ * @brief Shadow cleanup queue for amortized resource freeing
+ *
+ * Per-worker queue that holds HTTP/2 resources scheduled for cleanup.
+ * Workers push dying connections here during event processing and
+ * pop/free during quiet phases of the adaptive spin loop.
+ *
+ * @par Design:
+ * - Power-of-2 size for fast bitwise masking
+ * - Single-writer (owning worker) - no atomics needed
+ * - Amortized cleanup prevents latency spikes
+ *
+ * @par Backpressure:
+ * When queue fills up, cleanup rate increases proportionally.
+ */
+/** @brief Size of the shadow queue (must be power of 2) */
+#define H2_SHADOW_QUEUE_SIZE 1024
+
+/** @brief Bitmask for fast modulo on shadow queue index */
+#define H2_SHADOW_QUEUE_MASK (H2_SHADOW_QUEUE_SIZE - 1)
+
+/**
+ * @brief Ring buffer queue for deferred HTTP/2 cleanup operations
+ *
+ * Lock-free single-producer single-consumer queue for scheduling
+ * HTTP/2 connection cleanup after a grace period.
+ */
+typedef struct {
+    h2_deferred_cleanup_t items[H2_SHADOW_QUEUE_SIZE]; /**< Cleanup items */
+    uint32_t head;  /**< Write position (next push slot) */
+    uint32_t tail;  /**< Read position (next pop slot) */
+} h2_shadow_queue_t;
+
+/**
  * @brief Per-connection HTTP/2 session state (worker-local)
  *
  * Each worker maintains its own pool of HTTP/2 connections. Connection
@@ -170,11 +335,16 @@ struct nghttp2_session_callbacks; /**< nghttp2 callback table */
  * - server_session parses client requests (we're acting as "server")
  * - response_inflater decodes server response headers (separate HPACK context)
  * - This dual-context approach handles both directions of HTTP/2 traffic
+ *
+ * @par Atomic State Machine:
+ * The state field uses atomic operations to coordinate between dispatcher
+ * (marking connections for cleanup) and workers (allocating/using connections).
+ * This eliminates the use-after-free race condition without locking.
  */
 typedef struct h2_connection_local {
     uint32_t pid;           /**< Process ID owning this connection */
     uint64_t ssl_ctx;       /**< SSL context pointer (connection identifier) */
-    bool active;            /**< true if slot is in use */
+    _Atomic h2_conn_state_t state;  /**< Atomic lifecycle state (replaces bool active) */
 
     /** nghttp2 server session for parsing client->server requests */
     struct nghttp2_session *server_session;
@@ -499,6 +669,7 @@ typedef struct worker_state {
     h2_connection_local_t *h2_connections;  /**< Connection state array */
     int h2_connection_count;                /**< Active connections */
     int h2_connection_capacity;             /**< Array capacity */
+    h2_shadow_queue_t h2_shadow_queue;      /**< Deferred cleanup queue */
     /** @} */
 
     /** @name HTTP/2 Stream Pool */
@@ -621,6 +792,23 @@ typedef struct worker_ctx {
     object_pool_t output_pool;  /**< Pool for outgoing formatted messages */
     /** @} */
 
+    /** @name Deferred Display Queue (XDP Correlation) */
+    /** @{ */
+    deferred_queue_t deferred;  /**< Queue for XDP correlation synchronization */
+    /** @} */
+
+    /** @name Per-Worker XDP SPSC Ring (Phase 3 Fix) */
+    /** @{ */
+    /**
+     * @brief SPSC ring for XDP events from dispatcher
+     *
+     * Workers receive XDP events via this ring instead of the dispatcher
+     * handling them directly. This ensures HAS_XDP is set before HTTP parsing.
+     * Shares the worker's wakeup_fd for instant signaling.
+     */
+    xdp_ring_t *xdp_ring;
+    /** @} */
+
     /** @name Statistics (atomic for thread-safe reads) */
     /** @{ */
     _Atomic uint64_t events_processed;  /**< Total events handled */
@@ -710,7 +898,8 @@ typedef void (*process_lifecycle_cb_t)(const ssl_data_event_t *event, void *ctx)
 typedef struct dispatcher_ctx {
     pthread_t thread;           /**< Dispatcher thread handle */
 
-    probe_handler_t *handler;   /**< BPF ring buffer handle */
+    probe_handler_t *handler;   /**< BPF ring buffer handle (SSL events) */
+    bpf_loader_t *loader;       /**< BPF loader handle (XDP events) */
 
     /** @name Worker Array */
     /** @{ */
@@ -732,6 +921,7 @@ typedef struct dispatcher_ctx {
 
     /** @name XDP Statistics */
     /** @{ */
+    _Atomic uint64_t xdp_events_received;   /**< Total XDP events received from ring buffer */
     _Atomic uint64_t xdp_flows_discovered;  /**< New flows detected */
     _Atomic uint64_t xdp_flows_terminated;  /**< Flows closed/timed out */
     _Atomic uint64_t xdp_ambiguous_events;  /**< Ambiguous protocol events */
@@ -742,6 +932,20 @@ typedef struct dispatcher_ctx {
     /** @name Shared Pool Flow Manager */
     /** @{ */
     flow_manager_t flow_mgr;    /**< Unified pool with dual indexes */
+    /** @} */
+
+    /** @name XDP Poll Urgency */
+    /** @{ */
+    /**
+     * @brief Request immediate XDP poll
+     *
+     * Set to true when SSL PROMOTE finds no XDP flow for a cookie.
+     * Main thread checks this flag before sleeping between XDP polls.
+     * If set, main thread polls XDP immediately (skips usleep).
+     * This fixes the timing race where SSL events arrive before XDP
+     * events are polled from the ring buffer.
+     */
+    _Atomic bool xdp_poll_urgent;
     /** @} */
 
     _Atomic bool running;       /**< false signals thread to exit */
@@ -756,14 +960,15 @@ typedef struct dispatcher_ctx {
  * @brief Initialize dispatcher context
  *
  * @param[out] ctx         Dispatcher context to initialize
- * @param[in]  handler     BPF ring buffer handle
+ * @param[in]  handler     BPF ring buffer handle (SSL events)
+ * @param[in]  loader      BPF loader handle (XDP events), may be NULL
  * @param[in]  workers     Array of worker contexts
  * @param[in]  num_workers Number of workers
  *
  * @return 0 on success, -1 on failure
  */
 int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
-                    worker_ctx_t *workers, int num_workers);
+                    bpf_loader_t *loader, worker_ctx_t *workers, int num_workers);
 
 /**
  * @brief Cleanup dispatcher context
@@ -974,11 +1179,12 @@ int threading_init(threading_mgr_t *mgr, int num_workers, bool pin_cores);
  * Starts dispatcher, workers, and output threads.
  *
  * @param[in] mgr     Initialized manager
- * @param[in] handler BPF ring buffer handle for dispatcher
+ * @param[in] handler BPF ring buffer handle for dispatcher (SSL events)
+ * @param[in] loader  BPF loader handle for XDP events (may be NULL)
  *
  * @return 0 on success, -1 on failure
  */
-int threading_start(threading_mgr_t *mgr, probe_handler_t *handler);
+int threading_start(threading_mgr_t *mgr, probe_handler_t *handler, bpf_loader_t *loader);
 
 /**
  * @brief Request graceful shutdown
@@ -1249,6 +1455,9 @@ typedef struct {
 
     /* Flow pool (from shared pool architecture) */
     flow_pool_stats_t flow_pool;    /**< Pool and index statistics */
+
+    /* Deferred display queue (XDP correlation) */
+    deferred_stats_t deferred;      /**< XDP correlation timing statistics */
 } threading_stats_t;
 
 /**
@@ -1284,6 +1493,14 @@ void dispatcher_get_stats(dispatcher_ctx_t *ctx, uint64_t *dispatched,
 void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
                                uint64_t *flows_terminated, uint64_t *ambiguous,
                                uint64_t *dropped);
+
+/**
+ * @brief Get total XDP events received by dispatcher
+ *
+ * @param[in] ctx Dispatcher context
+ * @return Total events received from ring buffer, 0 if ctx is NULL
+ */
+uint64_t dispatcher_get_xdp_events_received(dispatcher_ctx_t *ctx);
 
 /**
  * @brief Get output thread statistics
