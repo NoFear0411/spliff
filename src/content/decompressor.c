@@ -50,11 +50,17 @@
  * collisions with system zlib. These macros provide a unified interface.
  *----------------------------------------------------------------------------*/
 #include <zlib-ng.h>
-/* Native zlib-ng API uses zng_ prefix */
-#define z_stream        zng_stream
-#define inflateInit2    zng_inflateInit2
-#define inflate         zng_inflate
-#define inflateEnd      zng_inflateEnd
+/**
+ * @name zlib-ng Compatibility Macros
+ * Native zlib-ng API uses zng_ prefix. These macros provide a unified
+ * interface matching the standard zlib API names.
+ * @{
+ */
+#define z_stream        zng_stream      /**< @brief Stream structure alias */
+#define inflateInit2    zng_inflateInit2 /**< @brief Init with window bits */
+#define inflate         zng_inflate      /**< @brief Decompress data */
+#define inflateEnd      zng_inflateEnd   /**< @brief Cleanup stream */
+/** @} */
 
 #include <zstd.h>
 #include <brotli/decode.h>

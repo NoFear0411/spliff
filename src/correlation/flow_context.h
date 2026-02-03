@@ -366,7 +366,9 @@ typedef struct flow_context {
     flow_proto_t proto;             /**< Detected protocol */
     flow_state_t state;             /**< Lifecycle state */
     uint8_t xdp_category;           /**< XDP protocol category */
-    uint8_t flags;                  /**< Bit flags (see below) */
+    uint8_t xdp_direction;          /**< XDP packet direction (1=ingress, 2=egress) */
+    _Atomic uint8_t flags;          /**< Bit flags - atomic for thread safety */
+    uint8_t _pad_flags;             /**< Padding for alignment */
     uint32_t uid;                   /**< User ID */
 
     /*=== Protocol Parser (union to save memory) ===*/
@@ -408,6 +410,25 @@ typedef struct flow_context {
      */
     _Atomic uint32_t home_worker_id;
 
+    /*=== Handshake Deduplication (Fix #2) ===*/
+    /**
+     * @brief Last handshake event timestamp for deduplication
+     *
+     * SSL_do_handshake() can be called multiple times during TLS negotiation
+     * (WANT_READ/WANT_WRITE retries). Track the last handshake timestamp to
+     * deduplicate events within a 100ms window.
+     */
+    uint64_t last_handshake_ns;
+
+    /**
+     * @brief True if handshake completion has been displayed
+     *
+     * Atomic flag to prevent duplicate handshake output when SSL_do_handshake()
+     * is called multiple times during TLS negotiation. Uses atomic_exchange
+     * to ensure only one thread displays the handshake event.
+     */
+    _Atomic bool handshake_displayed;
+
 } __attribute__((aligned(64))) flow_context_t;
 
 /**
@@ -432,74 +453,41 @@ enum flow_flags {
 /** @} */
 
 /*============================================================================
- * Index Structures
+ * Index Structures (Thread-Safe CK Hash Sets)
  *============================================================================*/
 
 /**
  * @defgroup flow_indexes Index Structures
- * @brief Incrementally-resizing hash tables mapping keys to flow pointers
+ * @brief Thread-safe SPMC hash tables using CK hs
+ *
+ * @par Thread Safety Model (SPMC)
+ * These indexes use Concurrency Kit's ck_hs for lock-free SPMC access:
+ * - Single-Producer: Only dispatcher thread performs writes (insert/remove)
+ * - Multiple-Consumer: Workers can safely lookup during writes/resize
+ *
+ * This architectural constraint is CRITICAL for thread safety. All functions
+ * that modify the indexes (insert, remove) MUST only be called from the
+ * dispatcher thread.
+ *
+ * @see ck_cookie_index.h for cookie index implementation
+ * @see ck_shadow_index.h for shadow index implementation
  * @{
  */
 
-/**
- * @brief Cookie index entry
- *
- * Maps socket_cookie to flow_context_t pointer. Uses open addressing with
- * linear probing for collision resolution.
- */
-typedef struct {
-    uint64_t cookie;                /**< Socket cookie (key) */
-    flow_context_t *ctx;            /**< Flow context pointer (value) */
-} cookie_entry_t;
+#include "ck_cookie_index.h"
+#include "ck_shadow_index.h"
 
 /**
- * @brief Cookie index hash table with incremental resizing
- *
- * Primary index for fast lookups when socket_cookie is known.
- * Grows incrementally: when load factor exceeds 75%, a new table
- * is allocated and entries migrate in batches of FLOW_INDEX_GROW_BATCH
- * per insert/lookup operation. Zero latency spikes.
+ * @brief Type alias for CK-based cookie index
+ * @see ck_cookie_index.h
  */
-typedef struct {
-    cookie_entry_t *buckets;        /**< Active table */
-    cookie_entry_t *old_buckets;    /**< Previous table (NULL if not migrating) */
-    size_t capacity;                /**< Active table size */
-    size_t old_capacity;            /**< Previous table size (0 if done) */
-    size_t migrate_pos;             /**< Next old bucket to migrate */
-    _Atomic uint64_t count;         /**< Active entries */
-    _Atomic uint64_t hits;          /**< Successful lookups */
-    _Atomic uint64_t misses;        /**< Failed lookups */
-} cookie_index_t;
+typedef ck_cookie_index_t cookie_index_t;
 
 /**
- * @brief Shadow index entry
- *
- * Maps (pid, ssl_ctx) pair to flow_context_t pointer. Used as fallback when
- * socket_cookie is not yet known.
+ * @brief Type alias for CK-based shadow index
+ * @see ck_shadow_index.h
  */
-typedef struct {
-    uint32_t pid;                   /**< Process ID (key part 1) */
-    uint64_t ssl_ctx;               /**< SSL context (key part 2) */
-    flow_context_t *ctx;            /**< Flow context pointer (value) */
-} shadow_entry_t;
-
-/**
- * @brief Shadow index hash table with incremental resizing
- *
- * Fallback index for early SSL events before socket_cookie is known.
- * Every flow has an entry here; not all flows are in cookie_index.
- * Same incremental resize strategy as cookie_index.
- */
-typedef struct {
-    shadow_entry_t *buckets;        /**< Active table */
-    shadow_entry_t *old_buckets;    /**< Previous table (NULL if not migrating) */
-    size_t capacity;                /**< Active table size */
-    size_t old_capacity;            /**< Previous table size (0 if done) */
-    size_t migrate_pos;             /**< Next old bucket to migrate */
-    _Atomic uint64_t count;         /**< Active entries */
-    _Atomic uint64_t hits;          /**< Successful lookups */
-    _Atomic uint64_t promotions;    /**< Flows promoted to cookie_index */
-} shadow_index_t;
+typedef ck_shadow_index_t shadow_index_t;
 
 /** @} */
 
@@ -625,117 +613,48 @@ void flow_pool_free(flow_pool_t *pool, flow_context_t *ctx);
  */
 void flow_pool_drain_deferred(flow_pool_t *pool, uint64_t now);
 
+/**
+ * @brief Force drain all flows at shutdown
+ *
+ * Immediately frees ALL flows in active and deferred lists without
+ * waiting for grace periods. Use only at program shutdown.
+ *
+ * @param pool  The flow pool to drain
+ */
+void flow_pool_force_drain(flow_pool_t *pool);
+
 /** @} */
 
 /*============================================================================
- * Index Operations
+ * Index Operations (Delegated to CK Wrappers)
  *============================================================================*/
 
 /**
  * @defgroup flow_index_ops Index Operations
- * @brief Hash table operations for both indexes
+ * @brief Thread-safe hash table operations delegated to CK wrappers
+ *
+ * @par Thread Safety
+ * All write operations (init, cleanup, insert, remove) MUST only be called
+ * from the dispatcher thread. Lookup operations are safe from any thread.
  * @{
  */
 
-/**
- * @brief Initialize cookie index
+/*
+ * Cookie index operations are now provided by ck_cookie_index.h:
+ * - ck_cookie_index_init()
+ * - ck_cookie_index_cleanup()
+ * - ck_cookie_index_insert()
+ * - ck_cookie_index_lookup()
+ * - ck_cookie_index_remove()
  *
- * @param idx       Index to initialize
- * @param capacity  Initial number of buckets
- * @return 0 on success, -1 on failure
+ * Shadow index operations are now provided by ck_shadow_index.h:
+ * - ck_shadow_index_init()
+ * - ck_shadow_index_cleanup()
+ * - ck_shadow_index_insert()
+ * - ck_shadow_index_lookup()
+ * - ck_shadow_index_remove()
+ * - ck_shadow_find_by_cookie()
  */
-int cookie_index_init(cookie_index_t *idx, size_t capacity);
-
-/**
- * @brief Cleanup cookie index
- *
- * @param idx  Index to cleanup
- */
-void cookie_index_cleanup(cookie_index_t *idx);
-
-/**
- * @brief Insert into cookie index
- *
- * Drives incremental migration if in progress. Triggers growth at 75% load.
- *
- * @param idx     The index
- * @param cookie  Socket cookie (key)
- * @param ctx     Flow context pointer (value)
- * @return 0 on success, -1 if full or allocation failure
- */
-int cookie_index_insert(cookie_index_t *idx, uint64_t cookie, flow_context_t *ctx);
-
-/**
- * @brief Lookup in cookie index
- *
- * Searches active table first, then old table if migration in progress.
- * Drives incremental migration on each call.
- *
- * @param idx     The index
- * @param cookie  Socket cookie to find
- * @return flow_context_t pointer, or NULL if not found
- */
-flow_context_t *cookie_index_lookup(cookie_index_t *idx, uint64_t cookie);
-
-/**
- * @brief Remove from cookie index
- *
- * @param idx     The index
- * @param cookie  Socket cookie to remove
- */
-void cookie_index_remove(cookie_index_t *idx, uint64_t cookie);
-
-/**
- * @brief Initialize shadow index
- *
- * @param idx       Index to initialize
- * @param capacity  Initial number of buckets
- * @return 0 on success, -1 on failure
- */
-int shadow_index_init(shadow_index_t *idx, size_t capacity);
-
-/**
- * @brief Cleanup shadow index
- *
- * @param idx  Index to cleanup
- */
-void shadow_index_cleanup(shadow_index_t *idx);
-
-/**
- * @brief Insert into shadow index
- *
- * Drives incremental migration if in progress. Triggers growth at 75% load.
- *
- * @param idx      The index
- * @param pid      Process ID (key part 1)
- * @param ssl_ctx  SSL context (key part 2)
- * @param ctx      Flow context pointer (value)
- * @return 0 on success, -1 if full or allocation failure
- */
-int shadow_index_insert(shadow_index_t *idx, uint32_t pid,
-                        uint64_t ssl_ctx, flow_context_t *ctx);
-
-/**
- * @brief Lookup in shadow index
- *
- * Searches active table first, then old table if migration in progress.
- *
- * @param idx      The index
- * @param pid      Process ID
- * @param ssl_ctx  SSL context
- * @return flow_context_t pointer, or NULL if not found
- */
-flow_context_t *shadow_index_lookup(shadow_index_t *idx, uint32_t pid,
-                                     uint64_t ssl_ctx);
-
-/**
- * @brief Remove from shadow index
- *
- * @param idx      The index
- * @param pid      Process ID
- * @param ssl_ctx  SSL context
- */
-void shadow_index_remove(shadow_index_t *idx, uint32_t pid, uint64_t ssl_ctx);
 
 /** @} */
 
@@ -767,6 +686,16 @@ int flow_manager_init(flow_manager_t *mgr);
  * @param mgr  Manager to cleanup
  */
 void flow_manager_cleanup(flow_manager_t *mgr);
+
+/**
+ * @brief Force drain all flows at shutdown
+ *
+ * Wrapper for flow_pool_force_drain() that operates on the manager's pool.
+ * Immediately frees all flows without grace periods.
+ *
+ * @param mgr  Manager whose pool to drain
+ */
+void flow_manager_force_drain(flow_manager_t *mgr);
 
 /**
  * @brief Correlation path used for flow lookup
@@ -888,6 +817,7 @@ typedef struct {
     uint64_t shadow_count;          /**< Entries in shadow index */
     uint64_t shadow_hits;           /**< Successful shadow lookups */
     uint64_t shadow_promotions;     /**< Flows promoted to cookie index */
+    uint64_t shadow_merges;         /**< XDP flows merged into SSL flows */
 } flow_pool_stats_t;
 
 /**
@@ -992,15 +922,76 @@ void flow_free_resources(flow_context_t *ctx);
  * @{
  */
 
+/**
+ * @brief Initialize HTTP/2 stream pool for a flow context
+ * @param[in,out] ctx Flow context to initialize
+ */
 void flow_h2_init_stream_pool(flow_context_t *ctx);
+
+/**
+ * @brief Allocate HTTP/2 stream transaction
+ * @param[in,out] ctx       Flow context
+ * @param[in]     stream_id HTTP/2 stream identifier
+ * @return Transaction pointer, or NULL on failure
+ */
 flow_transaction_t *flow_h2_alloc_stream(flow_context_t *ctx, int32_t stream_id);
+
+/**
+ * @brief Find existing HTTP/2 stream transaction
+ * @param[in] ctx       Flow context
+ * @param[in] stream_id HTTP/2 stream identifier
+ * @return Transaction pointer, or NULL if not found
+ */
 flow_transaction_t *flow_h2_find_stream(flow_context_t *ctx, int32_t stream_id);
+
+/**
+ * @brief Free HTTP/2 stream transaction
+ * @param[in,out] ctx Flow context
+ * @param[in]     txn Transaction to free
+ */
 void flow_h2_free_stream(flow_context_t *ctx, flow_transaction_t *txn);
+
+/**
+ * @brief Reap idle/ghost HTTP/2 streams
+ * @param[in,out] ctx        Flow context
+ * @param[in]     current_ms Current monotonic time in milliseconds
+ * @return Number of streams reaped
+ */
 int flow_h2_reap_ghosts(flow_context_t *ctx, uint32_t current_ms);
+
+/**
+ * @brief Reset HTTP/1 transaction state for new request
+ * @param[in,out] ctx Flow context
+ */
 void flow_h1_reset_txn(flow_context_t *ctx);
+
+/**
+ * @brief Allocate body buffer for transaction
+ * @param[in,out] txn      Transaction
+ * @param[in]     capacity Initial buffer capacity
+ * @return 0 on success, -1 on failure
+ */
 int flow_txn_alloc_body(flow_transaction_t *txn, size_t capacity);
+
+/**
+ * @brief Append data to transaction body buffer
+ * @param[in,out] txn  Transaction
+ * @param[in]     data Data to append
+ * @param[in]     len  Data length
+ * @return 0 on success, -1 on failure
+ */
 int flow_txn_append_body(flow_transaction_t *txn, const uint8_t *data, size_t len);
+
+/**
+ * @brief Free transaction body buffer
+ * @param[in,out] txn Transaction
+ */
 void flow_txn_free_body(flow_transaction_t *txn);
+
+/**
+ * @brief Get current monotonic time in milliseconds
+ * @return Monotonic milliseconds since boot
+ */
 uint32_t flow_get_monotonic_ms(void);
 
 /** @} */

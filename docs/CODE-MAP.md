@@ -1,4 +1,4 @@
-# CODE-MAP.md - spliff v0.9.8 Comprehensive Code Map
+# CODE-MAP.md - spliff v0.9.9 Comprehensive Code Map
 
 > **Purpose:** AI-friendly and human-readable architecture reference for understanding, maintaining, and extending the spliff codebase.
 
@@ -16,7 +16,7 @@
 
 ## Project Overview
 
-**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.8 features:
+**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.9 features:
 
 - **Dynamic Flow Pool**: On-demand allocation via jemalloc with incremental hash table resizing
 - **Embedded BPF Skeleton**: CO-RE BTF bytecode embedded in binary, strip-safe
@@ -68,10 +68,18 @@ spliff/
 │   │   └── signatures.h            # Signature database and API
 │   ├── output/                     # Terminal output formatting and colors
 │   │   ├── display.c               # Colored output, latency formatting
-│   │   └── display.h               # Display API
+│   │   ├── display.h               # Display API
+│   │   ├── logger.c                # Async MPSC logging pipeline (NEW v0.9.9)
+│   │   ├── logger.h                # Logger API (NEW v0.9.9)
+│   │   ├── stats.c                 # Session statistics display (NEW v0.9.9)
+│   │   └── stats.h                 # Stats API (NEW v0.9.9)
 │   ├── correlation/                # XDP-SSL correlation and flow pooling
 │   │   ├── flow_context.c          # Dynamic pool, dual-index lookup, deferred free
-│   │   └── flow_context.h          # flow_context_t, pool types, index types
+│   │   ├── flow_context.h          # flow_context_t, pool types, index types
+│   │   ├── ck_cookie_index.c       # CK cookie hash table (NEW v0.9.9)
+│   │   ├── ck_cookie_index.h       # Cookie index API (NEW v0.9.9)
+│   │   ├── ck_shadow_index.c       # CK shadow hash table (NEW v0.9.9)
+│   │   └── ck_shadow_index.h       # Shadow index API (NEW v0.9.9)
 │   ├── threading/                  # Multi-threaded event processing
 │   │   ├── threading.h             # Threading API, worker struct, ring buffers
 │   │   ├── dispatcher.c            # BPF ring consumer, flow routing
@@ -79,7 +87,11 @@ spliff/
 │   │   ├── worker.c                # Worker thread main loop
 │   │   ├── output.c                # Output serialization thread
 │   │   ├── state.c                 # Per-worker state (H2 pools, ALPN cache)
-│   │   └── pool.c                  # Lock-free object pool
+│   │   ├── pool.c                  # Lock-free object pool
+│   │   ├── deferred.c              # Per-worker deferred display queue (NEW v0.9.9)
+│   │   ├── deferred.h              # Deferred queue API (NEW v0.9.9)
+│   │   ├── xdp_ring.c              # Per-worker XDP SPSC ring (NEW v0.9.9)
+│   │   └── xdp_ring.h              # XDP ring API (NEW v0.9.9)
 │   └── util/                       # Utility functions
 │       ├── safe_str.c              # Safe string operations
 │       └── safe_str.h              # String API
@@ -148,7 +160,7 @@ spliff/
 | `MAX_HEADERS` | 128 |
 | `MAX_BODY_BUFFER` | 1 MB |
 | `XDP_PAYLOAD_MAX` | 128 bytes |
-| `SPLIFF_VERSION` | "0.9.8" |
+| `SPLIFF_VERSION` | "0.9.9" |
 
 ---
 
@@ -358,6 +370,42 @@ typedef struct flow_context {
 
 ---
 
+#### `src/correlation/ck_cookie_index.c` (~209 lines) (NEW v0.9.9)
+**Purpose:** Lock-free cookie hash table using Concurrency Kit
+
+**Key Features:**
+- SPMC-safe lookups (multiple workers, single dispatcher writer)
+- Incremental resize with tombstone GC
+- ~256 initial capacity, grows at 75% load
+
+**Key Functions:**
+| Function | Purpose |
+|----------|---------|
+| `ck_cookie_index_init()` | Initialize CK hash set |
+| `ck_cookie_index_insert()` | Insert cookie → flow mapping |
+| `ck_cookie_index_lookup()` | Lock-free lookup by cookie |
+| `ck_cookie_index_remove()` | Remove entry |
+
+---
+
+#### `src/correlation/ck_shadow_index.c` (~256 lines) (NEW v0.9.9)
+**Purpose:** Lock-free shadow hash table for (pid, ssl_ctx) lookup
+
+**Key Features:**
+- Used before socket_cookie is known
+- Same SPMC-safe design as cookie index
+- Flows promoted to cookie index via `flow_promote_cookie()`
+
+**Key Functions:**
+| Function | Purpose |
+|----------|---------|
+| `ck_shadow_index_init()` | Initialize CK hash set |
+| `ck_shadow_index_insert()` | Insert (pid, ssl_ctx) → flow |
+| `ck_shadow_index_lookup()` | Lock-free lookup |
+| `ck_shadow_index_remove()` | Remove entry |
+
+---
+
 ### Threading
 
 #### `src/threading/threading.h` (~1376 lines)
@@ -414,12 +462,83 @@ typedef struct flow_context {
 
 ---
 
+#### `src/threading/deferred.c` (~424 lines) (NEW v0.9.9)
+**Purpose:** Per-worker deferred display queue for XDP-SSL correlation timing
+
+**Key Features:**
+- Waits for FLOW_FLAG_HAS_XDP before display
+- 100ms normal timeout, 20ms under load (backpressure)
+- Force flush oldest 10% when queue exceeds max
+- Checks xdp_category != UNKNOWN before display
+
+**Key Functions:**
+| Function | Purpose |
+|----------|---------|
+| `deferred_queue_init()` | Initialize per-worker queue |
+| `deferred_display_or_enqueue()` | Display now or defer for XDP |
+| `deferred_queue_flush()` | Process timed-out entries |
+
+---
+
+#### `src/threading/xdp_ring.c` (~132 lines) (NEW v0.9.9)
+**Purpose:** Per-worker XDP SPSC ring for event delivery
+
+**Key Features:**
+- Fixes timing race: workers check HAS_XDP before dispatcher polls
+- Workers drain XDP ring FIRST, then process SSL events
+- eventfd instant wakeup on ring push
+
+**Key Functions:**
+| Function | Purpose |
+|----------|---------|
+| `xdp_ring_init()` | Initialize SPSC ring + eventfd |
+| `xdp_ring_push()` | Dispatcher pushes XDP event |
+| `xdp_ring_pop()` | Worker pops XDP event |
+
+---
+
 ### Output
 
 #### `src/output/display.c` (~528 lines)
-**Purpose:** Terminal output with ANSI colors
+**Purpose:** Terminal output with ANSI colors, dual checkmark XDP correlation display
 
 **Colors:** C_RESET, C_DIM, C_RED, C_GREEN, C_YELLOW, C_CYAN, C_MAGENTA
+
+**Output Format (v0.9.9):**
+- `[XDP:TLS][App:H2] ✓✓` - Both XDP and App layer verified
+- `[XDP:?][App:H1] ✓` - App layer only (XDP pending)
+- XDP protocols: TLS, QUIC, HTTP, H2, Other, ?
+
+---
+
+#### `src/output/logger.c` (~459 lines) (NEW v0.9.9)
+**Purpose:** Async MPSC logging pipeline for lock-free output serialization
+
+**Key Features:**
+- MPSC ring buffer with pre-allocated entry pool
+- eventfd notification (edge-triggered)
+- writev() batching for atomic output
+- Zero malloc in hot path
+
+**Key Functions:**
+| Function | Purpose |
+|----------|---------|
+| `logger_init()` | Initialize ring buffer and entry pool |
+| `log_enqueue()` | Push message to MPSC ring (lock-free) |
+| `logger_thread_func()` | Consumer thread - batches and writes |
+| `logger_shutdown()` | Drain queue and cleanup |
+
+---
+
+#### `src/output/stats.c` (~272 lines) (NEW v0.9.9)
+**Purpose:** Unified session statistics display at shutdown
+
+**Key Functions:**
+| Function | Purpose |
+|----------|---------|
+| `stats_display()` | Print all session statistics |
+| `stats_collect_worker()` | Gather per-worker metrics |
+| `stats_collect_flow_pool()` | Gather flow pool metrics |
 
 ---
 
@@ -599,4 +718,4 @@ See [../ISSUES.md](../ISSUES.md) for the full list of open issues, known limitat
 
 ---
 
-*Last updated: v0.9.8 (January 2026)*
+*Last updated: v0.9.9 (February 2026)*

@@ -4,9 +4,17 @@
 # Builds for: Fedora 43/42 (dynamic), AlmaLinux 10/9 (static vectorscan)
 # Publishes signed .rpm packages with detached GPG signatures to GitHub Releases
 #
+# Pipeline: check-existing → build (4x parallel) → test → sign → publish
+#
 # Caching strategy:
 # - DNF package cache: Avoids re-downloading packages (~2-3 min savings)
 # - Vectorscan static build: Avoids recompiling from source (~10 min savings)
+#   Uses restore-keys fallback to persist cache across releases
+#
+# Security:
+# - GPG key imported via crazy-max/ghaction-import-gpg (no shell exposure)
+# - All secrets passed through env: variables
+# - RPM signatures verified before publishing
 
 name: Release
 
@@ -241,7 +249,11 @@ jobs:
             /usr/local/lib64/libhs.a
             /usr/local/lib64/libhs_runtime.a
             /usr/local/lib64/pkgconfig/libhs.pc
-          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-static-v2
+          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-static-v3
+          restore-keys: |
+            vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-static-
+            vectorscan-${{ env.VECTORSCAN_VERSION }}-el10-
+            vectorscan-5.4-el10-
 
       - name: Build vectorscan from source (static)
         if: steps.cache-vectorscan.outputs.cache-hit != 'true'
@@ -348,7 +360,11 @@ jobs:
             /usr/local/lib64/libhs.a
             /usr/local/lib64/libhs_runtime.a
             /usr/local/lib64/pkgconfig/libhs.pc
-          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-static-v2
+          key: vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-static-v3
+          restore-keys: |
+            vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-static-
+            vectorscan-${{ env.VECTORSCAN_VERSION }}-el9-
+            vectorscan-5.4-el9-
 
       - name: Build vectorscan from source (static)
         if: steps.cache-vectorscan.outputs.cache-hit != 'true'
@@ -398,11 +414,11 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
-  # Create GitHub Release with Signed Packages
+  # Test Artifacts (Verify RPMs and binaries before signing)
   # ==========================================================================
-  release:
-    name: Create Release
-    needs: [check-existing, build-fedora-43, build-fedora-42, build-alma10, build-alma9]
+  test:
+    name: Test Artifacts
+    needs: [build-fedora-43, build-fedora-42, build-alma10, build-alma9]
     if: |
       always() && (
         needs.build-fedora-43.result == 'success' ||
@@ -410,6 +426,183 @@ jobs:
         needs.build-alma10.result == 'success' ||
         needs.build-alma9.result == 'success'
       )
+    runs-on: ubuntu-latest
+    container: fedora:43
+
+    steps:
+      - name: Setup DNF cache directory
+        run: mkdir -p /var/cache/dnf /var/cache/libdnf5
+
+      - name: Cache DNF packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/dnf
+            /var/cache/libdnf5
+          key: dnf-fedora-43-test-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            dnf-fedora-43-test-
+            dnf-fedora-43-
+
+      - name: Install test tools
+        run: dnf install -y --setopt=keepcache=True --setopt=install_weak_deps=False file
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Verify RPM packages
+        run: |
+          echo "=== Verifying RPM packages ==="
+          for rpm in artifacts/**/*.rpm; do
+            [ -f "$rpm" ] || continue
+            echo "Checking: $rpm"
+            rpm -K --nosignature "$rpm" || exit 1
+            rpm -qip "$rpm"
+            echo ""
+          done
+
+      - name: Verify binaries
+        run: |
+          echo "=== Verifying binaries ==="
+          for dir in artifacts/spliff-*; do
+            if [ -f "$dir/spliff" ]; then
+              echo "Checking: $dir/spliff"
+              file "$dir/spliff"
+              file "$dir/spliff" | grep -q "ELF" || exit 1
+              echo ""
+            fi
+          done
+
+  # ==========================================================================
+  # Sign Packages (Fedora container with native rpm-sign)
+  # ==========================================================================
+  sign:
+    name: Sign Packages
+    needs: [test]
+    runs-on: ubuntu-latest
+    container: fedora:43
+
+    steps:
+      - name: Setup DNF cache directory
+        run: mkdir -p /var/cache/dnf /var/cache/libdnf5
+
+      - name: Cache DNF packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/dnf
+            /var/cache/libdnf5
+          key: dnf-fedora-43-sign-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            dnf-fedora-43-sign-
+            dnf-fedora-43-
+
+      - name: Install signing tools
+        run: dnf install -y --setopt=keepcache=True --setopt=install_weak_deps=False rpm-sign gnupg2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        env:
+          TAG_REF: ${{ github.ref }}
+        run: |
+          VERSION=${TAG_REF#refs/tags/v}
+          mkdir -p release
+
+          # Copy binaries with distro suffix
+          for dir in artifacts/spliff-*; do
+            distro=$(basename "$dir" | sed 's/spliff-//')
+            if [ -f "$dir/spliff" ]; then
+              cp "$dir/spliff" "release/spliff-${VERSION}-${distro}"
+              chmod +x "release/spliff-${VERSION}-${distro}"
+            fi
+          done
+
+          # Copy all RPM packages
+          find artifacts -name '*.rpm' -exec cp {} release/ \;
+
+          echo "=== Release assets ==="
+          ls -la release/
+
+      - name: Import GPG key
+        uses: crazy-max/ghaction-import-gpg@v6
+        id: import_gpg
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Configure RPM signing
+        env:
+          GPG_KEYID: ${{ steps.import_gpg.outputs.keyid }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          cat > ~/.rpmmacros <<EOF
+          %_signature gpg
+          %_gpg_path $HOME/.gnupg
+          %_gpg_name $GPG_KEYID
+          %__gpg_sign_cmd %{__gpg} gpg --batch --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" --no-armor --no-secmem-warning -u "%{_gpg_name}" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}
+          EOF
+
+      - name: Sign and verify RPMs
+        env:
+          GPG_KEYID: ${{ steps.import_gpg.outputs.keyid }}
+        run: |
+          # Sign each RPM
+          for rpm in release/*.rpm; do
+            [ -f "$rpm" ] || continue
+            echo "Signing $rpm with key $GPG_KEYID"
+            rpmsign --addsign --define "_gpg_name $GPG_KEYID" "$rpm"
+          done
+
+          # Import public key into RPM database for verification
+          gpg --export --armor "$GPG_KEYID" > /tmp/project_pubkey.asc
+          rpm --import /tmp/project_pubkey.asc
+
+          # Verify signatures
+          echo "=== Verifying signatures ==="
+          for rpm in release/*.rpm; do
+            [ -f "$rpm" ] || continue
+            rpm -K "$rpm" | grep -qi "gpg" || { echo "Verification failed for $rpm"; exit 1; }
+            echo "✓ $rpm"
+          done
+
+      - name: Create detached signatures
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          cd release
+          for file in *; do
+            [ -f "$file" ] && [ "${file##*.}" != "asc" ] && \
+              gpg --batch --pinentry-mode loopback \
+                --passphrase "$GPG_PASSPHRASE" \
+                --detach-sign --armor --output "${file}.asc" "$file"
+          done
+
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum * > SHA256SUMS.txt 2>/dev/null || true
+          echo "=== SHA256SUMS.txt ==="
+          cat SHA256SUMS.txt
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release
+          path: release/
+          retention-days: 7
+
+  # ==========================================================================
+  # Publish Release to GitHub
+  # ==========================================================================
+  publish:
+    name: Publish Release
+    needs: [sign]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -422,17 +615,18 @@ jobs:
 
       - name: Get version info
         id: version
+        env:
+          TAG_REF: ${{ github.ref }}
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          VERSION=${TAG_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Extract changelog for this version
+      - name: Extract changelog
         id: changelog
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
-
-          # Try to extract the section for this version from CHANGELOG.md
           if [ -f CHANGELOG.md ]; then
             CHANGELOG=$(awk -v ver="$VERSION" '
               /^## \[?v?'"$VERSION"'\]?/ { found=1; next }
@@ -449,7 +643,6 @@ jobs:
             fi
           fi
 
-          # If no changelog found, use git log
           if [ -z "$CHANGELOG" ]; then
             PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
             if [ -n "$PREV_TAG" ]; then
@@ -462,79 +655,11 @@ jobs:
           echo "$CHANGELOG" > /tmp/changelog.txt
           echo "file=/tmp/changelog.txt" >> $GITHUB_OUTPUT
 
-      - name: Download all artifacts
+      - name: Download signed artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
-
-      - name: Prepare release assets
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p release
-
-          # Copy binaries with distro suffix
-          for dir in artifacts/spliff-*; do
-            distro=$(basename "$dir" | sed 's/spliff-//')
-            if [ -f "$dir/spliff" ]; then
-              cp "$dir/spliff" "release/spliff-${VERSION}-${distro}"
-              chmod +x "release/spliff-${VERSION}-${distro}"
-            fi
-          done
-
-          # Copy all RPM packages
-          find artifacts -name '*.rpm' -exec cp {} release/ \;
-
-          echo "Release assets:"
-          ls -la release/
-
-      - name: Install signing tools
-        run: sudo apt-get update && sudo apt-get install -y rpm gnupg2
-
-      - name: Sign RPMs (if GPG key configured)
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          if [ -z "$GPG_PRIVATE_KEY" ]; then
-            echo "GPG_PRIVATE_KEY not configured, skipping signing"
-            exit 0
-          fi
-
-          # Import GPG key
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          GPG_KEY_ID=$(gpg --list-keys --with-colons | grep '^pub' | head -1 | cut -d: -f5)
-
-          # Configure rpmmacros
-          echo "%_signature gpg" >> ~/.rpmmacros
-          echo "%_gpg_name ${GPG_KEY_ID}" >> ~/.rpmmacros
-          echo "%_gpg_path ${HOME}/.gnupg" >> ~/.rpmmacros
-          echo "%__gpg_sign_cmd %{__gpg} gpg --batch --pinentry-mode loopback --passphrase ${GPG_PASSPHRASE} --no-armor --no-secmem-warning -u \"%{_gpg_name}\" -sbo %{__signature_filename} --digest-algo sha256 %{__plaintext_filename}" >> ~/.rpmmacros
-
-          cd release
-
-          # Sign each RPM with rpmsign
-          for rpm in *.rpm; do
-            [ -f "$rpm" ] || continue
-            rpmsign --addsign "$rpm"
-          done
-
-          # Create detached ASCII signatures for all release assets
-          for file in *; do
-            [ -f "$file" ] && [ "${file##*.}" != "asc" ] && \
-              gpg --batch --passphrase "${GPG_PASSPHRASE}" --pinentry-mode loopback \
-                --detach-sign --armor --output "${file}.asc" "$file"
-          done
-
-      - name: Generate checksums
-        run: |
-          cd release
-          # Generate checksums for all files except SHA256SUMS.txt itself
-          find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -exec sha256sum {} + > SHA256SUMS.txt || true
-          echo "=== SHA256SUMS.txt contents ==="
-          cat SHA256SUMS.txt
-          echo ""
-          echo "=== Release assets ==="
-          ls -la
+          name: signed-release
+          path: release
 
       - name: Create Release
         uses: softprops/action-gh-release@v2

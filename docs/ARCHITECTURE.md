@@ -302,6 +302,84 @@ connection from which process.
 - **O(1) stream allocation**: Free-list based pool for HTTP/2 streams
 - **O(active) janitor**: Linked list traversal, not O(capacity) bitmap scan
 
+## XDP Event Delivery (v0.9.9)
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   PER-WORKER XDP RING ARCHITECTURE                     │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  Dispatcher Thread                                                     │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  BPF Ring Poll ──► xdp_events ──► flow_context lookup           │   │
+│  │                                           │                      │   │
+│  │                           ┌───────────────┼───────────────┐      │   │
+│  │                           ▼               ▼               ▼      │   │
+│  │                   ┌──────────────┐ ┌──────────────┐ ┌──────────┐ │   │
+│  │                   │ XDP Ring [0] │ │ XDP Ring [1] │ │ Ring [N] │ │   │
+│  │                   │   (SPSC)     │ │   (SPSC)     │ │  (SPSC)  │ │   │
+│  │                   └──────┬───────┘ └──────┬───────┘ └────┬─────┘ │   │
+│  └──────────────────────────┼────────────────┼──────────────┼───────┘   │
+│                             │                │              │           │
+│                             ▼                ▼              ▼           │
+│  Worker Threads             │                │              │           │
+│  ┌──────────────────────────┼────────────────┼──────────────┼───────┐   │
+│  │  Worker[0]               │    Worker[1]   │  Worker[N]   │       │   │
+│  │  ┌───────────────────────▼─┐  ┌───────────▼─┐  ┌─────────▼──┐    │   │
+│  │  │ 1. Drain XDP ring FIRST │  │ 1. Drain XDP│  │ 1. Drain   │    │   │
+│  │  │ 2. Set HAS_XDP flag     │  │ 2. Set flag │  │ 2. Set flag│    │   │
+│  │  │ 3. Process SSL events   │  │ 3. SSL evts │  │ 3. SSL evts│    │   │
+│  │  └─────────────────────────┘  └─────────────┘  └────────────┘    │   │
+│  └──────────────────────────────────────────────────────────────────┘   │
+│                                                                        │
+│  **Problem solved:** Workers check HAS_XDP before dispatcher polls     │
+│  **Solution:** Workers drain their XDP ring BEFORE processing SSL      │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+## Deferred Display Queue (v0.9.9)
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   DEFERRED DISPLAY QUEUE ARCHITECTURE                  │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  HTTP Message Ready ──► Check XDP Correlation Status                   │
+│                                │                                       │
+│              ┌─────────────────┴─────────────────┐                     │
+│              ▼                                   ▼                     │
+│    ┌─────────────────────┐            ┌─────────────────────┐          │
+│    │  HAS_XDP && category│            │  Missing XDP data   │          │
+│    │     != UNKNOWN      │            │  (no correlation)   │          │
+│    └──────────┬──────────┘            └──────────┬──────────┘          │
+│               │                                  │                     │
+│               ▼                                  ▼                     │
+│    ┌─────────────────────┐            ┌─────────────────────┐          │
+│    │   DISPLAY IMMEDIATELY│            │   ENQUEUE DEFERRED  │          │
+│    │   [XDP:TLS][App:H2]  │            │   (wait for XDP)    │          │
+│    │        ✓✓            │            │                     │          │
+│    └─────────────────────┘            └──────────┬──────────┘          │
+│                                                  │                     │
+│                                                  ▼                     │
+│                                 ┌────────────────────────────────┐     │
+│                                 │      DEFERRED QUEUE            │     │
+│                                 │  ┌─────┬─────┬─────┬─────┐     │     │
+│                                 │  │ msg │ msg │ msg │ ... │     │     │
+│                                 │  │+flow│+flow│+flow│     │     │     │
+│                                 │  └─────┴─────┴─────┴─────┘     │     │
+│                                 │                                │     │
+│                                 │  Timeout: 100ms normal         │     │
+│                                 │           20ms under load      │     │
+│                                 │  Flush: oldest 10% when full   │     │
+│                                 └────────────────────────────────┘     │
+│                                                                        │
+│  **Problem solved:** XDP showing [?] despite successful correlation    │
+│  **Solution:** Wait briefly for XDP metadata before display            │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Data Flow
 
 1. **Startup** → Scan `/proc/PID/maps` for SSL libraries, attach uprobes, seed `flow_cookie_map` via SOCK_DIAG, init flow pool + indexes (256-entry tables), init vectorscan detector

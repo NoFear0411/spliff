@@ -2,6 +2,71 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.9] - 2026-02-03
+
+### Added
+- **Async MPSC Logger**: Lock-free logging pipeline for serialized output
+  - MPSC ring buffer with pre-allocated entry pool
+  - eventfd notification (edge-triggered)
+  - writev() batching for atomic output
+  - Zero malloc in hot path
+
+- **Per-Worker XDP Rings**: SPSC rings for XDP event delivery to workers
+  - Fixes timing race where workers check HAS_XDP before dispatcher polls
+  - Workers process XDP events FIRST, then SSL events
+  - eventfd instant wakeup on ring push
+
+- **Deferred Display Queue**: XDP-SSL correlation synchronization
+  - 100ms normal timeout, 20ms under load (backpressure valve)
+  - Force flush oldest 10% when queue exceeds max
+  - Waits for both FLOW_FLAG_HAS_XDP AND xdp_category != UNKNOWN
+
+- **CK Hash Tables**: Lock-free cookie and shadow indexes
+  - SPMC-safe lookups (multiple workers, single dispatcher)
+  - Incremental resize with tombstone GC
+  - ~256 initial capacity, grows at 75% load
+
+- **Dual Checkmark XDP Display**: Output shows XDP and App layer verification
+  - Format: `[XDP:proto][App:proto] ✓✓` when both verified
+  - Single checkmark when only App layer available
+  - XDP protocols: TLS, QUIC, HTTP, H2, Other, ?
+  - App protocols: H1, H2, ?
+
+- **Session Statistics Module**: Unified stats display at shutdown
+  - Extracted from scattered fprintf to dedicated module
+  - All stats via `stats_display()` function
+
+- **Handshake Correlation ID**: TLS handshakes show `#xxxx` correlation
+
+- **display_hpack_error()**: Dedicated HPACK decode error display function
+
+### Changed
+- **Flow Context Refactoring**: 843 lines changed
+  - Dual index system (cookie + shadow) replaces single hash
+  - Deferred free with grace period and inflight tracking
+  - Generation counter for safe pointer validation
+
+- **Threading Architecture**: XDP events routed to workers
+  - Dispatcher pushes XDP to per-worker SPSC rings
+  - Workers process XDP before SSL for correct ordering
+  - Fixes XDP correlation timing race
+
+- **Atomic Handshake Deduplication**: Uses atomic_exchange to prevent duplicates
+
+### Removed
+- **[HTTP/2 connection] messages**: Redundant - ALPN:h2 in output is sufficient
+- **Dead code**: Removed unused display_handshake() and display_flow_info()
+
+### Fixed
+- XDP showing `[?]` despite successful correlation (AMBIGUOUS event race)
+- Duplicate TLS handshake messages under high load
+- Workers checking HAS_XDP before XDP events processed
+
+### Technical Details
+- New files: logger.c/h, stats.c/h, deferred.c/h, xdp_ring.c/h, ck_cookie_index.c/h, ck_shadow_index.c/h
+- 2221 insertions, 1292 deletions across 19 files
+- Net: +929 lines
+
 ## [0.9.8] - 2026-01-29
 
 ### Added

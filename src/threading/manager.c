@@ -46,6 +46,8 @@
  */
 
 #include "threading.h"
+#include "deferred.h"
+#include "../correlation/flow_context.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -143,25 +145,20 @@ int threading_init(threading_mgr_t *mgr, int num_workers, bool pin_cores) {
     return 0;
 }
 
-int threading_start(threading_mgr_t *mgr, probe_handler_t *handler) {
+int threading_start(threading_mgr_t *mgr, probe_handler_t *handler, bpf_loader_t *loader) {
     if (!mgr || !mgr->initialized || !handler) {
         return -1;
     }
 
     fprintf(stderr, "Threading: starting threads...\n");
 
-    /* Initialize dispatcher */
-    if (dispatcher_init(&mgr->dispatcher, handler, mgr->workers, mgr->num_workers) != 0) {
+    /* Initialize dispatcher (loader may be NULL if XDP not initialized) */
+    if (dispatcher_init(&mgr->dispatcher, handler, loader, mgr->workers, mgr->num_workers) != 0) {
         fprintf(stderr, "Threading: failed to init dispatcher\n");
         return -1;
     }
 
-    /* Initialize output thread */
-    if (output_init(&mgr->output, mgr->workers, mgr->num_workers, NULL) != 0) {
-        fprintf(stderr, "Threading: failed to init output\n");
-        dispatcher_cleanup(&mgr->dispatcher);
-        return -1;
-    }
+    /* Note: Old per-worker output thread removed - using global MPSC logger instead */
 
     /* Start worker threads */
     for (int i = 0; i < mgr->num_workers; i++) {
@@ -186,37 +183,20 @@ int threading_start(threading_mgr_t *mgr, probe_handler_t *handler) {
                 atomic_store(&mgr->workers[j].running, false);
                 pthread_join(mgr->workers[j].thread, NULL);
             }
-            output_cleanup(&mgr->output);
             dispatcher_cleanup(&mgr->dispatcher);
             return -1;
         }
         pthread_attr_destroy(&attr);
     }
 
-    /* Start output thread */
-    if (pthread_create(&mgr->output.thread, NULL,
-                       output_thread_main, &mgr->output) != 0) {
-        fprintf(stderr, "Threading: failed to create output thread\n");
-        for (int i = 0; i < mgr->num_workers; i++) {
-            atomic_store(&mgr->workers[i].running, false);
-            pthread_join(mgr->workers[i].thread, NULL);
-        }
-        output_cleanup(&mgr->output);
-        dispatcher_cleanup(&mgr->dispatcher);
-        return -1;
-    }
-
     /* Start dispatcher thread */
     if (pthread_create(&mgr->dispatcher.thread, NULL,
                        dispatcher_thread_main, &mgr->dispatcher) != 0) {
         fprintf(stderr, "Threading: failed to create dispatcher thread\n");
-        atomic_store(&mgr->output.running, false);
-        pthread_join(mgr->output.thread, NULL);
         for (int i = 0; i < mgr->num_workers; i++) {
             atomic_store(&mgr->workers[i].running, false);
             pthread_join(mgr->workers[i].thread, NULL);
         }
-        output_cleanup(&mgr->output);
         dispatcher_cleanup(&mgr->dispatcher);
         return -1;
     }
@@ -275,10 +255,7 @@ void threading_shutdown(threading_mgr_t *mgr) {
     }
     fprintf(stderr, "  Workers stopped\n");
 
-    /* 4. Stop output thread (it will drain output queues) */
-    atomic_store(&mgr->output.running, false);
-    pthread_join(mgr->output.thread, NULL);
-    fprintf(stderr, "  Output thread stopped\n");
+    /* Note: Output thread removed - using global MPSC logger instead */
 }
 
 /**
@@ -292,8 +269,14 @@ void threading_cleanup(threading_mgr_t *mgr) {
         return;
     }
 
-    /* Cleanup components */
-    output_cleanup(&mgr->output);
+    /*
+     * Force drain all flows BEFORE dispatcher cleanup.
+     * This ensures HTTP/2 sessions, inflaters, and response buffers are freed
+     * while the indices are still valid for lookup.
+     */
+    flow_manager_force_drain(&mgr->dispatcher.flow_mgr);
+
+    /* Cleanup components (output thread removed - using global MPSC logger) */
     dispatcher_cleanup(&mgr->dispatcher);
 
     for (int i = 0; i < mgr->num_workers; i++) {
@@ -357,13 +340,16 @@ void threading_get_aggregate_stats(threading_mgr_t *mgr, threading_stats_t *stat
         stats->total_deferred_fail += def_fail;
     }
 
-    /* Output thread stats */
-    output_get_stats(&mgr->output,
-                     &stats->messages_written,
-                     &stats->bytes_written);
+    /* Output stats - now from global MPSC logger */
+    /* These will be filled in by stats module reading from logger directly */
+    stats->messages_written = 0;
+    stats->bytes_written = 0;
 
     /* Flow pool stats */
     flow_manager_get_stats(&mgr->dispatcher.flow_mgr, &stats->flow_pool);
+
+    /* Deferred display queue stats (XDP correlation) */
+    deferred_get_stats(mgr->workers, mgr->num_workers, &stats->deferred);
 }
 
 /** @} */ /* end manager_stats */

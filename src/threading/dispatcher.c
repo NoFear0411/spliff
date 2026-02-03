@@ -42,6 +42,7 @@
  */
 
 #include "threading.h"
+#include "xdp_ring.h"
 #include "../util/safe_str.h"
 
 #include <stdlib.h>
@@ -133,26 +134,40 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
     }
 
     /*
-     * Determine worker ID for routing.
+     * Determine worker ID for routing with sticky affinity.
      *
-     * Cache locality strategy:
-     * - If flow exists and has a home_worker_id, route to that worker
-     * - Otherwise, use hash-based routing (which will claim the flow)
+     * CRITICAL: Once a flow is assigned to a worker, ALL events (SSL, XDP, etc.)
+     * must go to that same worker. This is enforced by:
+     * 1. Checking home_worker_id first (sticky routing)
+     * 2. If unclaimed, compute worker_id and SET home_worker_id immediately
+     *    This prevents race where XDP and SSL use different routing algorithms
      *
-     * This ensures all events for an existing flow go to the same worker,
-     * which is critical for nghttp2 session thread safety.
+     * The dispatcher owns setting home_worker_id (single-writer), ensuring
+     * all events for a flow are routed consistently.
      */
     int worker_id;
     if (flow_ctx) {
         uint32_t home = atomic_load(&flow_ctx->home_worker_id);
         if (home != WORKER_ID_NONE && home < (uint32_t)ctx->num_workers) {
-            /* Route to flow's home worker for cache locality */
+            /* Route to flow's home worker for sticky affinity */
             worker_id = (int)home;
         } else {
-            /* Flow exists but unclaimed - use hash routing (worker will claim) */
+            /* Flow exists but unclaimed - compute and SET home_worker_id now */
             worker_id = get_worker_id_ex(bpf_event->socket_cookie,
                                           bpf_event->pid, bpf_event->ssl_ctx,
                                           ctx->num_workers);
+            /* CAS to claim - if another event already claimed, use their choice */
+            uint32_t expected = WORKER_ID_NONE;
+            if (atomic_compare_exchange_strong(&flow_ctx->home_worker_id,
+                                                &expected, (uint32_t)worker_id)) {
+                if (g_config.debug_mode) {
+                    fprintf(stderr, "[DEBUG] SSL: flow_id=%u claimed by worker %d\n",
+                            flow_ctx->self_id, worker_id);
+                }
+            } else {
+                /* Another event claimed first - use their worker for consistency */
+                worker_id = (int)expected;
+            }
         }
     } else {
         /* No flow context - use hash routing */
@@ -206,12 +221,18 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
                         flow_ctx->self_id,
                         (unsigned long long)bpf_event->socket_cookie);
             }
+
+            /*
+             * Note: xdp_poll_urgent flag removed - now that SSL and XDP are both
+             * polled in the dispatcher thread, XDP events are processed in the
+             * same iteration, eliminating the timing race.
+             */
         }
     }
 
     /* Update flow context with SSL metadata */
     if (flow_ctx) {
-        flow_ctx->flags |= FLOW_FLAG_HAS_SSL;
+        atomic_fetch_or(&flow_ctx->flags, FLOW_FLAG_HAS_SSL);
         if (flow_ctx->pid == 0) {
             flow_ctx->pid = bpf_event->pid;
         }
@@ -225,7 +246,7 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
         flow_ctx->last_seen_ns = bpf_event->timestamp_ns;
 
         /* Transition to ACTIVE if we have both XDP and SSL data */
-        if ((flow_ctx->flags & FLOW_FLAG_HAS_XDP) && flow_ctx->state == FLOW_STATE_INIT) {
+        if ((atomic_load(&flow_ctx->flags) & FLOW_FLAG_HAS_XDP) && flow_ctx->state == FLOW_STATE_INIT) {
             flow_ctx->state = FLOW_STATE_ACTIVE;
         }
     }
@@ -240,7 +261,7 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
      * Worker's deferred queue can retry later when XDP event populates the flow.
      */
     event->needs_cookie_retry = (bpf_event->socket_cookie != 0) &&
-                                 (!flow_ctx || !(flow_ctx->flags & FLOW_FLAG_HAS_XDP));
+                                 (!flow_ctx || !(atomic_load(&flow_ctx->flags) & FLOW_FLAG_HAS_XDP));
 
     /* Copy payload */
     event->data_len = (bpf_event->buf_filled > 0) ?
@@ -251,7 +272,7 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
 
     /* Track in-flight events for safe deferred free */
     if (flow_ctx) {
-        atomic_fetch_add_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
     }
 
     /* Enqueue to worker's input ring */
@@ -345,13 +366,14 @@ static void dispatcher_event_callback(const ssl_data_event_t *event, void *ctx) 
  */
 
 int dispatcher_init(dispatcher_ctx_t *ctx, probe_handler_t *handler,
-                    worker_ctx_t *workers, int num_workers) {
+                    bpf_loader_t *loader, worker_ctx_t *workers, int num_workers) {
     if (!ctx || !handler || !workers || num_workers <= 0) {
         return -1;
     }
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->handler = handler;
+    ctx->loader = loader;  /* May be NULL if XDP not initialized */
     ctx->workers = workers;
     ctx->num_workers = num_workers;
 
@@ -381,8 +403,11 @@ void dispatcher_cleanup(dispatcher_ctx_t *ctx) {
         return;
     }
 
-    /* Cleanup Shared Pool flow manager */
-    flow_manager_cleanup(&ctx->flow_mgr);
+    /*
+     * DO NOT call flow_manager_cleanup() here.
+     * It's already handled by flow_manager_force_drain() in threading_cleanup().
+     * Calling both would cause double-free of pool and index resources.
+     */
 
     g_dispatcher = NULL;
     ctx->handler = NULL;
@@ -398,18 +423,31 @@ void dispatcher_set_lifecycle_callback(dispatcher_ctx_t *ctx, process_lifecycle_
     ctx->lifecycle_ctx = user_ctx;
 }
 
+/* See declaration in threading.h for documentation */
 void dispatcher_cleanup_pid(dispatcher_ctx_t *ctx, uint32_t pid) {
     if (!ctx || !ctx->workers) return;
 
     for (int i = 0; i < ctx->num_workers; i++) {
         worker_state_t *state = &ctx->workers[i].state;
+        if (!state->h2_connections) continue;
 
-        /* Cleanup HTTP/2 connections and streams for this PID */
-        for (int j = 0; j < MAX_H2_SESSIONS_PER_WORKER; j++) {
+        for (int j = 0; j < state->h2_connection_capacity; j++) {
             h2_connection_local_t *conn = &state->h2_connections[j];
-            if (conn->active && conn->pid == pid) {
-                worker_cleanup_h2_connection(state, conn);
+
+            /* Skip slots not matching this PID */
+            if (conn->pid != pid) continue;
+
+            /* Atomically mark as DYING - worker will handle cleanup */
+            h2_conn_state_t old_state = atomic_exchange_explicit(
+                &conn->state, H2_CONN_STATE_DYING, memory_order_release);
+
+            /* Restore if slot was already FREE or DYING */
+            if (old_state == H2_CONN_STATE_FREE ||
+                old_state == H2_CONN_STATE_DYING) {
+                atomic_store_explicit(&conn->state, old_state, memory_order_relaxed);
             }
+            /* If was INITIALIZING, worker's CAS will fail and self-clean */
+            /* If was ACTIVE, worker will detect DYING and move to shadow queue */
         }
     }
 }
@@ -444,13 +482,26 @@ void *dispatcher_thread_main(void *arg) {
 
     /* Main poll loop */
     while (atomic_load(&ctx->running)) {
-        int err = probe_handler_poll(ctx->handler, 100);  /* 100ms timeout */
+        /* Poll SSL events (50ms timeout for responsive XDP polling) */
+        int err = probe_handler_poll(ctx->handler, 50);
         if (err == -EINTR) {
             continue;
         }
         if (err < 0 && err != -EINTR) {
             fprintf(stderr, "Dispatcher: poll error %d\n", err);
             break;
+        }
+
+        /*
+         * Poll XDP events - SINGLE-WRITER: all hash table writes now on this thread.
+         * This fixes the multi-writer race condition by ensuring both SSL and XDP
+         * events are processed in the dispatcher thread, making CK hs SPMC mode safe.
+         */
+        if (ctx->loader && bpf_loader_xdp_is_active(ctx->loader)) {
+            int xdp_err = bpf_loader_xdp_poll(ctx->loader, 0);  /* Non-blocking */
+            if (xdp_err < 0 && xdp_err != -EINTR && g_config.debug_mode) {
+                fprintf(stderr, "Dispatcher: XDP poll error %d\n", xdp_err);
+            }
         }
 
         /* Flow janitor: evict stale flows periodically */
@@ -463,6 +514,18 @@ void *dispatcher_thread_main(void *arg) {
                 fprintf(stderr, "[Janitor] Evicted %d flows\n", evicted_pool);
             }
             last_janitor_run = now;
+        }
+    }
+
+    /* Drain any remaining XDP events before shutdown to prevent event loss */
+    if (ctx->loader && bpf_loader_xdp_is_active(ctx->loader)) {
+        int drained = 0;
+        int remaining;
+        while ((remaining = bpf_loader_xdp_poll(ctx->loader, 0)) > 0) {
+            drained += remaining;
+        }
+        if (drained > 0 && g_config.debug_mode) {
+            fprintf(stderr, "Dispatcher: drained %d XDP events on shutdown\n", drained);
         }
     }
 
@@ -518,6 +581,17 @@ void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
     if (dropped) *dropped = atomic_load(&ctx->xdp_events_dropped);
 }
 
+/**
+ * @brief Get total XDP events received by dispatcher
+ *
+ * @param[in] ctx Dispatcher context
+ * @return Total events received from ring buffer, 0 if ctx is NULL
+ */
+uint64_t dispatcher_get_xdp_events_received(dispatcher_ctx_t *ctx) {
+    if (!ctx) return 0;
+    return atomic_load(&ctx->xdp_events_received);
+}
+
 /** @} */ /* end dispatcher_stats */
 
 /**
@@ -533,6 +607,221 @@ void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
 
 /** Debug sampling rate - print 1 in N events to avoid performance issues */
 #define XDP_DEBUG_SAMPLE_RATE 1000
+
+/**
+ * @brief Route XDP event to appropriate worker via SPSC ring
+ *
+ * Single-Writer Architecture: The dispatcher creates/looks up the flow
+ * BEFORE routing to workers. This ensures all hash table writes happen
+ * in the dispatcher thread, making CK hs SPMC mode safe.
+ *
+ * @param[in] dispatcher Dispatcher context
+ * @param[in] pkt        XDP packet event
+ * @return true if event was routed, false if dropped (ring full)
+ */
+static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
+                                            const xdp_packet_event_t *pkt) {
+    if (!dispatcher || !pkt || dispatcher->num_workers <= 0) {
+        return false;
+    }
+
+    /*
+     * SINGLE-WRITER: Create/lookup flow in dispatcher (not worker).
+     * This is the key architectural change for thread safety.
+     * All hash table writes happen here in the single dispatcher thread.
+     */
+    flow_context_t *flow_ctx = flow_get_or_create(&dispatcher->flow_mgr,
+                                                   pkt->socket_cookie, 0, 0);
+
+    if (flow_ctx) {
+        /* Populate XDP metadata in dispatcher (single-writer) */
+        flow_update_xdp(flow_ctx, pkt);
+
+        if (g_config.debug_mode) {
+            fprintf(stderr, "[DEBUG] XDP DISPATCHER: flow_id=%u cookie=%llu HAS_XDP set\n",
+                    flow_ctx->self_id, (unsigned long long)pkt->socket_cookie);
+        }
+    }
+
+    /* Build ring event from packet event with pre-resolved flow */
+    xdp_ring_event_t ring_evt = {
+        .socket_cookie = pkt->socket_cookie,
+        .flow = pkt->flow,
+        .timestamp_ns = pkt->timestamp_ns,
+        .ifindex = pkt->ifindex,
+        .pkt_len = pkt->pkt_len,
+        .category = pkt->category,
+        .direction = pkt->direction,
+        .flow_ctx = flow_ctx,
+        .expected_gen = flow_ctx ? flow_ctx->generation : 0,
+        ._pad = 0,
+    };
+
+    /*
+     * Route to worker with sticky affinity - CRITICAL for thread safety.
+     * Once a flow is assigned to a worker, ALL events must go there.
+     * The dispatcher sets home_worker_id on first routing to prevent races.
+     */
+    int worker_id;
+    if (flow_ctx) {
+        uint32_t home = atomic_load(&flow_ctx->home_worker_id);
+        if (home != WORKER_ID_NONE && home < (uint32_t)dispatcher->num_workers) {
+            /* Route to flow's home worker for sticky affinity */
+            worker_id = (int)home;
+        } else {
+            /* Flow unclaimed - compute and SET home_worker_id now */
+            worker_id = (int)(pkt->socket_cookie % (uint64_t)dispatcher->num_workers);
+            /* CAS to claim - if another event already claimed, use their choice */
+            uint32_t expected = WORKER_ID_NONE;
+            if (atomic_compare_exchange_strong(&flow_ctx->home_worker_id,
+                                                &expected, (uint32_t)worker_id)) {
+                if (g_config.debug_mode) {
+                    fprintf(stderr, "[DEBUG] XDP: flow_id=%u claimed by worker %d\n",
+                            flow_ctx->self_id, worker_id);
+                }
+            } else {
+                /* Another event claimed first - use their worker for consistency */
+                worker_id = (int)expected;
+            }
+        }
+    } else {
+        worker_id = (int)(pkt->socket_cookie % (uint64_t)dispatcher->num_workers);
+    }
+    worker_ctx_t *worker = &dispatcher->workers[worker_id];
+
+    /* Track in-flight events for safe deferred free */
+    if (flow_ctx) {
+        atomic_fetch_add_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+    }
+
+    /* Push to worker's SPSC ring (includes eventfd signal) */
+    if (!worker->xdp_ring) {
+        if (flow_ctx) {
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+        }
+        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        return false;
+    }
+
+    if (!xdp_ring_push(worker->xdp_ring, &ring_evt)) {
+        if (flow_ctx) {
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+        }
+        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * @brief Route AMBIGUOUS XDP event to worker via SPSC ring
+ *
+ * Single-Writer Architecture: The dispatcher creates/looks up the flow
+ * BEFORE routing to workers. Similar to dispatcher_route_xdp_to_worker
+ * but handles xdp_payload_event_t.
+ *
+ * @param[in] dispatcher Dispatcher context
+ * @param[in] evt        XDP payload event
+ * @return true if event was routed, false if dropped
+ */
+static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
+                                                  const xdp_payload_event_t *evt) {
+    if (!dispatcher || !evt || dispatcher->num_workers <= 0) {
+        return false;
+    }
+
+    /*
+     * SINGLE-WRITER: Create/lookup flow in dispatcher (not worker).
+     * All hash table writes happen here in the single dispatcher thread.
+     */
+    flow_context_t *flow_ctx = flow_get_or_create(&dispatcher->flow_mgr,
+                                                   evt->socket_cookie, 0, 0);
+
+    if (flow_ctx) {
+        /* Build a temporary packet event for flow_update_xdp */
+        xdp_packet_event_t tmp_pkt = {
+            .socket_cookie = evt->socket_cookie,
+            .flow = evt->flow,
+            .timestamp_ns = evt->timestamp_ns,
+            .ifindex = 0,
+            .pkt_len = (uint16_t)evt->payload_len,
+            .category = evt->category,
+            .direction = 0,
+            .tcp_flags = 0,
+        };
+        flow_update_xdp(flow_ctx, &tmp_pkt);
+    }
+
+    /* Build ring event with pre-resolved flow */
+    xdp_ring_event_t ring_evt = {
+        .socket_cookie = evt->socket_cookie,
+        .flow = evt->flow,
+        .timestamp_ns = evt->timestamp_ns,
+        .ifindex = 0,  /* Not available in payload event */
+        .pkt_len = (uint16_t)evt->payload_len,
+        .category = evt->category,
+        .direction = 0,  /* Not available in payload event */
+        .flow_ctx = flow_ctx,
+        .expected_gen = flow_ctx ? flow_ctx->generation : 0,
+        ._pad = 0,
+    };
+
+    /*
+     * Route to worker with sticky affinity - CRITICAL for thread safety.
+     * Once a flow is assigned to a worker, ALL events must go there.
+     * The dispatcher sets home_worker_id on first routing to prevent races.
+     */
+    int worker_id;
+    if (flow_ctx) {
+        uint32_t home = atomic_load(&flow_ctx->home_worker_id);
+        if (home != WORKER_ID_NONE && home < (uint32_t)dispatcher->num_workers) {
+            /* Route to flow's home worker for sticky affinity */
+            worker_id = (int)home;
+        } else {
+            /* Flow unclaimed - compute and SET home_worker_id now */
+            worker_id = (int)(evt->socket_cookie % (uint64_t)dispatcher->num_workers);
+            /* CAS to claim - if another event already claimed, use their choice */
+            uint32_t expected = WORKER_ID_NONE;
+            if (atomic_compare_exchange_strong(&flow_ctx->home_worker_id,
+                                                &expected, (uint32_t)worker_id)) {
+                if (g_config.debug_mode) {
+                    fprintf(stderr, "[DEBUG] AMBIGUOUS: flow_id=%u claimed by worker %d\n",
+                            flow_ctx->self_id, worker_id);
+                }
+            } else {
+                /* Another event claimed first - use their worker for consistency */
+                worker_id = (int)expected;
+            }
+        }
+    } else {
+        worker_id = (int)(evt->socket_cookie % (uint64_t)dispatcher->num_workers);
+    }
+    worker_ctx_t *worker = &dispatcher->workers[worker_id];
+
+    /* Track in-flight events for safe deferred free */
+    if (flow_ctx) {
+        atomic_fetch_add_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+    }
+
+    if (!worker->xdp_ring) {
+        if (flow_ctx) {
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+        }
+        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        return false;
+    }
+
+    if (!xdp_ring_push(worker->xdp_ring, &ring_evt)) {
+        if (flow_ctx) {
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+        }
+        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        return false;
+    }
+
+    return true;
+}
 
 /**
  * @brief Get human-readable category name for display
@@ -569,6 +858,9 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
     if (!dispatcher || !data) {
         return 0;  /* Continue processing */
     }
+
+    /* Track total events received for debugging ring buffer consumption */
+    atomic_fetch_add(&dispatcher->xdp_events_received, 1);
 
     /* Sampling counter for debug output */
     uint64_t sample_count = atomic_fetch_add(&dispatcher->xdp_debug_samples, 1);
@@ -610,6 +902,19 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
                     fprintf(stderr, "...");
                 }
                 fprintf(stderr, "\n");
+            }
+        }
+
+        /*
+         * PHASE 3 FIX: Route AMBIGUOUS events to workers via SPSC ring.
+         * Workers will set FLOW_FLAG_HAS_XDP before processing SSL events.
+         */
+        if (payload_evt->socket_cookie != 0) {
+            dispatcher_route_ambiguous_to_worker(dispatcher, payload_evt);
+
+            if (should_debug) {
+                fprintf(stderr, "[DEBUG] AMBIGUOUS: routed to worker (cookie=%llu)\n",
+                        (unsigned long long)payload_evt->socket_cookie);
             }
         }
 
@@ -657,36 +962,29 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
         } else {
             /* ==================== FLOW_NEW ====================
              * New flow discovered (category != UNKNOWN)
+             *
+             * PHASE 3 FIX: Route XDP events to workers via SPSC ring.
+             * Workers set FLOW_FLAG_HAS_XDP before processing SSL events,
+             * ensuring proper correlation timing.
              */
             atomic_fetch_add(&dispatcher->xdp_flows_discovered, 1);
 
             /*
-             * Populate Shared Pool with XDP metadata.
-             * XDP events only have socket_cookie, no pid/ssl_ctx yet.
-             * We create context with cookie only, SSL events will fill pid/ssl_ctx.
+             * Route to worker for HAS_XDP flag setting.
+             * Worker will handle flow lookup/creation and set the flag
+             * BEFORE processing any SSL events in the same iteration.
              */
-            flow_context_t *flow_ctx = flow_get_or_create(&dispatcher->flow_mgr,
-                                                           packet_evt->socket_cookie,
-                                                           0,  /* pid unknown from XDP */
-                                                           0); /* ssl_ctx unknown from XDP */
-            if (flow_ctx) {
-                /* Update with XDP metadata (5-tuple, counters, timestamps) */
-                flow_update_xdp(flow_ctx, packet_evt);
+            if (packet_evt->socket_cookie != 0) {
+                dispatcher_route_xdp_to_worker(dispatcher, packet_evt);
             }
 
             if (should_debug) {
-                fprintf(stderr, "[DEBUG] XDP FLOW_NEW: cookie=%llu sport=%u dport=%u cat=%s pool=%s\n",
-                        (unsigned long long)packet_evt->socket_cookie,
-                        ntohs(packet_evt->flow.sport),
-                        ntohs(packet_evt->flow.dport),
-                        xdp_category_name(packet_evt->category),
-                        flow_ctx ? "OK" : "FULL");
                 char src_ip[16], dst_ip[16];
                 format_ipv4(packet_evt->flow.saddr, src_ip, sizeof(src_ip));
                 format_ipv4(packet_evt->flow.daddr, dst_ip, sizeof(dst_ip));
 
                 fprintf(stderr,
-                    "[XDP] FLOW_NEW: %s:%u -> %s:%u [%s] cookie=%lu if=%u\n",
+                    "[XDP] FLOW_NEW: %s:%u -> %s:%u [%s] cookie=%lu if=%u → worker\n",
                     src_ip, ntohs(packet_evt->flow.sport),
                     dst_ip, ntohs(packet_evt->flow.dport),
                     xdp_category_name(packet_evt->category),

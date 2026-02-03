@@ -32,6 +32,8 @@
 #include "bpf/binary_scanner.h"
 #include "bpf/probe_handler.h"
 #include "output/display.h"
+#include "output/logger.h"
+#include "output/stats.h"
 #include "content/decompressor.h"
 #include "content/signatures.h"
 #include "protocol/http1.h"
@@ -62,6 +64,7 @@ static bool g_debug_mode = false;
 
 static threading_mgr_t g_threading;
 static bool g_threading_initialized = false;
+static bool g_logger_initialized = false;
 static dispatcher_ctx_t g_xdp_dispatcher;  /* XDP event dispatcher context */
 
 /* Configuration - IPC filtering enabled by default (BPF handles kernel-level filtering) */
@@ -468,204 +471,38 @@ static void threading_process_exec_callback(const ssl_data_event_t *event, void 
 /* ─── Centralized Shutdown Statistics ─────────────────────────────────────── */
 
 /**
- * @brief Format byte count as human-readable string (KB, MB, GB)
- */
-static const char *format_bytes(uint64_t bytes, char *buf, size_t bufsz) {
-    if (bytes >= 1073741824ULL) {
-        snprintf(buf, bufsz, "%.1f GB", (double)bytes / 1073741824.0);
-    } else if (bytes >= 1048576ULL) {
-        snprintf(buf, bufsz, "%.1f MB", (double)bytes / 1048576.0);
-    } else if (bytes >= 1024ULL) {
-        snprintf(buf, bufsz, "%.1f KB", (double)bytes / 1024.0);
-    } else {
-        snprintf(buf, bufsz, "%lu B", bytes);
-    }
-    return buf;
-}
-
-/**
- * @brief Print all shutdown statistics from one centralized location
+ * @brief Print all shutdown statistics using modular stats module
  *
- * Collects data from all subsystem getters and prints a unified report.
- * All statistics are shown unconditionally in every build.
+ * Collects data from all subsystem getters and delegates to stats_print_session.
  */
 static void print_shutdown_stats(void) {
-    const char *dim   = display_color(C_DIM);
-    const char *bold  = display_color(C_BOLD);
-    const char *cyan  = display_color(C_CYAN);
-    const char *green = display_color(C_GREEN);
-    const char *yellow = display_color(C_YELLOW);
-    const char *reset = display_color(C_RESET);
-
-    char bytebuf[32];
-
-    fprintf(stderr, "\n%s", bold);
-    fprintf(stderr, "============================================\n");
-    fprintf(stderr, "           Session Statistics\n");
-    fprintf(stderr, "============================================%s\n", reset);
-
-    /* ── Application Layer (SSL/TLS) ─────────────────────────────────── */
+    /* Collect threading stats */
     threading_stats_t ts;
     memset(&ts, 0, sizeof(ts));
     threading_get_aggregate_stats(&g_threading, &ts);
 
-    fprintf(stderr, "\n  %sApplication Layer (SSL/TLS)%s\n", cyan, reset);
-    fprintf(stderr, "  %s----------------------------------------------%s\n", dim, reset);
-
-    /* Events pipeline */
-    fprintf(stderr, "  Events:      %lu captured", ts.events_dispatched);
-    if (ts.total_processed > 0 || ts.events_dispatched > 0) {
-        fprintf(stderr, " -> %lu processed", ts.total_processed);
-    }
-    uint64_t total_drops = ts.events_dropped + ts.total_dropped;
-    if (total_drops > 0) {
-        fprintf(stderr, " %s(%lu dropped)%s", yellow, total_drops, reset);
-    }
-    fprintf(stderr, "\n");
-
-    /* Output */
-    fprintf(stderr, "  Output:      %lu messages (%s)\n",
-            ts.messages_written, format_bytes(ts.bytes_written, bytebuf, sizeof(bytebuf)));
-
-    /* Cookie retry correlation */
-    uint64_t total_deferred = ts.total_deferred_ok + ts.total_deferred_fail;
-    if (total_deferred > 0) {
-        double success_rate = 100.0 * ts.total_deferred_ok / total_deferred;
-        fprintf(stderr, "  Correlation: %.1f%% retry success (%lu of %lu deferred)\n",
-                success_rate, ts.total_deferred_ok, total_deferred);
-    }
-
-    /* ── Workers ─────────────────────────────────────────────────────── */
-    fprintf(stderr, "\n  %sWorkers (%d)%s\n", cyan, ts.num_workers, reset);
-    fprintf(stderr, "  %s----------------------------------------------%s\n", dim, reset);
-
-    for (int i = 0; i < ts.num_workers; i++) {
-        if (ts.worker_processed[i] > 0 || ts.worker_dropped[i] > 0) {
-            fprintf(stderr, "  Worker %2d: %lu events", i, ts.worker_processed[i]);
-            if (ts.worker_dropped[i] > 0) {
-                fprintf(stderr, " (%lu dropped)", ts.worker_dropped[i]);
-            }
-            if (ts.worker_deferred_ok[i] > 0 || ts.worker_deferred_fail[i] > 0) {
-                fprintf(stderr, " [retry: %lu ok, %lu fail]",
-                        ts.worker_deferred_ok[i], ts.worker_deferred_fail[i]);
-            }
-            fprintf(stderr, "\n");
-        }
-    }
-
-    /* CPU efficiency */
-    if (ts.total_sleep_cycles > 0) {
-        fprintf(stderr, "  CPU: %sGood%s (NAPI-style, %lu sleep cycles)\n",
-                green, reset, ts.total_sleep_cycles);
-    } else if (ts.total_processed > 0) {
-        fprintf(stderr, "  CPU: %sHigh load%s (continuous processing)\n",
-                yellow, reset);
-    }
-
-    /* ── Flow Pool ───────────────────────────────────────────────────── */
-    flow_pool_stats_t *fp = &ts.flow_pool;
-
-    fprintf(stderr, "\n  %sFlow Pool%s\n", cyan, reset);
-    fprintf(stderr, "  %s----------------------------------------------%s\n", dim, reset);
-
-    fprintf(stderr, "  Active:      %lu flows, peak %lu\n",
-            fp->pool_allocated, fp->pool_peak);
-    fprintf(stderr, "  Throughput:  %lu allocs, %lu frees\n",
-            fp->pool_total_allocs, fp->pool_total_frees);
-    if (fp->pool_alloc_failures > 0) {
-        fprintf(stderr, "  %sOOM:         %lu allocation failures%s\n",
-                yellow, fp->pool_alloc_failures, reset);
-    }
-
-    /* Flow index details */
-    uint64_t cookie_total = fp->cookie_hits + fp->cookie_misses;
-    double cookie_hit_rate = cookie_total > 0
-        ? 100.0 * fp->cookie_hits / cookie_total : 0.0;
-    fprintf(stderr, "  Cookie index: %lu entries, %lu hits (%.1f%%), %lu misses\n",
-            fp->cookie_count, fp->cookie_hits, cookie_hit_rate, fp->cookie_misses);
-    fprintf(stderr, "  Shadow index: %lu entries, %lu hits, %lu promotions\n",
-            fp->shadow_count, fp->shadow_hits, fp->shadow_promotions);
-
-    if (fp->pool_total_allocs > 0) {
-        double promo_rate = 100.0 * fp->shadow_promotions / fp->pool_total_allocs;
-        fprintf(stderr, "  Promotion:    %.1f%% of flows got socket_cookie\n", promo_rate);
-    }
-
-    /* ── Network Layer (XDP) ─────────────────────────────────────────── */
+    /* Collect XDP stats if available */
     xdp_stats_t xdp = {0};
-    bool have_xdp = false;
+    xdp_stats_t *xdp_ptr = NULL;
     if (g_xdp_initialized) {
         if (bpf_loader_xdp_read_stats(&g_loader, &xdp) == 0) {
-            have_xdp = true;
+            xdp_ptr = &xdp;
         }
     }
 
-    if (have_xdp) {
-        fprintf(stderr, "\n  %sNetwork Layer (XDP)%s\n", cyan, reset);
-        fprintf(stderr, "  %s----------------------------------------------%s\n", dim, reset);
-
-        fprintf(stderr, "  Packets:     %lu processed (%lu TCP)\n",
-                xdp.packets_total, xdp.packets_tcp);
-        fprintf(stderr, "  Connections: %lu tracked", xdp.flows_created);
-        if (xdp.flows_classified > 0) {
-            fprintf(stderr, ", %lu classified", xdp.flows_classified);
-        }
-        fprintf(stderr, "\n");
-
-        /* Correlation success rate */
-        if (xdp.flows_created > 0) {
-            uint64_t correlated = xdp.flows_created - xdp.cookie_failures;
-            double corr_pct = 100.0 * correlated / xdp.flows_created;
-            fprintf(stderr, "  Correlation: %.1f%% socket cookie success\n", corr_pct);
-        }
-
-        /* XDP classification details */
-        fprintf(stderr, "  Classified:  %lu flows\n", xdp.flows_classified);
-        fprintf(stderr, "  Ambiguous:   %lu (deeper inspection needed)\n", xdp.flows_ambiguous);
-        fprintf(stderr, "  Terminated:  %lu (FIN/RST)\n", xdp.flows_terminated);
-        fprintf(stderr, "  Cache hits:  %lu (fast-path gatekeeper)\n", xdp.gatekeeper_hits);
-        fprintf(stderr, "  Cookie miss: %lu (correlation gaps)\n", xdp.cookie_failures);
-        if (xdp.ringbuf_drops > 0) {
-            fprintf(stderr, "  %sRing drops:  %lu (buffer full)%s\n",
-                    yellow, xdp.ringbuf_drops, reset);
-        }
-
-        /* Sockops */
-        uint64_t sockops_total = xdp.sockops_active + xdp.sockops_passive;
-        fprintf(stderr, "\n  %sSockops (cookie caching)%s\n", cyan, reset);
-        fprintf(stderr, "  %s----------------------------------------------%s\n", dim, reset);
-
-        if (sockops_total > 0 || xdp.sockops_state > 0) {
-            fprintf(stderr, "  Events:  %lu (active: %lu, passive: %lu)\n",
-                    sockops_total, xdp.sockops_active, xdp.sockops_passive);
-            fprintf(stderr, "  Cleanup: %lu\n", xdp.sockops_state);
-        } else {
-            fprintf(stderr, "  %sWARNING: No sockops events - cookie caching inactive!%s\n",
-                    yellow, reset);
-            fprintf(stderr, "  (Check cgroup2 mount and sockops attachment)\n");
-        }
+    /* Collect async logger stats */
+    logger_stats_t log_stats = {0};
+    logger_stats_t *log_ptr = NULL;
+    if (g_logger_initialized) {
+        log_get_stats(&log_stats);
+        log_ptr = &log_stats;
     }
 
-    /* ── SSL Probes ──────────────────────────────────────────────────── */
-    if (g_bpf_initialized) {
-        struct bpf_object *obj = bpf_loader_get_object(&g_loader);
-        if (obj) {
-            struct bpf_map *map = bpf_object__find_map_by_name(obj, "ssl_op_counter");
-            if (map) {
-                int fd = bpf_map__fd(map);
-                uint32_t key = 0;
-                uint64_t counter = 0;
-                if (bpf_map_lookup_elem(fd, &key, &counter) == 0 && counter > 0) {
-                    fprintf(stderr, "\n  %sSSL Probes%s\n", cyan, reset);
-                    fprintf(stderr, "  %s----------------------------------------------%s\n",
-                            dim, reset);
-                    fprintf(stderr, "  SSL_read/SSL_write intercepted: %lu\n", counter);
-                }
-            }
-        }
-    }
-
-    fprintf(stderr, "\n%s============================================%s\n\n", dim, reset);
+    /* Use modular stats output */
+    stats_print_session(&ts, xdp_ptr,
+                        g_bpf_initialized ? &g_loader : NULL,
+                        log_ptr,
+                        g_config.use_colors);
 }
 
 /* Master cleanup function registered with atexit() */
@@ -675,8 +512,19 @@ static void cleanup_all_resources(void) {
         threading_shutdown(&g_threading);
     }
 
-    /* Print all statistics while data structures are still alive */
+    /* Drain async logger (joins thread, flushes remaining messages)
+     * Stats remain valid in global struct after this. */
+    if (g_logger_initialized) {
+        log_cleanup();
+        /* Don't set g_logger_initialized = false yet - stats are still valid */
+    }
+
+    /* Print all statistics while data structures are still alive
+     * Logger stats are still readable from global atomics after cleanup */
     print_shutdown_stats();
+
+    /* Now mark logger as uninitialized */
+    g_logger_initialized = false;
 
     /* Now safe to free threading resources */
     if (g_threading_initialized) {
@@ -769,8 +617,10 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
     /* Handle process exit events - cleanup resources */
     if (event->event_type == EVENT_PROCESS_EXIT) {
         /* Cleanup HTTP/2 sessions for this PID */
-        for (int i = 0; i < state->h2_connection_count; i++) {
-            if (state->h2_connections[i].active &&
+        for (int i = 0; i < state->h2_connection_capacity; i++) {
+            h2_conn_state_t conn_state = atomic_load_explicit(
+                &state->h2_connections[i].state, memory_order_relaxed);
+            if (conn_state == H2_CONN_STATE_ACTIVE &&
                 state->h2_connections[i].pid == event->pid) {
                 worker_cleanup_h2_connection(state, &state->h2_connections[i]);
             }
@@ -779,26 +629,45 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
         return;
     }
 
-    /* Handle handshake events */
+    /* Handle handshake events with deduplication (Fix #3) */
     if (event->event_type == EVENT_HANDSHAKE) {
         if (g_config.show_handshake) {
-            char ts[32];
-            display_get_timestamp(ts, sizeof(ts));
+            /*
+             * Deduplicate handshake events within 100ms window.
+             *
+             * SSL_do_handshake() / SSL_connect() can be called multiple times
+             * during TLS negotiation (WANT_READ/WANT_WRITE retries). Each
+             * successful return fires a handshake completion event, causing
+             * duplicate output.
+             *
+             * Fix: Track last handshake timestamp in flow_ctx and skip
+             * events that arrive within 100ms of the previous one.
+             */
+            if (event->flow_ctx) {
+                uint64_t delta_ns = event->timestamp_ns > event->flow_ctx->last_handshake_ns
+                    ? event->timestamp_ns - event->flow_ctx->last_handshake_ns
+                    : 0;
+
+                /* Atomic check-and-set to prevent duplicate display.
+                 * If already displayed within 100ms window, skip.
+                 * atomic_exchange returns previous value, so if it returns true,
+                 * another thread already displayed this handshake. */
+                bool was_displayed = atomic_exchange(&event->flow_ctx->handshake_displayed, true);
+                if (was_displayed && delta_ns < 100000000ULL) {
+                    return;  /* Duplicate - skip */
+                }
+
+                /* Update last handshake timestamp (after winning the race) */
+                event->flow_ctx->last_handshake_ns = event->timestamp_ns;
+            }
 
             char proc_name[TASK_COMM_LEN] = {0};
             get_process_name(event->pid, proc_name, sizeof(proc_name));
             const char *name = proc_name[0] ? proc_name : event->comm;
 
-            char lat[32];
-            display_format_latency(event->delta_ns, lat, sizeof(lat));
-
-            output_write(worker, "%s%s%s %s\xf0\x9f\x94\x92%s TLS handshake %scomplete%s %s[%s]%s %s%s%s %s(%u)%s\n",
-                        display_color(C_DIM), ts, display_color(C_RESET),
-                        display_color(C_MAGENTA), display_color(C_RESET),
-                        display_color(C_GREEN), display_color(C_RESET),
-                        display_color(C_YELLOW), lat, display_color(C_RESET),
-                        display_color(C_CYAN), name, display_color(C_RESET),
-                        display_color(C_DIM), event->pid, display_color(C_RESET));
+            /* Use extended handshake display with flow context for network info */
+            display_handshake_ex(event->pid, name, event->delta_ns,
+                                 (int)event->data_len, event->flow_ctx);
         }
         return;
     }
@@ -812,7 +681,7 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
             /* Store in Shared Pool flow_context and initialize parser */
             if (event->flow_ctx) {
                 flow_init_parser(event->flow_ctx, alpn_proto);
-                event->flow_ctx->flags |= FLOW_FLAG_HAS_SSL;
+                atomic_fetch_or(&event->flow_ctx->flags, FLOW_FLAG_HAS_SSL);
             }
         }
         return;
@@ -893,13 +762,13 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
     const char *display_name = raw_proc_name[0] ? raw_proc_name : event->comm;
 
     if (sig) {
-        output_write(worker, "%s%s%s [%s%s%s] %s (PID %u) %u bytes %s[%s]%s\n",
+        log_printf("%s%s%s [%s%s%s] %s (PID %u) %u bytes %s[%s]%s\n",
                     display_color(C_DIM), ts, display_color(C_RESET),
                     display_color(C_CYAN), dir, display_color(C_RESET),
                     display_name, event->pid, event->data_len,
                     display_color(C_YELLOW), sig, display_color(C_RESET));
     } else {
-        output_write(worker, "%s%s%s [%s%s%s] %s (PID %u) %u bytes\n",
+        log_printf("%s%s%s [%s%s%s] %s (PID %u) %u bytes\n",
                     display_color(C_DIM), ts, display_color(C_RESET),
                     display_color(C_CYAN), dir, display_color(C_RESET),
                     display_name, event->pid, event->data_len);
@@ -1069,6 +938,15 @@ int main(int argc, char **argv) {
 
     /* Initialize modules */
     display_init(g_config.use_colors);
+
+    /* Initialize async logger (must be before threading) */
+    if (log_init(NULL) != 0) {
+        fprintf(stderr, "Warning: Failed to initialize async logger\n");
+        /* Continue anyway - will fall back to direct output */
+    } else {
+        g_logger_initialized = true;
+    }
+
     if (signatures_init() != 0) {
         fprintf(stderr, "Warning: Failed to initialize signature detection (memory allocation failure)\n");
         /* Continue anyway - detection will work but signatures won't be in priority order */
@@ -1244,9 +1122,11 @@ int main(int argc, char **argv) {
                     printf("  %s✓%s sock_ops attached for cookie caching\n",
                            display_color(C_GREEN), display_color(C_RESET));
                 }
-            } else if (debug_mode) {
-                printf("  %s[DEBUG]%s sock_ops attach failed (cookie correlation limited)\n",
-                       display_color(C_YELLOW), display_color(C_RESET));
+            } else {
+                /* CRITICAL: Without sock_ops, XDP correlation will fail */
+                fprintf(stderr, "%sWarning:%s sock_ops attach failed - XDP correlation will be limited\n",
+                        display_color(C_YELLOW), display_color(C_RESET));
+                fprintf(stderr, "  This may be due to missing cgroup2 mount or permissions\n");
             }
 
             /* Warm-up: Seed flow_cookie_map with existing TCP connections
@@ -1690,8 +1570,9 @@ int main(int argc, char **argv) {
      *   - EINTR:         Harmless (continue loop)
      */
 
-    /* Start multi-threaded event processing */
-    if (threading_start(&g_threading, &g_handler) != 0) {
+    /* Start multi-threaded event processing
+     * Pass loader for XDP polling in dispatcher thread (single-writer architecture) */
+    if (threading_start(&g_threading, &g_handler, g_xdp_initialized ? &g_loader : NULL) != 0) {
         fprintf(stderr, "%sError:%s Failed to start threading\n",
                 display_color(C_RED), display_color(C_RESET));
         return 1;
@@ -1701,34 +1582,34 @@ int main(int argc, char **argv) {
     dispatcher_set_lifecycle_callback(&g_threading.dispatcher,
                                       threading_process_exec_callback, NULL);
 
-    /* Re-register XDP callback with the threaded dispatcher's flow_cache.
+    /* Re-register XDP callback with the threaded dispatcher's flow manager.
      * The initial registration (above) used g_xdp_dispatcher which has no
-     * flow_cache. Now that threading is started, use the real dispatcher
-     * so XDP events populate the same flow_cache that SSL events use. */
+     * flow_mgr. Now that threading is started, use the real dispatcher
+     * so XDP events populate the same flow_mgr that SSL events use. */
     if (g_xdp_initialized) {
         bpf_loader_xdp_set_event_callback(&g_loader,
                                           dispatcher_xdp_event_handler,
                                           &g_threading.dispatcher);
         if (debug_mode) {
-            printf("  %s✓%s XDP callback re-registered with threaded dispatcher\n",
+            printf("  %s✓%s XDP callback registered with dispatcher (single-writer)\n",
                    display_color(C_GREEN), display_color(C_RESET));
         }
     }
 
-    /* Main thread polls XDP ring buffer while workers handle uprobes */
+    /*
+     * Main thread: just wait for exit signal.
+     *
+     * Event polling is handled by dispatcher thread (modular design):
+     * - SSL events: probe_handler_poll() in dispatcher
+     * - XDP events: bpf_loader_xdp_poll() in dispatcher
+     *
+     * This single-writer architecture ensures all hash table writes
+     * (cookie_index, shadow_index) happen in one thread, making
+     * CK hs SPMC mode safe without locking.
+     */
     while (!g_exiting) {
-        if (g_xdp_initialized && bpf_loader_xdp_is_active(&g_loader)) {
-            /* Poll XDP events (non-blocking with short timeout) */
-            int xdp_err = bpf_loader_xdp_poll(&g_loader, 50);
-            if (xdp_err < 0 && xdp_err != -EINTR) {
-                if (debug_mode) {
-                    fprintf(stderr, "[DEBUG] XDP poll error: %d\n", xdp_err);
-                }
-            }
-        }
-        usleep(50000);  /* 50ms between XDP polls */
+        usleep(100000);  /* 100ms - check exit flag periodically */
     }
-    /* Shutdown handled by cleanup_all_resources via atexit */
 
     printf("\n%sDone.%s\n", display_color(C_GREEN), display_color(C_RESET));
 

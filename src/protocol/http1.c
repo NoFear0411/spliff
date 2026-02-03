@@ -40,8 +40,10 @@
 #include "../util/safe_str.h"
 #include "../correlation/flow_context.h"
 #include "../output/display.h"
+#include "../output/logger.h"
 #include "../content/decompressor.h"
 #include "../threading/threading.h"
+#include "../threading/deferred.h"
 #include <llhttp.h>
 #include <string.h>
 #include <strings.h>
@@ -911,7 +913,7 @@ static void h1_display_message_flow(struct flow_context *flow_ctx,
     }
 
     /* Add XDP flow correlation if available */
-    if (flow_ctx->flags & FLOW_FLAG_HAS_XDP) {
+    if (atomic_load_explicit(&flow_ctx->flags, memory_order_acquire) & FLOW_FLAG_HAS_XDP) {
         msg.has_flow_info = true;
         msg.flow_src_ip = flow_ctx->flow.saddr;
         msg.flow_dst_ip = flow_ctx->flow.daddr;
@@ -919,15 +921,16 @@ static void h1_display_message_flow(struct flow_context *flow_ctx,
         msg.flow_dst_port = flow_ctx->flow.dport;
         msg.flow_ip_version = flow_ctx->flow.ip_version;
         msg.flow_category = flow_ctx->xdp_category;
+        msg.flow_direction = flow_ctx->xdp_direction;
+        safe_strcpy(msg.flow_ifname, sizeof(msg.flow_ifname), flow_ctx->ifname);
     }
 
-    if (txn->direction == DIR_REQUEST) {
-        display_http_request(&msg);
-    } else {
-        display_http_response(&msg);
-    }
-    printf("\n");
-    fflush(stdout);
+    /* HTTP/1.1: stream_id=0, correlation based on socket_cookie only */
+    msg.correlation_id = calculate_correlation_id(flow_ctx->socket_cookie, 0);
+
+    /* Use deferred display for XDP correlation synchronization */
+    deferred_display_or_enqueue(&msg, flow_ctx);
+    /* Newline and flush handled by async logger */
 }
 
 /**
@@ -972,7 +975,7 @@ static void h1_display_body_flow(struct flow_context *flow_ctx) {
     }
 
     display_body(display_data, display_len, txn->content_type);
-    fflush(stdout);
+    /* Flush handled by async logger */
 
     if (decomp_buf) {
         free(decomp_buf);

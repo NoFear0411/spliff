@@ -38,7 +38,7 @@
  */
 
 /** @brief Full version string (major.minor.patch) */
-#define SPLIFF_VERSION "0.9.8"
+#define SPLIFF_VERSION "0.9.9"
 
 /** @brief Major version number (breaking changes) */
 #define SPLIFF_VERSION_MAJOR 0
@@ -47,7 +47,7 @@
 #define SPLIFF_VERSION_MINOR 9
 
 /** @brief Patch version number (bug fixes) */
-#define SPLIFF_VERSION_PATCH 8
+#define SPLIFF_VERSION_PATCH 9
 
 /** @} */ /* end of version group */
 
@@ -82,6 +82,42 @@
     do { if (g_config.debug_mode) fprintf(stderr, "[MAIN DEBUG] " fmt "\n", ##__VA_ARGS__); } while(0)
 
 /** @} */ /* end of debug group */
+
+/**
+ * @defgroup correlation Request-Response Correlation
+ * @brief Utilities for pairing HTTP requests with responses
+ * @{
+ */
+
+/** @brief FNV-1a hash offset basis for 64-bit */
+#define FNV_OFFSET_BASIS 14695981039346656037ULL
+
+/** @brief FNV-1a hash prime for 64-bit */
+#define FNV_PRIME 1099511628211ULL
+
+/**
+ * @brief Generate correlation ID using FNV-1a hash
+ *
+ * Creates a unique identifier for request-response pairing.
+ * Same (cookie, stream_id) always produces same correlation_id.
+ *
+ * @param[in] cookie    Socket cookie (0 if unavailable)
+ * @param[in] stream_id HTTP/2 stream ID (0 for HTTP/1.1)
+ * @return 64-bit correlation ID
+ */
+static inline uint64_t calculate_correlation_id(uint64_t cookie, uint32_t stream_id) {
+    uint64_t hash = FNV_OFFSET_BASIS;
+
+    hash ^= cookie;
+    hash *= FNV_PRIME;
+
+    hash ^= (uint64_t)stream_id;
+    hash *= FNV_PRIME;
+
+    return hash;
+}
+
+/** @} */ /* end of correlation group */
 
 /**
  * @defgroup limits Size Limits
@@ -354,6 +390,9 @@ typedef struct {
     uint8_t flow_direction;     /**< Direction (1=ingress, 2=egress) */
     uint8_t flow_category;      /**< XDP protocol category */
     char flow_ifname[16];       /**< Network interface name */
+
+    /* Request-Response Pairing */
+    uint64_t correlation_id;    /**< Hash of (socket_cookie, stream_id) for pairing */
 } http_message_t;
 
 /** @} */ /* end of http group */
