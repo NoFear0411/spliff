@@ -117,7 +117,8 @@
 │  │  ║                                                                           ║   │     │
 │  │  ║              ┌─────────────────┐       ┌─────────────────┐                ║   │     │
 │  │  ║              │ flow_cookie_map │       │   ssl_to_fd     │                ║   │     │
-│  │  ║              │ (5-tuple:cookie)│       │ (SSL*:fd:cookie)│                ║   │     │
+│  │  ║              │ (5-tuple:cookie)│       │ (LRU_HASH v0.9.10)              ║   │     │
+│  │  ║              │ + map_v6 (IPv6) │       │                 │                ║   │     │
 │  │  ║              └────────┬────────┘       └────────┬────────┘                ║   │     │
 │  │  ║                       │                         │                         ║   │     │
 │  │  ║                       └────────────┬────────────┘                         ║   │     │
@@ -263,9 +264,12 @@ connection from which process.
 │  │  value: flow_ctx*      │        │  value: flow_ctx*       │       │
 │  │  (incremental resize)  │        │  (incremental resize)   │       │
 │  │                        │        │                         │       │
-│  │  cookie_A → ctx_A      │        │  (100, ctx1) → ctx_A    │       │
-│  │  cookie_B → ctx_B      │        │  (200, ctx2) → ctx_B    │       │
-│  │                        │        │  (300, ctx3) → ctx_D    │       │
+│  │  cookie_A → ctx_A      │        │  by_composite:          │       │
+│  │  cookie_B → ctx_B      │        │  (100, ctx1) → ctx_A    │       │
+│  │                        │        │  (200, ctx2) → ctx_B    │       │
+│  │                        │        │                         │       │
+│  │                        │        │  by_cookie (v0.9.10):   │       │
+│  │                        │        │  cookie_A → ctx_A (O(1))│       │
 │  └────────────────────────┘        └─────────────────────────┘       │
 │                                                                      │
 │  Per-Flow State (flow_context_t):                                    │
@@ -274,7 +278,7 @@ connection from which process.
 │  │ • socket_cookie, pid, ssl_ctx, generation, list_prev/next      │  │
 │  │                                                                │  │
 │  │ Cache line 1 (network + timing):                               │  │
-│  │ • flow_key, ifindex, first_seen, last_seen, counters           │  │
+│  │ • flow_key, ifindex, first_seen, last_seen, atomic counters    │  │
 │  │                                                                │  │
 │  │ Cache line 2+ (protocol state):                                │  │
 │  │ • flags, home_worker_id, inflight_events (atomic)              │  │
@@ -299,10 +303,15 @@ connection from which process.
 - **Generation safety**: Stale pointer detection across worker threads
 - **Inflight counting**: Reference-counted deferred free prevents use-after-free
 - **Single-writer guarantee**: Atomic CAS on `home_worker_id` prevents races
+- **RCU-safe reclamation**: liburcu `call_rcu()` for safe deferred memory frees (v0.9.10)
+- **Atomic counters**: Per-flow counters use `_Atomic` with relaxed ordering (v0.9.10)
 - **O(1) stream allocation**: Free-list based pool for HTTP/2 streams
 - **O(active) janitor**: Linked list traversal, not O(capacity) bitmap scan
+- **IPv6 zero-collision**: Separate 40-byte `flow_key_v6` with full 128-bit addresses (v0.9.10)
+- **Secondary cookie index**: O(1) lookup by socket_cookie in shadow_index (v0.9.10)
+- **Dynamic cgroup2**: Parses `/proc/mounts` for cgroup2 mount point (v0.9.10)
 
-## XDP Event Delivery (v0.9.9)
+## XDP Event Delivery (v0.9.9+)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -338,7 +347,7 @@ connection from which process.
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Deferred Display Queue (v0.9.9)
+## Deferred Display Queue (v0.9.9+)
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -379,6 +388,78 @@ connection from which process.
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+
+## Thread Safety Model (v0.9.10)
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                   THREAD SAFETY & MEMORY RECLAMATION                   │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    DISPATCHER THREAD (SINGLE WRITER)            │   │
+│  │                                                                 │   │
+│  │  • Owns all write operations to flow indexes                   │   │
+│  │  • Creates flows via flow_get_or_create()                      │   │
+│  │  • Merges SSL info via flow_merge_ssl_info() (single-writer)   │   │
+│  │  • Promotes flows: shadow_index → cookie_index                 │   │
+│  │  • Terminates flows via flow_terminate()                       │   │
+│  │                                                                 │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                              │                                         │
+│              ┌───────────────┼───────────────┬───────────────┐         │
+│              ▼               ▼               ▼               ▼         │
+│  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐ ┌─────────┐  │
+│  │   Worker 0     │ │   Worker 1     │ │   Worker N     │ │ Logger  │  │
+│  │   (READER)     │ │   (READER)     │ │   (READER)     │ │ Thread  │  │
+│  ├────────────────┤ ├────────────────┤ ├────────────────┤ ├─────────┤  │
+│  │ • Read-only    │ │ • Read-only    │ │ • Read-only    │ │ SPMC    │  │
+│  │   index lookup │ │   index lookup │ │   index lookup │ │ dequeue │  │
+│  │ • Atomic reads │ │ • Atomic reads │ │ • Atomic reads │ │ from    │  │
+│  │ • RCU reader   │ │ • RCU reader   │ │ • RCU reader   │ │ free    │  │
+│  │   critical     │ │   critical     │ │   critical     │ │ ring    │  │
+│  │   sections     │ │   sections     │ │   sections     │ │         │  │
+│  └────────────────┘ └────────────────┘ └────────────────┘ └─────────┘  │
+│                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    liburcu INTEGRATION (v0.9.10)                │   │
+│  │                                                                 │   │
+│  │  Memory Reclamation (RCU-safe deferred free):                   │   │
+│  │  ┌─────────────────────────────────────────────────────────┐    │   │
+│  │  │ 1. Writer removes entry from hash table                 │    │   │
+│  │  │ 2. call_rcu(&entry->rcu_head, free_callback) schedules  │    │   │
+│  │  │ 3. RCU grace period waits for all readers to quiesce    │    │   │
+│  │  │ 4. Callback safely frees memory after grace period      │    │   │
+│  │  └─────────────────────────────────────────────────────────┘    │   │
+│  │                                                                 │   │
+│  │  Thread Registration:                                           │   │
+│  │  • urcu_memb_register_thread() on worker/dispatcher start       │   │
+│  │  • urcu_memb_unregister_thread() on thread exit                 │   │
+│  │  • synchronize_rcu() during graceful shutdown                   │   │
+│  │                                                                 │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                    ATOMIC COUNTERS (v0.9.10)                    │   │
+│  │                                                                 │   │
+│  │  Per-flow counters use _Atomic with relaxed ordering:           │   │
+│  │  • pkts_in, pkts_out    - atomic_fetch_add (relaxed)            │   │
+│  │  • bytes_in, bytes_out  - atomic_fetch_add (relaxed)            │   │
+│  │                                                                 │   │
+│  │  Logger ring uses SPMC operations:                              │   │
+│  │  • Workers: ck_ring_dequeue_spmc() from free_ring               │   │
+│  │  • Logger:  ck_ring_enqueue_spsc() to free_ring                 │   │
+│  │                                                                 │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Key v0.9.10 Thread Safety Improvements:**
+- **Single-writer guarantee**: `flow_merge_ssl_info()` isolates all write operations to dispatcher thread
+- **RCU-safe memory reclamation**: liburcu `call_rcu()` ensures readers never see freed memory
+- **Atomic counters**: Per-flow packet/byte counters are now `_Atomic` to prevent lost updates
+- **Correct ring semantics**: Logger free_ring uses SPMC (multiple workers dequeue, single logger enqueues)
 
 ## Data Flow
 

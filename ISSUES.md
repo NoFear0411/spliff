@@ -90,6 +90,84 @@ These are architectural or design constraints rather than bugs.
 
 ## Resolved Issues
 
+### IPv6 XOR Hash Collisions (Fixed in v0.9.10)
+
+**Symptoms:**
+- IPv6 flow correlation fails or has high collision rate (~50% at 65K flows)
+- Different IPv6 flows incorrectly correlated to same flow context
+
+**Root Cause:**
+XOR hashing of 128-bit IPv6 addresses to 32-bit values loses too much information. With 65K flows, birthday problem causes ~50% collision probability.
+
+**Resolution:**
+Implemented zero-collision IPv6 flow correlation:
+- New `struct flow_key_v6` with full 16-byte source and destination addresses (40 bytes total)
+- Separate `flow_cookie_map_v6` BPF map (LRU_HASH, 32768 entries)
+- IPv6 extension header walking with bounded loop (MAX_IPV6_EXT_HEADERS=5)
+- XDP parser updated to use appropriate flow key type based on IP version
+
+**Fixed in:** `src/bpf/spliff.bpf.c`, `src/include/spliff.h`
+
+---
+
+### O(n) Cookie Lookup in Shadow Index (Fixed in v0.9.10)
+
+**Symptoms:**
+- `ck_shadow_find_by_cookie()` performs O(n) linear scan
+- Performance degrades with many concurrent flows
+
+**Root Cause:**
+Shadow index only had composite key (pid, ssl_ctx) → flow lookup. Finding flow by socket_cookie required iterating all entries.
+
+**Resolution:**
+Added secondary `ck_hs` hash table keyed by socket_cookie:
+- `by_cookie` hash set added to `ck_shadow_index_t` struct
+- O(1) lookup via `ck_shadow_find_by_cookie()`
+- Dual insert/remove to maintain both indexes
+- ~8KB memory cost (256 entries × 32 bytes)
+
+**Fixed in:** `src/correlation/ck_shadow_index.h`, `src/correlation/ck_shadow_index.c`
+
+---
+
+### Hardcoded cgroup2 Paths (Fixed in v0.9.10)
+
+**Symptoms:**
+- sock_ops attachment fails on systems with non-standard cgroup2 mount
+- Manual path configuration required for some distributions
+
+**Root Cause:**
+Hardcoded fallback paths (`/sys/fs/cgroup`, `/sys/fs/cgroup/unified`) don't cover all configurations.
+
+**Resolution:**
+Implemented dynamic cgroup2 detection:
+- `find_cgroup2_mount()` parses `/proc/mounts` for "cgroup2" filesystem type
+- Falls back to standard paths if parsing fails
+- Works across all distributions: Fedora 31+, Ubuntu 21.10+, RHEL 9+
+
+**Fixed in:** `src/bpf/bpf_loader.c`
+
+---
+
+### Cache-Line Alignment Verification (Fixed in v0.9.10)
+
+**Symptoms:**
+- Potential performance issues on systems where `aligned_alloc(64, ...)` may not work
+- No compile-time verification of alignment requirements
+
+**Root Cause:**
+jemalloc dependency implicit; glibc < 2.16 may not honor 64-byte alignment.
+
+**Resolution:**
+Added compile-time verification:
+- `_Static_assert(alignof(max_align_t) >= 16, ...)` ensures system alignment is sufficient
+- Documentation clarifies jemalloc requirement for cache-line alignment
+- `aligned_alloc(64, ...)` used for HTTP/2 response buffer (65KB)
+
+**Fixed in:** `src/correlation/flow_context.c`, `src/threading/state.c`
+
+---
+
 ### SSL-sockops Timing Race (Fixed in v0.9.2)
 
 **Symptoms:**

@@ -8,12 +8,56 @@
  *
  * Uses Concurrency Kit's ck_hs (hash set) for lock-free SPMC access.
  * All entries are cache-line aligned for optimal performance.
+ *
+ * FIX H4/M9: Integrates liburcu for safe deferred memory reclamation.
+ * When CK passes defer=true, we use call_rcu() to delay the free
+ * until all readers have completed their critical sections.
  */
 
 #include "ck_cookie_index.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdalign.h>
+
+/*
+ * liburcu for safe deferred memory reclamation (FIX H4/M9)
+ *
+ * We use the urcu-memb flavor (memory barriers) for RCU synchronization.
+ * The call_rcu() API requires liburcu-cds library for the call-rcu thread.
+ *
+ * _LGPL_SOURCE enables static inline optimizations for RCU read-side.
+ * We use explicit urcu_memb_call_rcu() to avoid macro expansion issues.
+ */
+#define _LGPL_SOURCE
+#define RCU_MEMBARRIER
+#include <urcu/urcu-memb.h>
+#include <urcu/call-rcu.h>
+
+/*============================================================================
+ * RCU Deferred Free Support (FIX H4/M9)
+ *============================================================================*/
+
+/**
+ * @brief RCU callback structure for deferred free
+ *
+ * Wraps the pointer to free with an rcu_head for call_rcu() integration.
+ */
+typedef struct {
+    struct rcu_head rcu_head;  /**< liburcu callback header */
+    void *ptr;                 /**< Pointer to free */
+} ck_rcu_free_t;
+
+/**
+ * @brief RCU callback to perform deferred free
+ *
+ * Called by liburcu worker thread after all readers have completed
+ * their critical sections (grace period has passed).
+ */
+static void ck_rcu_free_callback(struct rcu_head *head) {
+    ck_rcu_free_t *rcu_free = caa_container_of(head, ck_rcu_free_t, rcu_head);
+    free(rcu_free->ptr);
+    free(rcu_free);
+}
 
 /*============================================================================
  * CK Memory Allocator
@@ -29,12 +73,36 @@ static void *ck_cookie_malloc(size_t size) {
 }
 
 /**
- * @brief Free for ck_hs allocations
+ * @brief Free for ck_hs allocations with RCU-safe deferred free
+ *
+ * FIX H4/M9: When defer=true, CK is indicating that readers may still be
+ * accessing the memory. We use liburcu's call_rcu() to defer the free
+ * until after a grace period when all readers have completed.
+ *
+ * @param ptr    Pointer to free
+ * @param size   Size of allocation (unused)
+ * @param defer  true = readers may be active, use RCU deferred free
  */
 static void ck_cookie_free(void *ptr, size_t size, bool defer) {
     (void)size;
-    (void)defer;
-    free(ptr);
+
+    if (!defer || ptr == nullptr) {
+        /* Immediate free is safe (no readers) */
+        free(ptr);
+        return;
+    }
+
+    /* FIX H4/M9: Deferred free via liburcu urcu_memb_call_rcu()
+     * Allocate callback structure and schedule deferred free.
+     * Using explicit flavor-prefixed name to avoid macro expansion issues. */
+    ck_rcu_free_t *rcu_free = malloc(sizeof(*rcu_free));
+    if (rcu_free) {
+        rcu_free->ptr = ptr;
+        urcu_memb_call_rcu(&rcu_free->rcu_head, ck_rcu_free_callback);
+    } else {
+        /* Fallback: immediate free if OOM (unsafe but avoids leak) */
+        free(ptr);
+    }
 }
 
 static struct ck_malloc cookie_allocator = {

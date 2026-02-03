@@ -57,6 +57,10 @@
 /** Ring buffer size - must be power of 2. ~256KB memory per worker. */
 #define XDP_RING_SIZE 4096
 
+/* Batch 5.1: Compile-time verification of ring size invariant */
+_Static_assert((XDP_RING_SIZE & (XDP_RING_SIZE - 1)) == 0,
+               "XDP_RING_SIZE must be power of 2 for bitmask optimization");
+
 /** Bitmask for fast modulo on power-of-2 size */
 #define XDP_RING_MASK (XDP_RING_SIZE - 1)
 

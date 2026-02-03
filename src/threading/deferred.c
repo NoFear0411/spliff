@@ -36,8 +36,11 @@
 /**
  * @brief Allocate entry from free list or heap
  *
+ * FIX L3: Use cache-line aligned allocation to prevent false sharing
+ * when multiple workers operate on adjacent entries.
+ *
  * @param[in] q Queue with free list
- * @return Allocated entry or NULL
+ * @return Allocated entry or NULL (cache-line aligned)
  */
 static deferred_msg_t *deferred_alloc(deferred_queue_t *q) {
     deferred_msg_t *entry = q->free_list;
@@ -46,7 +49,13 @@ static deferred_msg_t *deferred_alloc(deferred_queue_t *q) {
         entry->next = NULL;
         return entry;
     }
-    return calloc(1, sizeof(deferred_msg_t));
+    /* FIX L3: Use aligned_alloc for cache-line alignment (64 bytes)
+     * to prevent false sharing between adjacent entries */
+    entry = aligned_alloc(64, sizeof(deferred_msg_t));
+    if (entry) {
+        memset(entry, 0, sizeof(deferred_msg_t));
+    }
+    return entry;
 }
 
 /**
@@ -123,10 +132,12 @@ int deferred_queue_init(deferred_queue_t *q, size_t prealloc) {
 
     memset(q, 0, sizeof(*q));
 
-    /* Pre-allocate free list entries to avoid malloc in hot path */
+    /* Pre-allocate free list entries to avoid malloc in hot path
+     * FIX L3: Use aligned_alloc for cache-line alignment (64 bytes) */
     for (size_t i = 0; i < prealloc; i++) {
-        deferred_msg_t *entry = calloc(1, sizeof(deferred_msg_t));
+        deferred_msg_t *entry = aligned_alloc(64, sizeof(deferred_msg_t));
         if (entry) {
+            memset(entry, 0, sizeof(deferred_msg_t));
             entry->next = q->free_list;
             q->free_list = entry;
         }

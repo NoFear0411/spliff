@@ -123,14 +123,16 @@ static int collect_and_write_output(output_ctx_t *ctx) {
             if (msg->len > 0) {
                 size_t n = fwrite(msg->data, 1, msg->len, ctx->output_file);
                 if (n > 0) {
-                    atomic_fetch_add(&ctx->bytes_written, n);
+                    /* FIX L2: Use relaxed ordering for non-synchronizing stats counters */
+                    atomic_fetch_add_explicit(&ctx->bytes_written, n, memory_order_relaxed);
                 }
             }
 
             /* Return message to worker's output pool */
             pool_free(&worker->output_pool, msg);
 
-            atomic_fetch_add(&ctx->messages_written, 1);
+            /* FIX L2: Use relaxed ordering for non-synchronizing stats counters */
+            atomic_fetch_add_explicit(&ctx->messages_written, 1, memory_order_relaxed);
             written++;
             batch++;
         }

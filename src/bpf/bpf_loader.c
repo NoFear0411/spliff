@@ -68,8 +68,13 @@ int bpf_loader_init(bpf_loader_t *loader) {
      * FIX M6: Save original MEMLOCK before modifying.
      * BPF programs require elevated memory lock limits. We save the original
      * value so it can be restored during cleanup for proper resource hygiene.
+     *
+     * FIX L4: Initialize saved_memlock before use to prevent undefined behavior
+     * if getrlimit() fails and we later try to restore from uninitialized memory.
      */
     loader->memlock_modified = false;
+    memset(&loader->saved_memlock, 0, sizeof(loader->saved_memlock));
+
     if (getrlimit(RLIMIT_MEMLOCK, &loader->saved_memlock) == 0) {
         struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
         if (setrlimit(RLIMIT_MEMLOCK, &rlim) == 0) {
@@ -1262,6 +1267,76 @@ int bpf_loader_xdp_attach_all(bpf_loader_t *loader, bool debug) {
     return attached;
 }
 
+/**
+ * @brief Find cgroup2 mount point by parsing /proc/mounts (FIX M3)
+ *
+ * Production-stable approach that works across all distributions:
+ * 1. Parse /proc/mounts for "cgroup2" filesystem type
+ * 2. Fall back to standard paths if parsing fails
+ *
+ * This handles non-standard cgroup2 mounts that the hardcoded path list
+ * would miss (e.g., containers, custom systemd configurations).
+ *
+ * @param[out] out_path  Buffer to store the found path (min 256 bytes)
+ * @param[in]  out_size  Size of out_path buffer
+ * @param[in]  debug     Enable debug output
+ * @return Pointer to out_path on success, nullptr on failure
+ */
+static const char *find_cgroup2_mount(char *out_path, size_t out_size, bool debug) {
+    if (!out_path || out_size < 64) {
+        return nullptr;
+    }
+
+    /* Try parsing /proc/mounts first for accurate detection */
+    FILE *f = fopen("/proc/mounts", "re");  /* 'e' for O_CLOEXEC */
+    if (f != nullptr) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            char dev[128], mount[256], type[64], opts[256];
+            int parsed = sscanf(line, "%127s %255s %63s %255s", dev, mount, type, opts);
+            if (parsed >= 3 && strcmp(type, "cgroup2") == 0) {
+                size_t len = strlen(mount);
+                if (len < out_size) {
+                    memcpy(out_path, mount, len + 1);
+                    fclose(f);
+                    if (debug) {
+                        printf("  [SOCKOPS] Found cgroup2 in /proc/mounts: %s\n", out_path);
+                    }
+                    return out_path;
+                }
+            }
+        }
+        fclose(f);
+        if (debug) {
+            printf("  [SOCKOPS] No cgroup2 found in /proc/mounts, trying fallbacks\n");
+        }
+    }
+
+    /* Fallback to standard paths for systems where /proc/mounts is unavailable
+     * or when cgroup2 is mounted at a standard location not listed in mounts */
+    static const char *fallback_paths[] = {
+        "/sys/fs/cgroup",           /* Unified hierarchy (Fedora 31+, Ubuntu 21.10+) */
+        "/sys/fs/cgroup/unified",   /* Hybrid mode fallback (older systemd) */
+        nullptr
+    };
+
+    for (int i = 0; fallback_paths[i] != nullptr; i++) {
+        struct stat st;
+        if (stat(fallback_paths[i], &st) == 0 && S_ISDIR(st.st_mode)) {
+            size_t len = strlen(fallback_paths[i]);
+            if (len < out_size) {
+                memcpy(out_path, fallback_paths[i], len + 1);
+                if (debug) {
+                    printf("  [SOCKOPS] Using fallback cgroup2 path: %s\n", out_path);
+                }
+                return out_path;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 /* Attach sock_ops program for socket cookie caching */
 int bpf_loader_sockops_attach(bpf_loader_t *loader, bool debug) {
     if (!loader || !loader->obj) {
@@ -1280,24 +1355,18 @@ int bpf_loader_sockops_attach(bpf_loader_t *loader, bool debug) {
         return -1;
     }
 
-    /* Open root cgroup for attachment
+    /* FIX M3: Dynamic cgroup2 mount detection via /proc/mounts
      * sock_ops programs must be attached to a cgroup.
      * We use the root cgroup (cgroup2) so all connections are tracked.
      */
-    const char *cgroup_paths[] = {
-        "/sys/fs/cgroup",           /* cgroup2 unified hierarchy */
-        "/sys/fs/cgroup/unified",   /* cgroup2 on hybrid systems */
-        NULL
-    };
+    char cgroup_path[256];
+    const char *found_path = find_cgroup2_mount(cgroup_path, sizeof(cgroup_path), debug);
 
     int cgroup_fd = -1;
-    for (int i = 0; cgroup_paths[i] != NULL; i++) {
-        cgroup_fd = open(cgroup_paths[i], O_RDONLY | O_DIRECTORY);
-        if (cgroup_fd >= 0) {
-            if (debug) {
-                printf("  [SOCKOPS] Using cgroup: %s\n", cgroup_paths[i]);
-            }
-            break;
+    if (found_path != nullptr) {
+        cgroup_fd = open(found_path, O_RDONLY | O_DIRECTORY);
+        if (cgroup_fd >= 0 && debug) {
+            printf("  [SOCKOPS] Using cgroup: %s\n", found_path);
         }
     }
 
@@ -1395,14 +1464,18 @@ void bpf_loader_xdp_detach_all(bpf_loader_t *loader, bool debug) {
     for (int i = 0; i < xdp->interface_count; i++) {
         if (xdp->interfaces[i].attached) {
             int err = bpf_xdp_detach(xdp->interfaces[i].ifindex, 0, NULL);
-            if (err && debug) {
-                printf("  [XDP] Warning: detach from %s failed: %s\n",
-                       xdp->interfaces[i].name, strerror(-err));
-            }
-            xdp->interfaces[i].attached = false;
-
-            if (debug) {
-                printf("  [XDP] Detached from %s\n", xdp->interfaces[i].name);
+            if (err) {
+                /* FIX L5: Only clear attached flag on successful detach.
+                 * Keep attached=true to reflect actual kernel state when detach fails. */
+                if (debug) {
+                    printf("  [XDP] Warning: detach from %s failed: %s (state retained)\n",
+                           xdp->interfaces[i].name, strerror(-err));
+                }
+            } else {
+                xdp->interfaces[i].attached = false;
+                if (debug) {
+                    printf("  [XDP] Detached from %s\n", xdp->interfaces[i].name);
+                }
             }
         }
     }

@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(spliff
-    VERSION 0.9.9
+    VERSION 0.9.10
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C
@@ -363,21 +363,28 @@ endif()
 message(STATUS "Found libxdp: ${LIBXDP_VERSION}")
 
 # --- RCU support ---
+# liburcu-memb provides the membarrier-based RCU flavor
+# liburcu-cds provides call_rcu() for deferred memory reclamation
 pkg_check_modules(LIBURCU IMPORTED_TARGET liburcu-memb)
-if(NOT LIBURCU_FOUND)
+pkg_check_modules(LIBURCU_CDS IMPORTED_TARGET liburcu-cds)
+if(NOT LIBURCU_FOUND OR NOT LIBURCU_CDS_FOUND)
     find_path(LIBURCU_INCLUDE_DIR urcu/urcu-memb.h)
     find_library(LIBURCU_LIBRARY NAMES urcu-memb)
-    if(LIBURCU_INCLUDE_DIR AND LIBURCU_LIBRARY)
+    find_library(LIBURCU_CDS_LIBRARY NAMES urcu-cds)
+    if(LIBURCU_INCLUDE_DIR AND LIBURCU_LIBRARY AND LIBURCU_CDS_LIBRARY)
         message(STATUS "Found liburcu via direct search")
         set(LIBURCU_FOUND TRUE)
+        set(LIBURCU_CDS_FOUND TRUE)
         add_library(PkgConfig::LIBURCU INTERFACE IMPORTED)
         target_include_directories(PkgConfig::LIBURCU INTERFACE ${LIBURCU_INCLUDE_DIR})
         target_link_libraries(PkgConfig::LIBURCU INTERFACE ${LIBURCU_LIBRARY})
+        add_library(PkgConfig::LIBURCU_CDS INTERFACE IMPORTED)
+        target_link_libraries(PkgConfig::LIBURCU_CDS INTERFACE ${LIBURCU_CDS_LIBRARY})
     else()
         message(FATAL_ERROR "liburcu not found. Install userspace-rcu-devel (Fedora) or liburcu-dev (Debian)")
     endif()
 endif()
-message(STATUS "Found liburcu: ${LIBURCU_VERSION}")
+message(STATUS "Found liburcu: ${LIBURCU_VERSION} (memb + cds)")
 
 # --- Memory allocator ---
 # mimalloc provides lower latency for multi-threaded workloads
@@ -682,6 +689,7 @@ else()
         PkgConfig::CK
         PkgConfig::LIBXDP
         PkgConfig::LIBURCU
+        PkgConfig::LIBURCU_CDS
         # Memory allocator (mimalloc or jemalloc)
         ${ALLOCATOR_TARGET}
         # Pattern matching (vectorscan, hyperscan, or pcre2)

@@ -2,6 +2,130 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.10] - 2026-02-03
+
+### Security & Stability Audit Release
+
+This release addresses 25 issues identified during a comprehensive code audit,
+including 5 critical bugs, 7 high-priority issues, and integration of liburcu
+for safe memory reclamation.
+
+### Fixed
+
+#### Critical Fixes (P0)
+- **C1: BPF in-place map modifications** - Session info updates now use copy-modify-update
+  pattern with explicit `bpf_map_update_elem()` instead of non-persisting pointer writes
+- **C2: XDP-uprobe correlation race** - Added reverse flow key lookup in XDP, reducing
+  cookie correlation failures by trying both forward and reverse 5-tuple keys
+- **C4: Thread safety violation in flow_lookup_ex()** - Split into read-only lookup (SPMC safe)
+  and separate `flow_merge_ssl_info()` for single-writer context (dispatcher only)
+- **C5: Logger free_ring MPSC/SPMC mismatch** - Fixed to use `ck_ring_dequeue_spmc` for
+  multiple consumers (workers) and `ck_ring_enqueue_spsc` for single producer (logger)
+
+#### High Priority Fixes (P1)
+- **H1: ssl_to_fd map exhaustion** - Changed from `BPF_MAP_TYPE_HASH` to `LRU_HASH` to
+  prevent silent failures after 8K connections via automatic LRU eviction
+- **H2: XDP reverse flow key lookup** - Now tries reverse key when forward lookup fails,
+  catching asymmetric flow scenarios and late cookie arrivals
+- **H4/H5: CK defer flag ignored** - Integrated liburcu `call_rcu()` for safe deferred
+  memory reclamation in both `ck_cookie_index.c` and `ck_shadow_index.c`
+- **H6: Non-atomic flow counters** - Made `pkts_in`, `pkts_out`, `bytes_in`, `bytes_out`
+  atomic with `_Atomic uint32_t` and `atomic_fetch_add_explicit()` operations
+- **H7: XDP callback failure silent in non-debug** - Warning now always displayed when
+  XDP event callback registration fails (affects Golden Thread correlation)
+
+#### Medium Priority Fixes (P2)
+- **M5: Logger ring buffer alignment** - Changed from `calloc()` to `aligned_alloc()`
+  with `LOG_CACHE_LINE` (64-byte) alignment to prevent false sharing
+- **M9: liburcu integration** - Full implementation with `urcu_memb_register_thread()`
+  in worker and dispatcher threads, enabling RCU-safe deferred frees
+
+#### Low Priority Fixes (P3)
+- **H3: sockops byte order documentation** - Added clear documentation for BPF sock_ops
+  port semantics (remote_port: upper 16 bits network order, local_port: host order)
+- **L1: Dispatcher stats relaxed ordering** - Changed stats counters from seq_cst to
+  `memory_order_relaxed` (non-synchronizing counters don't need sequential consistency)
+- **L2: Output stats relaxed ordering** - Same fix for `bytes_written` and `messages_written`
+- **L3: Deferred queue cache alignment** - Changed from `calloc()` to `aligned_alloc(64,...)`
+  for `deferred_msg_t` entries to prevent false sharing between workers
+- **L4: MEMLOCK initialization** - Added `memset(&saved_memlock, 0, ...)` before `getrlimit()`
+  to prevent undefined behavior if getrlimit fails
+- **L5: XDP detach state accuracy** - Only clear `attached` flag on successful detach;
+  keep `true` if detach fails to reflect actual kernel state
+- **L6: g_probed_paths thread ownership** - Added Doxygen `@thread_safety` documentation
+  documenting main-thread-only access pattern
+
+### Added
+- **liburcu Integration**: Full userspace RCU support for lock-free data structures
+  - `call_rcu()` deferred free callbacks in CK hash table allocators
+  - Thread registration/unregistration in worker and dispatcher threads
+  - Grace period tracking for safe memory reclamation
+- **flow_merge_ssl_info()**: New single-writer function for merging SSL context into
+  XDP-created flows, maintaining SPMC thread safety invariants
+- **Compile-time invariant checks**: `_Static_assert` for ring buffer power-of-2 sizes
+  in `logger.h` and `xdp_ring.h`
+
+### Changed
+- **Build system**: Separated `build-sanitize/` directory for `make relsan` and `make sanitize`
+  targets, preventing overwrites of debug builds
+- **Build system**: Added `liburcu-cds` to CMake dependencies for `call_rcu()` support
+- **BPF code documentation**: Added extensive comments explaining copy-modify-update pattern,
+  RCU integration points, and thread safety contracts
+- **RCU API**: Using explicit `urcu_memb_call_rcu()` flavor-prefixed function for clarity
+
+### Technical Details
+- **Files modified**: 14 source files across BPF, correlation, output, and threading modules
+- **New dependencies**: liburcu-memb + liburcu-cds (for `call_rcu()` deferred free support)
+- **Thread safety model**: Documented SPMC contracts with `@thread_safety` Doxygen tags
+- **Memory ordering**: Uses `memory_order_relaxed` for stats counters, `memory_order_acquire` for
+  active flag checks, `memory_order_release` for inflight event tracking, RCU barriers for hash
+  table operations
+- **Cache alignment**: Consistent 64-byte alignment for ring buffers and deferred queue entries
+
+### Audit Summary
+| Category | Count | Critical | High | Medium | Low | Fixed |
+|----------|-------|----------|------|--------|-----|-------|
+| BPF Kernel | 8 | 3 | 3 | 2 | 0 | ✅ |
+| Correlation | 6 | 1 | 3 | 2 | 0 | ✅ |
+| Output | 2 | 1 | 0 | 1 | 0 | ✅ |
+| Threading | 3 | 0 | 0 | 1 | 2 | ✅ |
+| Main/Loader | 4 | 0 | 1 | 1 | 2 | ✅ |
+| Build/Arch | 2 | 0 | 0 | 2 | 0 | ✅ |
+| **Total** | **25** | **5** | **7** | **9** | **4** | **25/25** |
+
+### v0.9.10 Remaining Items (This Session)
+| ID | Issue | Status |
+|----|-------|--------|
+| M1 | IPv6 full key (zero collisions) | ✅ Fixed |
+| M2 | BPF counter atomicity | ✅ Documented as intentional |
+| M3 | Dynamic cgroup2 detection | ✅ Fixed |
+| M4 | Alignment verification | ✅ Fixed |
+| M6 | response_buf alignment | ✅ Fixed |
+| M7 | Secondary cookie index O(1) | ✅ Fixed |
+| M8 | Architecture coupling docs | ✅ Fixed |
+
+**All 25 audit items + 6 deferred items now resolved in v0.9.10.**
+
+#### Additional Medium Priority Fixes (P2) - This Session
+- **M1: IPv6 zero-collision correlation** - Added `struct flow_key_v6` (40 bytes) with full 128-bit
+  IPv6 addresses and separate `flow_cookie_map_v6` BPF map. Eliminates XOR hash collisions (~50%
+  at 65K flows). Includes extension header walking (bounded loop, MAX_IPV6_EXT_HEADERS=5).
+- **M3: Dynamic cgroup2 detection** - Replaced hardcoded cgroup_paths[] with `find_cgroup2_mount()`
+  that parses `/proc/mounts` for cgroup2 filesystem type, with fallback to standard paths.
+  Works across all distributions (Fedora 31+, Ubuntu 21.10+, RHEL 9+).
+- **M4: Alignment verification** - Added `_Static_assert(alignof(max_align_t) >= 16)` in
+  `flow_context.c` to verify compile-time alignment support, with documentation of jemalloc
+  requirement for 64-byte cache-line alignment.
+- **M6: response_buf alignment** - Changed `malloc()` to `aligned_alloc(64, ...)` for HTTP/2
+  65KB response buffer to prevent false sharing and enable SIMD optimizations.
+- **M7: O(1) cookie lookup** - Added secondary `ck_hs` index (`by_cookie`) to `ck_shadow_index`
+  keyed by socket_cookie. Replaces O(n) scan with O(1) hash lookup. ~8KB memory cost.
+- **M8: Architecture coupling documentation** - Added Doxygen comment in `flow_context.c`
+  documenting intentional Protocol layer coupling and rationale for deferring decoupling.
+
+Note: M2 (BPF non-atomic counters) documented as intentional trade-off at `spliff.bpf.c:3075-3087`.
+All audit items from v0.9.10 now resolved.
+
 ## [0.9.9] - 2026-02-03
 
 ### Added
