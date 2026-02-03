@@ -46,6 +46,7 @@ int bpf_loader_init(bpf_loader_t *loader) {
     memset(loader, 0, sizeof(*loader));
     loader->obj = NULL;
     loader->link_count = 0;
+    loader->owns_object = false;  /* FIX: Explicit ownership flag */
 
     /* Initialize XDP state */
     loader->xdp.xdp_prog = NULL;
@@ -63,9 +64,22 @@ int bpf_loader_init(bpf_loader_t *loader) {
     loader->xdp.sockops_link = NULL;
     loader->xdp.cgroup_fd = -1;
 
-    /* Set memory limits for BPF */
-    struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
-    setrlimit(RLIMIT_MEMLOCK, &rlim);
+    /*
+     * FIX M6: Save original MEMLOCK before modifying.
+     * BPF programs require elevated memory lock limits. We save the original
+     * value so it can be restored during cleanup for proper resource hygiene.
+     */
+    loader->memlock_modified = false;
+    if (getrlimit(RLIMIT_MEMLOCK, &loader->saved_memlock) == 0) {
+        struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
+        if (setrlimit(RLIMIT_MEMLOCK, &rlim) == 0) {
+            loader->memlock_modified = true;
+        }
+    } else {
+        /* Best effort: try to set even if getrlimit failed */
+        struct rlimit rlim = { RLIM_INFINITY, RLIM_INFINITY };
+        setrlimit(RLIMIT_MEMLOCK, &rlim);
+    }
 
     return 0;
 }
@@ -87,13 +101,17 @@ int bpf_loader_load(bpf_loader_t *loader, const char *filename) {
         return err;
     }
 
+    loader->owns_object = true;  /* FIX: We loaded it, we own it */
     return 0;
 }
 
-/* Set BPF object from skeleton (embedded BPF) */
+/* Set BPF object from skeleton (embedded BPF)
+ * FIX: Caller retains ownership (skeleton will destroy the object).
+ * The owns_object flag remains false, preventing double-free in cleanup. */
 void bpf_loader_set_object(bpf_loader_t *loader, struct bpf_object *obj) {
     if (loader) {
         loader->obj = obj;
+        loader->owns_object = false;  /* Caller (skeleton) owns it */
     }
 }
 
@@ -720,8 +738,23 @@ void bpf_loader_cleanup(bpf_loader_t *loader) {
     /* Detach sock_ops program */
     bpf_loader_sockops_detach(loader, false);
 
-    /* Free XDP ring buffer */
+    /* Drain XDP ring buffer before freeing */
     if (loader->xdp.xdp_rb) {
+        /*
+         * FIX: Drain pending events before freeing the ring buffer.
+         * Without this, events in the ring buffer at shutdown are lost.
+         * Use timeout=0 to consume all available events without blocking.
+         */
+        int drained = 0;
+        int batch;
+        do {
+            batch = ring_buffer__poll(loader->xdp.xdp_rb, 0);
+            if (batch > 0) {
+                drained += batch;
+            }
+        } while (batch > 0);
+        (void)drained;  /* Suppress unused variable warning in non-debug builds */
+
         ring_buffer__free(loader->xdp.xdp_rb);
         loader->xdp.xdp_rb = NULL;
     }
@@ -745,13 +778,27 @@ void bpf_loader_cleanup(bpf_loader_t *loader) {
         }
     }
 
-    /* Close BPF object */
-    if (loader->obj) {
+    /*
+     * FIX: Only close BPF object if we own it.
+     * When using skeleton (bpf_loader_set_object), the skeleton owns the object
+     * and will destroy it. Closing it here would cause double-free.
+     */
+    if (loader->obj && loader->owns_object) {
         bpf_object__close(loader->obj);
-        loader->obj = NULL;
     }
-
+    loader->obj = NULL;
+    loader->owns_object = false;
     loader->link_count = 0;
+
+    /*
+     * FIX M6: Restore original MEMLOCK limit.
+     * We raised MEMLOCK to INFINITY for BPF; restore original value for
+     * proper resource hygiene on cleanup.
+     */
+    if (loader->memlock_modified) {
+        setrlimit(RLIMIT_MEMLOCK, &loader->saved_memlock);
+        loader->memlock_modified = false;
+    }
 }
 
 // =============================================================================

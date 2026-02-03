@@ -23,6 +23,7 @@
 #define BPF_LOADER_H
 
 #include <stdbool.h>
+#include <sys/resource.h>  /* For struct rlimit (MEMLOCK save/restore) */
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
 
@@ -104,6 +105,20 @@ typedef struct {
     struct bpf_link *links[SPLIFF_MAX_LINKS]; /**< Attached probe links */
     int link_count;                          /**< Number of attached probes */
     xdp_loader_t xdp;                        /**< XDP-specific state */
+    /**
+     * FIX: Add explicit ownership flag for BPF object.
+     * When using skeleton (bpf_loader_set_object), the skeleton owns the object
+     * and caller must destroy it. When using bpf_loader_load(), we own it.
+     * This flag makes ownership explicit instead of relying on NULL tricks.
+     */
+    bool owns_object;                        /**< Whether loader should free obj on cleanup */
+    /**
+     * FIX M6: Save original MEMLOCK rlimit for restoration on cleanup.
+     * BPF programs require elevated MEMLOCK limits. We save the original
+     * value before raising it so we can restore proper limits on exit.
+     */
+    struct rlimit saved_memlock;             /**< Original MEMLOCK limit before BPF init */
+    bool memlock_modified;                   /**< Whether we changed MEMLOCK */
 } bpf_loader_t;
 
 /* Initialize BPF loader - returns 0 on success, -1 on failure */

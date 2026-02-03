@@ -1093,7 +1093,14 @@ int BPF_URETPROBE(probe_ssl_read_exit) {
     
     event->buf_filled = 0;
     if (args->buf_ptr != 0) {
-        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        /*
+         * FIX: Remove & (MAX_BUF_SIZE - 1) mask.
+         * Bug: When buf_copy_size == MAX_BUF_SIZE (16384), the mask
+         * produces 0 (16384 & 16383 = 0), reading ZERO bytes but
+         * reporting buf_filled = 16384 to userspace.
+         * Value is already bounded by the check above.
+         */
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size, (void *)args->buf_ptr);
         if (err == 0) {
             event->buf_filled = buf_copy_size;
         }
@@ -1102,7 +1109,12 @@ int BPF_URETPROBE(probe_ssl_read_exit) {
     // Track this PID for process exit cleanup
     track_pid(event->pid);
 
-    // Submit event - size must be bounded for verifier
+    /*
+     * Submit event - size must be bounded for verifier.
+     * NOTE: Return value of bpf_ringbuf_output is intentionally ignored.
+     * Checking for -ENOENT (ring buffer full) would require uprobe stats
+     * infrastructure that doesn't exist. XDP has xdp_stats->ringbuf_drops.
+     */
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
         submit_size = sizeof(struct ssl_data_event);
@@ -1169,7 +1181,14 @@ int BPF_URETPROBE(probe_ssl_write_exit) {
     
     event->buf_filled = 0;
     if (args->buf_ptr != 0) {
-        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        /*
+         * FIX: Remove & (MAX_BUF_SIZE - 1) mask.
+         * Bug: When buf_copy_size == MAX_BUF_SIZE (16384), the mask
+         * produces 0 (16384 & 16383 = 0), reading ZERO bytes but
+         * reporting buf_filled = 16384 to userspace.
+         * Value is already bounded by the check above.
+         */
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size, (void *)args->buf_ptr);
         if (err == 0) {
             event->buf_filled = buf_copy_size;
         }
@@ -1178,7 +1197,12 @@ int BPF_URETPROBE(probe_ssl_write_exit) {
     // Track this PID for process exit cleanup
     track_pid(event->pid);
 
-    // Submit event - size must be bounded for verifier
+    /*
+     * Submit event - size must be bounded for verifier.
+     * NOTE: Return value of bpf_ringbuf_output is intentionally ignored.
+     * Checking for -ENOENT (ring buffer full) would require uprobe stats
+     * infrastructure that doesn't exist. XDP has xdp_stats->ringbuf_drops.
+     */
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
         submit_size = sizeof(struct ssl_data_event);
@@ -1285,7 +1309,14 @@ int BPF_URETPROBE(probe_ssl_read_ex_exit) {
 
     event->buf_filled = 0;
     if (args->buf_ptr != 0) {
-        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        /*
+         * FIX: Remove & (MAX_BUF_SIZE - 1) mask.
+         * Bug: When buf_copy_size == MAX_BUF_SIZE (16384), the mask
+         * produces 0 (16384 & 16383 = 0), reading ZERO bytes but
+         * reporting buf_filled = 16384 to userspace.
+         * Value is already bounded by the check above.
+         */
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size, (void *)args->buf_ptr);
         if (err == 0) {
             event->buf_filled = buf_copy_size;
         }
@@ -1294,7 +1325,12 @@ int BPF_URETPROBE(probe_ssl_read_ex_exit) {
     // Track this PID for process exit cleanup
     track_pid(event->pid);
 
-    // Submit event - size must be bounded for verifier
+    /*
+     * Submit event - size must be bounded for verifier.
+     * NOTE: Return value of bpf_ringbuf_output is intentionally ignored.
+     * Checking for -ENOENT (ring buffer full) would require uprobe stats
+     * infrastructure that doesn't exist. XDP has xdp_stats->ringbuf_drops.
+     */
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
         submit_size = sizeof(struct ssl_data_event);
@@ -1373,7 +1409,14 @@ int BPF_URETPROBE(probe_ssl_write_ex_exit) {
 
     event->buf_filled = 0;
     if (args->buf_ptr != 0) {
-        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        /*
+         * FIX: Remove & (MAX_BUF_SIZE - 1) mask.
+         * Bug: When buf_copy_size == MAX_BUF_SIZE (16384), the mask
+         * produces 0 (16384 & 16383 = 0), reading ZERO bytes but
+         * reporting buf_filled = 16384 to userspace.
+         * Value is already bounded by the check above.
+         */
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size, (void *)args->buf_ptr);
         if (err == 0) {
             event->buf_filled = buf_copy_size;
         }
@@ -1382,7 +1425,12 @@ int BPF_URETPROBE(probe_ssl_write_ex_exit) {
     // Track this PID for process exit cleanup
     track_pid(event->pid);
 
-    // Submit event - size must be bounded for verifier
+    /*
+     * Submit event - size must be bounded for verifier.
+     * NOTE: Return value of bpf_ringbuf_output is intentionally ignored.
+     * Checking for -ENOENT (ring buffer full) would require uprobe stats
+     * infrastructure that doesn't exist. XDP has xdp_stats->ringbuf_drops.
+     */
     __u64 submit_size = sizeof(struct ssl_data_event) - MAX_BUF_SIZE + event->buf_filled;
     if (submit_size > sizeof(struct ssl_data_event)) {
         submit_size = sizeof(struct ssl_data_event);
@@ -1599,7 +1647,14 @@ int BPF_URETPROBE(probe_gnutls_send_exit) {
 
     event->buf_filled = 0;
     if (args->buf_ptr != 0) {
-        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        /*
+         * FIX: Remove & (MAX_BUF_SIZE - 1) mask.
+         * Bug: When buf_copy_size == MAX_BUF_SIZE (16384), the mask
+         * produces 0 (16384 & 16383 = 0), reading ZERO bytes but
+         * reporting buf_filled = 16384 to userspace.
+         * Value is already bounded by the check above.
+         */
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size, (void *)args->buf_ptr);
         if (err == 0) {
             event->buf_filled = buf_copy_size;
         }
@@ -1690,7 +1745,14 @@ int BPF_URETPROBE(probe_gnutls_recv_exit) {
 
     event->buf_filled = 0;
     if (args->buf_ptr != 0) {
-        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        /*
+         * FIX: Remove & (MAX_BUF_SIZE - 1) mask.
+         * Bug: When buf_copy_size == MAX_BUF_SIZE (16384), the mask
+         * produces 0 (16384 & 16383 = 0), reading ZERO bytes but
+         * reporting buf_filled = 16384 to userspace.
+         * Value is already bounded by the check above.
+         */
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size, (void *)args->buf_ptr);
         if (err == 0) {
             event->buf_filled = buf_copy_size;
         }
@@ -1797,7 +1859,14 @@ int BPF_URETPROBE(probe_nss_write_exit) {
 
     event->buf_filled = 0;
     if (args->buf_ptr != 0) {
-        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        /*
+         * FIX: Remove & (MAX_BUF_SIZE - 1) mask.
+         * Bug: When buf_copy_size == MAX_BUF_SIZE (16384), the mask
+         * produces 0 (16384 & 16383 = 0), reading ZERO bytes but
+         * reporting buf_filled = 16384 to userspace.
+         * Value is already bounded by the check above.
+         */
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size, (void *)args->buf_ptr);
         if (err == 0) {
             event->buf_filled = buf_copy_size;
         }
@@ -1896,7 +1965,14 @@ int BPF_URETPROBE(probe_nss_read_exit) {
 
     event->buf_filled = 0;
     if (args->buf_ptr != 0) {
-        int err = bpf_probe_read_user(&event->buf, buf_copy_size & (MAX_BUF_SIZE - 1), (void *)args->buf_ptr);
+        /*
+         * FIX: Remove & (MAX_BUF_SIZE - 1) mask.
+         * Bug: When buf_copy_size == MAX_BUF_SIZE (16384), the mask
+         * produces 0 (16384 & 16383 = 0), reading ZERO bytes but
+         * reporting buf_filled = 16384 to userspace.
+         * Value is already bounded by the check above.
+         */
+        int err = bpf_probe_read_user(&event->buf, buf_copy_size, (void *)args->buf_ptr);
         if (err == 0) {
             event->buf_filled = buf_copy_size;
         }
@@ -2974,7 +3050,16 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
     if (fs && fs->socket_cookie != 0) {
         struct session_policy *policy = bpf_map_lookup_elem(&session_registry, &fs->socket_cookie);
         if (policy) {
-            // Update stats (approximate, no atomic)
+            /*
+             * Update flow stats - intentionally non-atomic for performance.
+             * NOTE: These counters may lose updates on multi-CPU systems due to
+             * read-modify-write races. This is acceptable because:
+             * 1. Per-flow stats are advisory/debugging only
+             * 2. Atomic ops (__sync_fetch_and_add) add ~10ns overhead per update
+             * 3. High-frequency packet path makes atomics too expensive
+             * Users requiring exact counts should use per-CPU counters or
+             * aggregate from XDP stats map instead.
+             */
             fs->pkt_count++;
             fs->byte_count += payload_len;
             fs->last_seen_ns = now;

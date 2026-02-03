@@ -147,7 +147,11 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
      */
     int worker_id;
     if (flow_ctx) {
-        uint32_t home = atomic_load(&flow_ctx->home_worker_id);
+        /*
+         * FIX: Use memory_order_acquire to ensure we see any writes
+         * performed by the worker that claimed ownership.
+         */
+        uint32_t home = atomic_load_explicit(&flow_ctx->home_worker_id, memory_order_acquire);
         if (home != WORKER_ID_NONE && home < (uint32_t)ctx->num_workers) {
             /* Route to flow's home worker for sticky affinity */
             worker_id = (int)home;
@@ -279,7 +283,13 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
     if (!ck_ring_enqueue_spsc(&worker->in_ring, worker->in_buffer, event)) {
         /* Queue full - return event to pool and drop */
         if (flow_ctx) {
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+            /*
+             * FIX: Use memory_order_release for inflight_events decrement.
+             * Ensures janitor thread sees this decrement before potentially
+             * freeing the flow context. memory_order_relaxed could allow
+             * the janitor to observe stale count and free prematurely.
+             */
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
         pool_free(&worker->event_pool, event);
         atomic_fetch_add(&ctx->events_dropped, 1);
@@ -664,7 +674,11 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
      */
     int worker_id;
     if (flow_ctx) {
-        uint32_t home = atomic_load(&flow_ctx->home_worker_id);
+        /*
+         * FIX: Use memory_order_acquire to ensure we see any writes
+         * performed by the worker that claimed ownership.
+         */
+        uint32_t home = atomic_load_explicit(&flow_ctx->home_worker_id, memory_order_acquire);
         if (home != WORKER_ID_NONE && home < (uint32_t)dispatcher->num_workers) {
             /* Route to flow's home worker for sticky affinity */
             worker_id = (int)home;
@@ -697,7 +711,12 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
     /* Push to worker's SPSC ring (includes eventfd signal) */
     if (!worker->xdp_ring) {
         if (flow_ctx) {
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+            /*
+             * FIX: Use memory_order_release for inflight_events decrement.
+             * Ensures janitor thread sees this decrement before potentially
+             * freeing the flow context.
+             */
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
         atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
         return false;
@@ -705,7 +724,12 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
 
     if (!xdp_ring_push(worker->xdp_ring, &ring_evt)) {
         if (flow_ctx) {
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+            /*
+             * FIX: Use memory_order_release for inflight_events decrement.
+             * Ensures janitor thread sees this decrement before potentially
+             * freeing the flow context.
+             */
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
         atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
         return false;
@@ -774,7 +798,11 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
      */
     int worker_id;
     if (flow_ctx) {
-        uint32_t home = atomic_load(&flow_ctx->home_worker_id);
+        /*
+         * FIX: Use memory_order_acquire to ensure we see any writes
+         * performed by the worker that claimed ownership.
+         */
+        uint32_t home = atomic_load_explicit(&flow_ctx->home_worker_id, memory_order_acquire);
         if (home != WORKER_ID_NONE && home < (uint32_t)dispatcher->num_workers) {
             /* Route to flow's home worker for sticky affinity */
             worker_id = (int)home;
@@ -806,7 +834,12 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
 
     if (!worker->xdp_ring) {
         if (flow_ctx) {
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+            /*
+             * FIX: Use memory_order_release for inflight_events decrement.
+             * Ensures janitor thread sees this decrement before potentially
+             * freeing the flow context.
+             */
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
         atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
         return false;
@@ -814,7 +847,12 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
 
     if (!xdp_ring_push(worker->xdp_ring, &ring_evt)) {
         if (flow_ctx) {
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_relaxed);
+            /*
+             * FIX: Use memory_order_release for inflight_events decrement.
+             * Ensures janitor thread sees this decrement before potentially
+             * freeing the flow context.
+             */
+            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
         atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
         return false;

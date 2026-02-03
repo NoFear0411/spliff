@@ -565,6 +565,16 @@ static bool detect_tar(const uint8_t *data, size_t len, signature_result_t *resu
  * @see signatures_cleanup()
  */
 int signatures_init(void) {
+    /*
+     * FIX: Free existing sorted_index before reallocating.
+     * If signatures_init is called multiple times, the previous
+     * allocation would leak without this cleanup.
+     */
+    if (sorted_index) {
+        free(sorted_index);
+        sorted_index = NULL;
+    }
+
     /* Count signatures */
     signature_count = 0;
     while (signatures[signature_count].magic != NULL) {

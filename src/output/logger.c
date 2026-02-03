@@ -99,9 +99,15 @@ static void entry_free(log_entry_t *entry)
  */
 static void signal_logger(void)
 {
+    /*
+     * FIX: Use memory_order_release instead of memory_order_acq_rel.
+     * We only need release semantics here - we're publishing the fact
+     * that the ring is no longer empty. The acquire is unnecessary since
+     * we don't read any data that depends on the previous value.
+     */
     bool was_empty = atomic_exchange_explicit(&g_logger.ring_was_empty,
                                                false,
-                                               memory_order_acq_rel);
+                                               memory_order_release);
     if (was_empty) {
         uint64_t val = 1;
         ssize_t ret = write(g_logger.eventfd, &val, sizeof(val));

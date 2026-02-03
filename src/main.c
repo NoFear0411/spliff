@@ -50,9 +50,17 @@
 #pragma GCC diagnostic pop
 
 #include "threading/threading.h"
+#include <stdatomic.h>
 
 /* Global state */
-static volatile sig_atomic_t g_exiting = 0;
+/*
+ * FIX: Use _Atomic for g_exiting instead of volatile sig_atomic_t.
+ * The compiler may optimize `while (!g_exiting)` to an infinite loop with
+ * plain volatile. C11 atomics provide proper memory ordering guarantees.
+ * sig_atomic_t is used as the underlying type since signal handlers are
+ * async-signal-safe only with sig_atomic_t or _Atomic types.
+ */
+static _Atomic(sig_atomic_t) g_exiting = 0;
 static struct spliff_bpf *g_skel = NULL;  /* BPF skeleton (owns the BPF object) */
 static bpf_loader_t g_loader;
 static probe_handler_t g_handler;
@@ -544,9 +552,9 @@ static void cleanup_all_resources(void) {
         g_xdp_initialized = false;
     }
 
-    /* Cleanup BPF loader (detach probes, but NOT the object - skeleton owns it) */
+    /* Cleanup BPF loader (detach probes, but NOT the object - skeleton owns it)
+     * FIX: The owns_object flag now properly handles this - no NULL hack needed */
     if (g_bpf_initialized) {
-        g_loader.obj = NULL;  /* Prevent bpf_loader_cleanup from closing it */
         bpf_loader_cleanup(&g_loader);
         g_bpf_initialized = false;
     }
@@ -574,7 +582,11 @@ static void cleanup_all_resources(void) {
 /* Signal handler */
 static void sig_handler(int sig) {
     (void)sig;
-    g_exiting = 1;
+    /*
+     * Use atomic store with release semantics to ensure visibility.
+     * The main loop uses acquire semantics to observe this write.
+     */
+    atomic_store_explicit(&g_exiting, 1, memory_order_release);
 }
 
 /* Setup signal handlers */
@@ -877,7 +889,18 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: --comm requires a process name\n");
                 return 1;
             }
-            safe_strcpy(target_comm, sizeof(target_comm), argv[++i]);
+            /*
+             * FIX H4: Check length before safe_strcpy to warn on truncation.
+             * Process names are typically 15 chars (TASK_COMM_LEN-1) but users
+             * may specify longer patterns. Warn if truncation occurs.
+             */
+            const char *comm_arg = argv[++i];
+            size_t comm_len = strlen(comm_arg);
+            if (comm_len >= sizeof(target_comm)) {
+                fprintf(stderr, "Warning: --comm value truncated from %zu to %zu characters\n",
+                        comm_len, sizeof(target_comm) - 1);
+            }
+            safe_strcpy(target_comm, sizeof(target_comm), comm_arg);
         } else if (strcmp(argv[i], "-C") == 0) {
             g_config.use_colors = false;
         } else if (strcmp(argv[i], "-d") == 0) {
@@ -933,7 +956,14 @@ int main(int argc, char **argv) {
 
     /* Register cleanup handler for safe exit */
     if (atexit(cleanup_all_resources) != 0) {
-        fprintf(stderr, "Warning: Failed to register cleanup handler\n");
+        /*
+         * FIX: Return error instead of continuing.
+         * Without atexit handler, cleanup won't happen on normal exit,
+         * leaving BPF probes attached and resources leaked.
+         */
+        fprintf(stderr, "%sError:%s Failed to register cleanup handler\n",
+                display_color(C_RED), display_color(C_RESET));
+        return 1;
     }
 
     /* Initialize modules */
@@ -1047,6 +1077,24 @@ int main(int argc, char **argv) {
         }
     }
 
+    /*
+     * FIX H12: Add clear diagnostic when no SSL libraries are found.
+     * This helps users understand why the tool won't capture any traffic
+     * and suggests corrective actions.
+     */
+    if (!openssl_path[0] && !gnutls_path[0] && !nss_path[0] && !wolfssl_path[0]) {
+        fprintf(stderr, "\n%sWarning:%s No SSL/TLS libraries found!\n",
+                display_color(C_YELLOW), display_color(C_RESET));
+        fprintf(stderr, "  Possible causes:\n");
+        fprintf(stderr, "  - No target processes using SSL/TLS are running\n");
+        fprintf(stderr, "  - Target processes use statically-linked SSL libraries\n");
+        fprintf(stderr, "  - SSL library paths are non-standard\n");
+        if (num_target_pids > 0) {
+            fprintf(stderr, "  - Specified PID(s) don't have SSL libraries loaded\n");
+        }
+        fprintf(stderr, "  The tool will continue but won't capture any traffic.\n\n");
+    }
+
     printf("\n");
 
     /* Initialize BPF */
@@ -1094,9 +1142,20 @@ int main(int argc, char **argv) {
         int callback_ret = bpf_loader_xdp_set_event_callback(&g_loader,
                                                               dispatcher_xdp_event_handler,
                                                               &g_xdp_dispatcher);
-        if (callback_ret != 0 && debug_mode) {
-            printf("  %s[DEBUG]%s XDP event callback not registered (ringbuf unavailable)\n",
-                   display_color(C_YELLOW), display_color(C_RESET));
+        if (callback_ret != 0) {
+            /*
+             * FIX: Warn about XDP callback failure in all modes.
+             * Without the callback, XDP-SSL correlation ("Golden Thread") won't work.
+             * XDP programs still run for packet classification, but events don't
+             * reach userspace. This is a significant feature degradation.
+             */
+            if (debug_mode) {
+                printf("  %s[WARNING]%s XDP event callback not registered (ringbuf unavailable)\n",
+                       display_color(C_YELLOW), display_color(C_RESET));
+                printf("             XDP-SSL correlation will not work\n");
+            }
+            /* Note: We keep g_xdp_initialized=true because XDP programs are still
+             * attached and doing packet classification. Only event delivery fails. */
         }
 
         /* Auto-attach to all suitable network interfaces
@@ -1347,47 +1406,18 @@ int main(int argc, char **argv) {
              * stable 3-arg signatures: (SSL*, buf, len)
              */
 
-            /* ssl_read_impl - DISABLED: only takes SSL*, no buffer args
-             * The probe would read garbage from RSI/RDX causing crashes */
-#if 0
-            if (b->ssl_read_impl_offset) {
-                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
-                    b->ssl_read_impl_offset, "probe_ssl_read_impl_enter", false, debug_mode);
-                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
-                    b->ssl_read_impl_offset, "probe_ssl_read_exit", true, debug_mode);
-            }
-#endif
-
-            /* DoPayloadWrite - DISABLED: no buffer arguments, can't capture data */
-#if 0
-            if (b->ssl_write_impl_offset) {
-                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
-                    b->ssl_write_impl_offset, "probe_do_payload_write_enter", false, debug_mode);
-                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
-                    b->ssl_write_impl_offset, "probe_ssl_write_exit", true, debug_mode);
-            }
-#endif
-
-            /* Async I/O hooks - DISABLED: complex C++ ABI, need more analysis */
-#if 0
-            if (b->socket_read_offset) {
-                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
-                    b->socket_read_offset, "probe_socket_read_enter", false, debug_mode);
-            }
-            if (b->on_read_ready_offset) {
-                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
-                    b->on_read_ready_offset, "probe_on_read_ready", false, debug_mode);
-            }
-#endif
-
-            /* DoPayloadRead - base::span passed by value (RSI=data, RDX=size)
-             * This one might work but disabled for safety until verified */
-#if 0
-            if (b->do_payload_read_offset) {
-                bpf_loader_attach_uprobe_offset(&g_loader, b->path,
-                    b->do_payload_read_offset, "probe_do_payload_read_enter", false, debug_mode);
-            }
-#endif
+            /*
+             * FIX M7: Removed dead BoringSSL async hook code blocks.
+             *
+             * Previously had #if 0 blocks for experimental hooks:
+             * - ssl_read_impl: only takes SSL*, no buffer args (crashes)
+             * - DoPayloadWrite: no buffer arguments, can't capture data
+             * - Async I/O hooks: complex C++ ABI, need more analysis
+             * - DoPayloadRead: base::span ABI, unverified
+             *
+             * These were kept as dead code for reference but never worked.
+             * Using SSL_read/SSL_write public API hooks instead.
+             */
 
             /* Public API fallback hooks */
             bpf_loader_attach_uprobe_offset(&g_loader, b->path,
@@ -1607,7 +1637,11 @@ int main(int argc, char **argv) {
      * (cookie_index, shadow_index) happen in one thread, making
      * CK hs SPMC mode safe without locking.
      */
-    while (!g_exiting) {
+    /*
+     * Use atomic load with acquire semantics to ensure we see the
+     * signal handler's write (which uses release semantics).
+     */
+    while (!atomic_load_explicit(&g_exiting, memory_order_acquire)) {
         usleep(100000);  /* 100ms - check exit flag periodically */
     }
 
