@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.9.9-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.10-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -24,6 +24,14 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 |----------|---------|----------|
 | HTTP/1.1 | llhttp  | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
 | HTTP/2   | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
+
+### Thread Safety Audit & IPv6 Correlation (v0.9.10)
+- **IPv6 Full Correlation**: Zero-collision 40-byte flow keys with separate `flow_cookie_map_v6`
+- **Secondary Cookie Index**: O(1) lookup by socket_cookie (replaces O(n) scan)
+- **Dynamic cgroup2 Detection**: Parses `/proc/mounts` for any cgroup2 mount location
+- **RCU-Safe Memory Reclamation**: liburcu `call_rcu()` for safe deferred hash table frees
+- **Atomic Counters**: Per-flow packet/byte counters now use `_Atomic` with relaxed ordering
+- **Cache-Line Alignment**: Verified via `_Static_assert`, aligned_alloc for response buffers
 
 ### Async Logging & XDP Correlation (v0.9.9)
 - **MPSC Logger**: Lock-free async logging pipeline with eventfd notification
@@ -419,14 +427,15 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and data 
 | v0.9.6 | Embedded BPF Skeleton + XDP-SSL correlation fix + Thread cleanup | ✅ Complete |
 | v0.9.7 | Centralized session statistics + Production-grade shutdown metrics | ✅ Complete |
 | v0.9.8 | Dynamic flow pool + Generation safety + Mandatory libs + Scanner dedup | ✅ Complete |
-| v0.9.9 | Async MPSC logger + XDP correlation rings + Deferred display + CK hash tables | ✅ **Current** |
+| v0.9.9 | Async MPSC logger + XDP correlation rings + Deferred display + CK hash tables | ✅ Complete |
+| v0.9.10 | Thread safety audit + IPv6 full correlation + Secondary cookie index + Dynamic cgroup2 | ✅ **Current** |
 | v0.10.0 | Content-based protocol detection fallback + ZSTD streaming | 🔄 Next |
 | v0.11.0 | HTTP/3 + QUIC protocol support (ngtcp2/nghttp3) | Planned |
 | v1.0.0 | WebSocket support + Production hardening | Planned |
 | v1.1.0+ | EDR agent mode + Event streaming | Planned |
 
 ### Near-Term Goals (v0.10.x - v1.0)
-- **BPF/XDP Improvements**: IPv6 correlation, expanded ring buffers, atomic state machine
+- **BPF/XDP Improvements**: ~~IPv6 correlation~~ ✅ (v0.9.10), expanded ring buffers, atomic state machine
 - **Plain HTTP Capture**: XDP payload extraction for unencrypted traffic
 - **WebSocket Support**: Frame parsing and message reconstruction
 - **Enhanced Display**: XDP flow metrics in output, connection timeline

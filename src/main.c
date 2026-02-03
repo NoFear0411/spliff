@@ -131,6 +131,14 @@ static void get_process_name(uint32_t pid, char *buf, size_t bufsize) {
 
 /**
  * @brief Track library paths that already have probes attached
+ *
+ * @thread_safety Main thread only during initialization phase.
+ *                Must be fully populated before starting dispatcher and worker
+ *                threads. After dispatcher_start(), this data is read-only and
+ *                not accessed by any thread. No concurrent access occurs.
+ *
+ * FIX L6: Added explicit thread ownership documentation.
+ *
  * @internal
  */
 typedef struct {
@@ -139,7 +147,17 @@ typedef struct {
     bool active;     /**< Whether probes are currently active */
 } probed_path_t;
 
+/**
+ * @brief Global array tracking probed library paths
+ * @thread_safety Main thread only. Populated during probe attachment before
+ *                worker threads start. No synchronization needed.
+ */
 static probed_path_t g_probed_paths[MAX_PROBED_PATHS];
+
+/**
+ * @brief Count of entries in g_probed_paths
+ * @thread_safety Main thread only. Modified only during initialization.
+ */
 static int g_probed_path_count = 0;
 
 /* Check if probes are already attached to this path */
@@ -1144,16 +1162,15 @@ int main(int argc, char **argv) {
                                                               &g_xdp_dispatcher);
         if (callback_ret != 0) {
             /*
-             * FIX: Warn about XDP callback failure in all modes.
+             * FIX H7: ALWAYS warn about XDP callback failure (not just debug mode).
              * Without the callback, XDP-SSL correlation ("Golden Thread") won't work.
              * XDP programs still run for packet classification, but events don't
-             * reach userspace. This is a significant feature degradation.
+             * reach userspace. This is a significant feature degradation that users
+             * need to know about.
              */
-            if (debug_mode) {
-                printf("  %s[WARNING]%s XDP event callback not registered (ringbuf unavailable)\n",
-                       display_color(C_YELLOW), display_color(C_RESET));
-                printf("             XDP-SSL correlation will not work\n");
-            }
+            fprintf(stderr, "%s[WARNING]%s XDP event callback not registered (ringbuf unavailable)\n",
+                    display_color(C_YELLOW), display_color(C_RESET));
+            fprintf(stderr, "          XDP-SSL correlation (\"Golden Thread\") will not work\n");
             /* Note: We keep g_xdp_initialized=true because XDP programs are still
              * attached and doing packet classification. Only event delivery fails. */
         }

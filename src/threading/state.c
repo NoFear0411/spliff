@@ -530,11 +530,18 @@ h2_connection_local_t *worker_get_h2_connection(worker_state_t *state,
     slot->comm[0] = '\0';
     slot->alpn_proto[0] = '\0';
 
-    slot->response_buf = malloc(H2_REASSEMBLY_BUF_SIZE);
+    /*
+     * FIX M6: Use aligned_alloc for cache-line alignment of 65KB response buffer.
+     * Cache-line alignment (64 bytes) improves memcpy/memset performance by
+     * avoiding false sharing and enabling SIMD optimizations.
+     * H2_REASSEMBLY_BUF_SIZE (65536) is divisible by 64, satisfying aligned_alloc.
+     */
+    slot->response_buf = aligned_alloc(64, H2_REASSEMBLY_BUF_SIZE);
     if (!slot->response_buf) {
         atomic_store_explicit(&slot->state, H2_CONN_STATE_FREE, memory_order_relaxed);
         return NULL;
     }
+    memset(slot->response_buf, 0, H2_REASSEMBLY_BUF_SIZE);
 
     if (nghttp2_hd_inflate_new(&slot->response_inflater) != 0) {
         free(slot->response_buf);

@@ -48,17 +48,39 @@ typedef struct {
 } ck_shadow_entry_t;
 
 /**
+ * @brief Secondary index entry for O(1) cookie lookup (FIX M7)
+ *
+ * Maps socket_cookie → flow_context_t* for fast lookup by cookie.
+ * This eliminates the O(n) scan in ck_shadow_find_by_cookie().
+ */
+typedef struct {
+    uint64_t cookie;            /**< Socket cookie (key) */
+    flow_context_t *ctx;        /**< Flow context pointer (value) */
+} ck_shadow_cookie_entry_t;
+
+/**
  * @brief Thread-safe shadow index using CK hs
  *
  * Wraps ck_hs with statistics counters and provides a clean API
  * for the flow manager to use.
+ *
+ * @par Dual Indexing (FIX M7)
+ * Contains two hash sets:
+ * - `hs`: Primary index keyed by (pid, ssl_ctx) composite key
+ * - `by_cookie`: Secondary index keyed by socket_cookie for O(1) lookup
+ *
+ * The secondary index is populated only when a flow has a valid
+ * socket_cookie (cookie != 0), enabling fast deduplication during
+ * XDP-SSL merge without O(n) scanning.
  */
 typedef struct {
-    ck_hs_t hs;                     /**< CK hash set (SPMC safe) */
-    _Atomic uint64_t count;         /**< Active entry count */
+    ck_hs_t hs;                     /**< Primary: (pid, ssl_ctx) → flow_context */
+    ck_hs_t by_cookie;              /**< Secondary: socket_cookie → flow_context (FIX M7) */
+    _Atomic uint64_t count;         /**< Active entry count (primary index) */
     _Atomic uint64_t hits;          /**< Successful lookups */
     _Atomic uint64_t promotions;    /**< Flows promoted to cookie_index */
     _Atomic uint64_t merges;        /**< XDP flows merged into SSL flows */
+    _Atomic uint64_t cookie_index_count;  /**< Secondary index entry count */
 } ck_shadow_index_t;
 
 /*============================================================================
@@ -131,17 +153,44 @@ flow_context_t *ck_shadow_index_lookup(ck_shadow_index_t *idx, uint32_t pid,
 /**
  * @brief Find flow in shadow index by socket_cookie (dispatcher only)
  *
- * O(n) scan of shadow index to find a flow that already has the given
- * socket_cookie. This handles the race where SSL promoted a flow to
- * cookie_index, but XDP event arrives and would create a duplicate.
- *
- * @warning This is O(n) - use sparingly
+ * FIX M7: Now O(1) via secondary cookie index instead of O(n) scan.
+ * This handles the race where SSL promoted a flow to cookie_index,
+ * but XDP event arrives and would create a duplicate.
  *
  * @param[in] idx     The shadow index
  * @param[in] cookie  Socket cookie to search for
  * @return flow_context_t pointer, or NULL if not found
  */
 flow_context_t *ck_shadow_find_by_cookie(ck_shadow_index_t *idx, uint64_t cookie);
+
+/**
+ * @brief Update secondary cookie index when flow gets a cookie
+ *
+ * Called when a flow in the shadow index acquires a socket_cookie
+ * (via SSL→XDP correlation). This enables O(1) lookup by cookie.
+ *
+ * @warning Single-writer: MUST only be called from dispatcher thread
+ *
+ * @param[in] idx     The shadow index
+ * @param[in] cookie  Socket cookie to index
+ * @param[in] ctx     Flow context pointer to associate
+ * @return 0 on success, -1 on failure
+ */
+int ck_shadow_index_add_cookie(ck_shadow_index_t *idx, uint64_t cookie,
+                                flow_context_t *ctx);
+
+/**
+ * @brief Remove entry from secondary cookie index
+ *
+ * Called when removing a flow from the shadow index to keep both
+ * indexes consistent.
+ *
+ * @warning Single-writer: MUST only be called from dispatcher thread
+ *
+ * @param[in] idx     The shadow index
+ * @param[in] cookie  Socket cookie to remove
+ */
+void ck_shadow_index_remove_cookie(ck_shadow_index_t *idx, uint64_t cookie);
 
 /**
  * @brief Get entry count

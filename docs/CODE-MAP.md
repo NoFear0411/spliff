@@ -1,4 +1,4 @@
-# CODE-MAP.md - spliff v0.9.9 Comprehensive Code Map
+# CODE-MAP.md - spliff v0.9.10 Comprehensive Code Map
 
 > **Purpose:** AI-friendly and human-readable architecture reference for understanding, maintaining, and extending the spliff codebase.
 
@@ -16,7 +16,7 @@
 
 ## Project Overview
 
-**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.9 features:
+**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.10 features:
 
 - **Dynamic Flow Pool**: On-demand allocation via jemalloc with incremental hash table resizing
 - **Embedded BPF Skeleton**: CO-RE BTF bytecode embedded in binary, strip-safe
@@ -24,6 +24,8 @@
 - **Modular Protocol Architecture**: Clean plugin-style routing for HTTP/1, HTTP/2, detection
 - **Multi-threaded Processing**: Lock-free worker threads with connection affinity
 - **Centralized Session Statistics**: Production-grade shutdown metrics with per-worker breakdown
+- **RCU-Safe Memory Reclamation**: liburcu integration for safe deferred memory frees (v0.9.10)
+- **Thread Safety Audit**: Atomic counters, correct ring buffer semantics, single-writer guarantees (v0.9.10)
 
 ---
 
@@ -69,17 +71,17 @@ spliff/
 │   ├── output/                     # Terminal output formatting and colors
 │   │   ├── display.c               # Colored output, latency formatting
 │   │   ├── display.h               # Display API
-│   │   ├── logger.c                # Async MPSC logging pipeline (NEW v0.9.9)
-│   │   ├── logger.h                # Logger API (NEW v0.9.9)
+│   │   ├── logger.c                # Async SPMC logging pipeline (v0.9.9, fixed v0.9.10)
+│   │   ├── logger.h                # Logger API (v0.9.9, _Static_assert v0.9.10)
 │   │   ├── stats.c                 # Session statistics display (NEW v0.9.9)
 │   │   └── stats.h                 # Stats API (NEW v0.9.9)
 │   ├── correlation/                # XDP-SSL correlation and flow pooling
 │   │   ├── flow_context.c          # Dynamic pool, dual-index lookup, deferred free
 │   │   ├── flow_context.h          # flow_context_t, pool types, index types
-│   │   ├── ck_cookie_index.c       # CK cookie hash table (NEW v0.9.9)
-│   │   ├── ck_cookie_index.h       # Cookie index API (NEW v0.9.9)
-│   │   ├── ck_shadow_index.c       # CK shadow hash table (NEW v0.9.9)
-│   │   └── ck_shadow_index.h       # Shadow index API (NEW v0.9.9)
+│   │   ├── ck_cookie_index.c       # CK cookie hash table (v0.9.9, RCU v0.9.10)
+│   │   ├── ck_cookie_index.h       # Cookie index API (v0.9.9)
+│   │   ├── ck_shadow_index.c       # CK shadow hash table (v0.9.9, RCU v0.9.10)
+│   │   └── ck_shadow_index.h       # Shadow index API (v0.9.9)
 │   ├── threading/                  # Multi-threaded event processing
 │   │   ├── threading.h             # Threading API, worker struct, ring buffers
 │   │   ├── dispatcher.c            # BPF ring consumer, flow routing
@@ -90,8 +92,8 @@ spliff/
 │   │   ├── pool.c                  # Lock-free object pool
 │   │   ├── deferred.c              # Per-worker deferred display queue (NEW v0.9.9)
 │   │   ├── deferred.h              # Deferred queue API (NEW v0.9.9)
-│   │   ├── xdp_ring.c              # Per-worker XDP SPSC ring (NEW v0.9.9)
-│   │   └── xdp_ring.h              # XDP ring API (NEW v0.9.9)
+│   │   ├── xdp_ring.c              # Per-worker XDP SPSC ring (v0.9.9, assertions v0.9.10)
+│   │   └── xdp_ring.h              # XDP ring API (v0.9.9, _Static_assert v0.9.10)
 │   └── util/                       # Utility functions
 │       ├── safe_str.c              # Safe string operations
 │       └── safe_str.h              # String API
@@ -147,7 +149,8 @@ spliff/
 |------|---------|
 | `protocol_t` | PROTO_HTTP1, PROTO_HTTP2, PROTO_HTTP3 |
 | `xdp_category_t` | XDP packet classification |
-| `flow_key_t` | 16-byte 5-tuple for flow identification |
+| `flow_key_t` | 16-byte 5-tuple for flow identification (IPv4) |
+| `flow_key_v6_t` | 40-byte 5-tuple for IPv6 flows (v0.9.10) |
 | `xdp_packet_event_t` | 52-byte metadata-only XDP event |
 | `http_message_t` | Parsed HTTP request/response |
 | `config_t` | Global configuration |
@@ -160,7 +163,7 @@ spliff/
 | `MAX_HEADERS` | 128 |
 | `MAX_BODY_BUFFER` | 1 MB |
 | `XDP_PAYLOAD_MAX` | 128 bytes |
-| `SPLIFF_VERSION` | "0.9.9" |
+| `SPLIFF_VERSION` | "0.9.10" |
 
 ---
 
@@ -188,8 +191,9 @@ spliff/
 | `ssl_events` | ring_buffer | SSL/TLS decrypted data events |
 | `xdp_events` | ring_buffer | XDP packet metadata |
 | `process_events` | ring_buffer | Process lifecycle events |
-| `ssl_to_fd` | hash | SSL* → {fd, socket_cookie} |
-| `flow_cookie_map` | hash | 5-tuple → socket_cookie |
+| `ssl_to_fd` | LRU_HASH | SSL* → {fd, socket_cookie} |
+| `flow_cookie_map` | hash | 5-tuple (IPv4) → socket_cookie |
+| `flow_cookie_map_v6` | LRU_HASH | 40-byte IPv6 key → socket_cookie (v0.9.10) |
 | `flow_states` | hash | flow_key → flow_state_t |
 
 ---
@@ -206,6 +210,7 @@ spliff/
 | `bpf_loader_discover_libraries()` | System scan for SSL libraries |
 | `bpf_loader_xdp_attach_all()` | Auto-attach to network interfaces |
 | `bpf_loader_sockops_attach()` | Attach sock_ops to cgroup2 |
+| `find_cgroup2_mount()` | Dynamic cgroup2 path detection via /proc/mounts (v0.9.10) |
 | `bpf_loader_cleanup()` | Detach all, close maps |
 
 ---
@@ -320,9 +325,9 @@ typedef struct flow_context {
     uint64_t first_seen_ns;         // First packet timestamp
     uint64_t last_seen_ns;          // Last activity timestamp
 
-    /* Traffic Counters */
-    uint32_t pkts_in, pkts_out;
-    uint32_t bytes_in, bytes_out;
+    /* Traffic Counters (atomic v0.9.10) */
+    _Atomic uint32_t pkts_in, pkts_out;
+    _Atomic uint32_t bytes_in, bytes_out;
 
     /* Application View (from SSL) */
     char comm[16], alpn[16], ifname[16];
@@ -365,18 +370,20 @@ typedef struct flow_context {
 | `flow_terminate()` | Remove from indexes, defer free |
 | `flow_evict_stale()` | Janitor: evict inactive flows (O(active) scan) |
 | `flow_update_xdp()` | Merge XDP packet metadata into flow |
+| `flow_merge_ssl_info()` | Single-writer SSL info merge (v0.9.10) |
 | `flow_manager_get_stats()` | Collect pool/index statistics for shutdown report |
 | `flow_manager_print_stats()` | Print formatted session statistics |
 
 ---
 
-#### `src/correlation/ck_cookie_index.c` (~209 lines) (NEW v0.9.9)
-**Purpose:** Lock-free cookie hash table using Concurrency Kit
+#### `src/correlation/ck_cookie_index.c` (~230 lines) (v0.9.9, RCU v0.9.10)
+**Purpose:** Lock-free cookie hash table using Concurrency Kit with liburcu integration
 
 **Key Features:**
 - SPMC-safe lookups (multiple workers, single dispatcher writer)
 - Incremental resize with tombstone GC
 - ~256 initial capacity, grows at 75% load
+- **RCU-safe deferred free via `call_rcu()`** (v0.9.10)
 
 **Key Functions:**
 | Function | Purpose |
@@ -388,21 +395,34 @@ typedef struct flow_context {
 
 ---
 
-#### `src/correlation/ck_shadow_index.c` (~256 lines) (NEW v0.9.9)
-**Purpose:** Lock-free shadow hash table for (pid, ssl_ctx) lookup
+#### `src/correlation/ck_shadow_index.c` (~360 lines) (v0.9.9, RCU + Secondary Index v0.9.10)
+**Purpose:** Lock-free shadow hash table for (pid, ssl_ctx) lookup with liburcu integration and secondary cookie index
 
 **Key Features:**
 - Used before socket_cookie is known
 - Same SPMC-safe design as cookie index
 - Flows promoted to cookie index via `flow_promote_cookie()`
+- **RCU-safe deferred free via `call_rcu()`** (v0.9.10)
+- **Secondary cookie index** for O(1) lookup by socket_cookie (v0.9.10, fixes M7)
+
+**Dual Index Structure (v0.9.10):**
+```c
+typedef struct {
+    ck_hs_t hs;           // Primary: (pid, ssl_ctx) → flow_context
+    ck_hs_t by_cookie;    // Secondary: socket_cookie → flow_context (O(1))
+    // ... stats
+} ck_shadow_index_t;
+```
 
 **Key Functions:**
 | Function | Purpose |
 |----------|---------|
-| `ck_shadow_index_init()` | Initialize CK hash set |
+| `ck_shadow_index_init()` | Initialize both CK hash sets |
 | `ck_shadow_index_insert()` | Insert (pid, ssl_ctx) → flow |
-| `ck_shadow_index_lookup()` | Lock-free lookup |
-| `ck_shadow_index_remove()` | Remove entry |
+| `ck_shadow_index_lookup()` | Lock-free lookup by composite key |
+| `ck_shadow_find_by_cookie()` | O(1) lookup by socket_cookie (v0.9.10) |
+| `ck_shadow_index_add_cookie()` | Add to secondary cookie index (v0.9.10) |
+| `ck_shadow_index_remove()` | Remove from both indexes |
 
 ---
 
@@ -421,14 +441,18 @@ typedef struct flow_context {
 
 ---
 
-#### `src/threading/dispatcher.c` (~714 lines)
-**Purpose:** Route events from BPF to workers
+#### `src/threading/dispatcher.c` (~730 lines)
+**Purpose:** Route events from BPF to workers (single-writer for flow mutations)
 
 **Routing:** `hash(pid, ssl_ctx) % num_workers → worker_id`
 
+**Thread Safety (v0.9.10):**
+- Calls `flow_merge_ssl_info()` for single-writer SSL info updates
+- RCU thread registration (`urcu_memb_register/unregister_thread`)
+
 ---
 
-#### `src/threading/worker.c` (~834 lines)
+#### `src/threading/worker.c` (~850 lines)
 **Purpose:** Worker thread main loop with NAPI-style adaptive polling
 
 **Processing Order:**
@@ -436,7 +460,9 @@ typedef struct flow_context {
 2. `http2_try_process_event()` → if handled, return
 3. `signature_detect()` + raw display
 
-**Safety:** Generation check on dequeued events detects stale flow pointers
+**Safety:**
+- Generation check on dequeued events detects stale flow pointers
+- **RCU thread registration** (`urcu_memb_register/unregister_thread`) (v0.9.10)
 
 ---
 
@@ -480,13 +506,14 @@ typedef struct flow_context {
 
 ---
 
-#### `src/threading/xdp_ring.c` (~132 lines) (NEW v0.9.9)
+#### `src/threading/xdp_ring.c` (~132 lines) (v0.9.9, assertions v0.9.10)
 **Purpose:** Per-worker XDP SPSC ring for event delivery
 
 **Key Features:**
 - Fixes timing race: workers check HAS_XDP before dispatcher polls
 - Workers drain XDP ring FIRST, then process SSL events
 - eventfd instant wakeup on ring push
+- **`_Static_assert` for power-of-2 ring size** (v0.9.10)
 
 **Key Functions:**
 | Function | Purpose |
@@ -511,11 +538,13 @@ typedef struct flow_context {
 
 ---
 
-#### `src/output/logger.c` (~459 lines) (NEW v0.9.9)
-**Purpose:** Async MPSC logging pipeline for lock-free output serialization
+#### `src/output/logger.c` (~470 lines) (v0.9.9, SPMC fix v0.9.10)
+**Purpose:** Async logging pipeline for lock-free output serialization
 
 **Key Features:**
-- MPSC ring buffer with pre-allocated entry pool
+- **SPMC free_ring** (multiple workers dequeue, single logger enqueues) - fixed v0.9.10
+- MPSC log_ring for log messages
+- Cache-aligned ring buffer storage (64-byte alignment v0.9.10)
 - eventfd notification (edge-triggered)
 - writev() batching for atomic output
 - Zero malloc in hot path
@@ -604,7 +633,7 @@ typedef struct flow_context {
 |-----|-----|-------|------|
 | `ssl_events` | - | ring_buffer | 256 KB |
 | `xdp_events` | - | ring_buffer | 256 KB |
-| `ssl_to_fd` | SSL* | {fd, cookie} | 1024 |
+| `ssl_to_fd` | SSL* | {fd, cookie} | LRU 8192 (v0.9.10) |
 | `flow_cookie_map` | 5-tuple | cookie | 8192 |
 | `flow_states` | flow_key | state | 8192 |
 
@@ -688,6 +717,27 @@ signature_detect(...);  // Fallback
 - XDP classification: packets, flows, sockops, correlation success rate
 - SSL probe counters: total SSL_read/SSL_write interceptions
 
+### 7. Thread Safety Model (v0.9.10)
+
+**Single-Writer Pattern:**
+- Dispatcher thread owns all write operations to flow indexes
+- `flow_merge_ssl_info()` isolates SSL context writes to single writer
+- Workers perform read-only lookups with atomic reads
+
+**RCU Integration (liburcu):**
+- `call_rcu()` for safe deferred memory reclamation in CK hash tables
+- Threads register/unregister via `urcu_memb_register_thread()`
+- Grace periods ensure readers never see freed memory
+
+**Atomic Counters:**
+- Per-flow counters (`pkts_in`, `bytes_in`, etc.) use `_Atomic uint32_t`
+- Memory ordering: `memory_order_relaxed` for performance (counters are approximate)
+
+**Ring Buffer Semantics:**
+- Logger `free_ring`: SPMC (workers dequeue, logger enqueues)
+- Logger `log_ring`: MPSC (workers enqueue, logger dequeues)
+- XDP rings: SPSC (dispatcher to worker)
+
 ---
 
 ## Known Issues & TODOs
@@ -718,4 +768,4 @@ See [../ISSUES.md](../ISSUES.md) for the full list of open issues, known limitat
 
 ---
 
-*Last updated: v0.9.9 (February 2026)*
+*Last updated: v0.9.10 (February 2026)*

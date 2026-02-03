@@ -62,13 +62,19 @@ static inline uint64_t get_timestamp_ns(void)
 /**
  * @brief Allocate an entry from the free-list
  *
+ * FIX C5: free_ring is SPMC (Single Producer, Multiple Consumers)
+ * - Single producer: logger thread returns entries via entry_free()
+ * - Multiple consumers: worker threads allocate entries via entry_alloc()
+ * Previously used MPSC which caused double-dequeue race conditions.
+ *
  * @return Entry pointer or NULL if free-list exhausted
  */
 static log_entry_t *entry_alloc(void)
 {
     log_entry_t *entry = NULL;
 
-    if (!ck_ring_dequeue_mpsc(&g_logger.free_ring,
+    /* SPMC dequeue: multiple consumers (workers) compete for entries */
+    if (!ck_ring_dequeue_spmc(&g_logger.free_ring,
                                g_logger.free_ring_buffer,
                                &entry)) {
         atomic_fetch_add_explicit(&g_logger.alloc_failures, 1,
@@ -81,12 +87,15 @@ static log_entry_t *entry_alloc(void)
 
 /**
  * @brief Return an entry to the free-list
+ *
+ * FIX C5: free_ring uses SPSC enqueue because only the logger thread
+ * returns entries (single producer). Workers are multiple consumers.
  */
 static void entry_free(log_entry_t *entry)
 {
     if (entry) {
-        /* MPSC enqueue back to free ring - always succeeds if balanced */
-        ck_ring_enqueue_mpsc(&g_logger.free_ring,
+        /* SPSC enqueue: single producer (logger thread) returns entries */
+        ck_ring_enqueue_spsc(&g_logger.free_ring,
                              g_logger.free_ring_buffer,
                              entry);
     }
@@ -226,18 +235,25 @@ int log_init(FILE *output_file)
         g_logger.output_fd = STDOUT_FILENO;
     }
 
-    /* Allocate ring buffer storage (power of 2 required) */
-    g_logger.ring_buffer = calloc(LOG_RING_SIZE, sizeof(ck_ring_buffer_t));
+    /* FIX M5: Allocate ring buffer storage with cache-line alignment.
+     * CK ring buffers are accessed concurrently by multiple threads (MPSC/SPMC).
+     * Cache-line alignment prevents false sharing between ring metadata and
+     * adjacent data structures, improving multi-core performance.
+     * Power of 2 size is required by ck_ring_init(). */
+    size_t ring_bytes = LOG_RING_SIZE * sizeof(ck_ring_buffer_t);
+    g_logger.ring_buffer = aligned_alloc(LOG_CACHE_LINE, ring_bytes);
     if (!g_logger.ring_buffer) {
         goto err_ring_buffer;
     }
+    memset(g_logger.ring_buffer, 0, ring_bytes);
     ck_ring_init(&g_logger.ring, LOG_RING_SIZE);
 
-    /* Allocate free ring buffer storage */
-    g_logger.free_ring_buffer = calloc(LOG_RING_SIZE, sizeof(ck_ring_buffer_t));
+    /* FIX M5: Allocate free ring buffer storage with cache-line alignment */
+    g_logger.free_ring_buffer = aligned_alloc(LOG_CACHE_LINE, ring_bytes);
     if (!g_logger.free_ring_buffer) {
         goto err_free_ring_buffer;
     }
+    memset(g_logger.free_ring_buffer, 0, ring_bytes);
     ck_ring_init(&g_logger.free_ring, LOG_RING_SIZE);
 
     /* Allocate entry pool with alignment */

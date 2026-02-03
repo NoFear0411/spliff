@@ -66,6 +66,10 @@
 #include <sys/eventfd.h>
 #include <errno.h>
 
+/* liburcu thread registration for RCU-safe memory reclamation (FIX M9) */
+#define RCU_MEMBARRIER
+#include <urcu/urcu-memb.h>
+
 /** Forward declaration - implemented in main.c integration */
 extern void process_worker_event(worker_ctx_t *ctx, worker_event_t *event);
 
@@ -985,6 +989,12 @@ void *worker_thread_main(void *arg) {
     pthread_setname_np(pthread_self(), name);
 #endif
 
+    /* FIX M9: Register this thread with liburcu for RCU read-side critical sections.
+     * Workers are RCU readers - they access CK hash tables that may be modified
+     * by the dispatcher. call_rcu() deferred frees won't complete until all
+     * registered reader threads have passed through a quiescent state. */
+    urcu_memb_register_thread();
+
     /* Set thread-local worker state */
     set_current_worker_state(&ctx->state);
 
@@ -1005,6 +1015,9 @@ void *worker_thread_main(void *arg) {
 
     /* Clear thread-local state */
     set_current_worker_state(NULL);
+
+    /* FIX M9: Unregister from liburcu before thread exit */
+    urcu_memb_unregister_thread();
 
     return NULL;
 }

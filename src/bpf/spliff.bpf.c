@@ -167,21 +167,48 @@ struct ssl_fd_args {
 #define TCP_FLAG_ACK      0x10
 
 /**
- * @brief Flow key (5-tuple) for XDP flow tracking
+ * @brief Flow key (5-tuple) for XDP flow tracking (IPv4)
  *
  * Packed struct for consistent memcmp and map lookup operations.
  * All addresses and ports are stored in network byte order for
  * consistency with XDP packet parsing and sock_ops context.
  */
 struct flow_key {
-    __u32 saddr;          /**< Source IP (v4) or hash (v6), network byte order */
-    __u32 daddr;          /**< Dest IP (v4) or hash (v6), network byte order */
+    __u32 saddr;          /**< Source IP (v4), network byte order */
+    __u32 daddr;          /**< Dest IP (v4), network byte order */
     __u16 sport;          /**< Source port, network byte order */
     __u16 dport;          /**< Dest port, network byte order */
     __u8  protocol;       /**< IP protocol (IPPROTO_TCP=6, IPPROTO_UDP=17) */
-    __u8  ip_version;     /**< IP version (4 or 6) */
+    __u8  ip_version;     /**< IP version (4 for this struct) */
     __u8  _pad[2];        /**< Padding to align to 16 bytes */
 } __attribute__((packed));
+
+/**
+ * @brief IPv6 flow key with full 128-bit addresses (FIX M1)
+ *
+ * Eliminates XOR hash collisions (~50% at 65K flows) by storing full
+ * IPv6 addresses. Uses separate flow_cookie_map_v6 for O(1) lookup.
+ *
+ * @par Size Analysis
+ * - saddr: 16 bytes (full IPv6)
+ * - daddr: 16 bytes (full IPv6)
+ * - sport: 2 bytes
+ * - dport: 2 bytes
+ * - protocol: 1 byte
+ * - _pad: 3 bytes (alignment)
+ * - Total: 40 bytes
+ */
+struct flow_key_v6 {
+    __u8  saddr[16];      /**< Full IPv6 source address (network byte order) */
+    __u8  daddr[16];      /**< Full IPv6 destination address (network byte order) */
+    __u16 sport;          /**< Source port, network byte order */
+    __u16 dport;          /**< Dest port, network byte order */
+    __u8  protocol;       /**< IP protocol (IPPROTO_TCP=6, IPPROTO_UDP=17) */
+    __u8  _pad[3];        /**< Padding to align to 40 bytes */
+} __attribute__((packed));
+
+/* Maximum extension headers to walk for IPv6 (bounded loop for verifier) */
+#define MAX_IPV6_EXT_HEADERS 5
 
 /**
  * @brief XDP packet event for flow metadata reporting
@@ -303,8 +330,11 @@ struct {
 // Populated by SSL_set_fd hook
 // Key: SSL* pointer
 // Value: OS fd number
+// FIX H1: Changed from HASH to LRU_HASH to prevent map exhaustion.
+// Without LRU, map fills after max_entries connections and new mappings fail silently.
+// LRU evicts oldest entries, ensuring new SSL connections can always be tracked.
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 8192);
     __type(key, __u64);    // SSL* pointer
     __type(value, __s32);  // OS fd
@@ -567,9 +597,27 @@ struct flow_cookie_entry {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, struct flow_key);           // 16-byte 5-tuple
+    __type(key, struct flow_key);           // 16-byte 5-tuple (IPv4)
     __type(value, struct flow_cookie_entry); // 16 bytes
 } flow_cookie_map SEC(".maps");
+
+/**
+ * @brief IPv6 flow→cookie map with full 128-bit addresses (FIX M1)
+ *
+ * Separate map for IPv6 flows to avoid XOR hash collisions. Uses full
+ * IPv6 addresses (40-byte key) for zero collision probability.
+ *
+ * @par Capacity
+ * Half the IPv4 map size (32768 vs 65536) due to larger key size.
+ * Still supports ~32K concurrent IPv6 flows which is sufficient for
+ * most environments. LRU eviction handles overflow gracefully.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 32768);
+    __type(key, struct flow_key_v6);         // 40-byte IPv6 5-tuple
+    __type(value, struct flow_cookie_entry); // 16 bytes
+} flow_cookie_map_v6 SEC(".maps");
 
 
 // =============================================================================
@@ -770,20 +818,36 @@ static __always_inline __u32 parse_alpn_protocol(const __u8 *alpn, __u32 len) {
 
 // Update session with protocol type from ALPN negotiation
 // Also validates/updates socket family if we have fd mapping
+//
+// FIX C1: BPF map value pointers are READ-ONLY views. In-place modifications
+// do NOT persist to the map! We must copy, modify, then call bpf_map_update_elem().
 static __always_inline void update_session_protocol(__u64 ssl_ctx, __u32 protocol) {
     struct session_info *info = bpf_map_lookup_elem(&tracked_sessions, &ssl_ctx);
     if (info) {
-        // Update protocol in existing session
-        info->protocol = protocol;
+        // Copy existing session info for modification
+        struct session_info updated = *info;
+        bool needs_update = false;
+
+        // Update protocol if changed
+        if (updated.protocol != protocol) {
+            updated.protocol = protocol;
+            needs_update = true;
+        }
 
         // If we don't have family yet, try to get it from fd mapping
-        if (info->family == 0) {
+        if (updated.family == 0) {
             __s32 *fd_ptr = bpf_map_lookup_elem(&ssl_to_fd, &ssl_ctx);
             if (fd_ptr) {
                 __u16 family = get_socket_family_from_fd(*fd_ptr);
-                info->family = family;
-                info->fd = *fd_ptr;
+                updated.family = family;
+                updated.fd = *fd_ptr;
+                needs_update = true;
             }
+        }
+
+        // Persist changes via explicit map update (FIX C1)
+        if (needs_update) {
+            bpf_map_update_elem(&tracked_sessions, &ssl_ctx, &updated, BPF_ANY);
         }
     } else {
         // Create new session entry
@@ -1548,13 +1612,16 @@ int BPF_URETPROBE(probe_ssl_set_fd_exit) {
     bpf_map_update_elem(&ssl_to_fd, &ssl_ctx, &fd, BPF_ANY);
 
     // Also update session_info if it exists, with socket family
+    // FIX C1: Copy-modify-update pattern - in-place modifications don't persist!
     struct session_info *info = bpf_map_lookup_elem(&tracked_sessions, &ssl_ctx);
     if (info) {
         __u16 family = get_socket_family_from_fd(fd);
-        if (family != 0) {
-            // Update in-place via map lookup (we have the pointer)
-            info->family = family;
-            info->fd = fd;
+        if (family != 0 && (info->family != family || info->fd != fd)) {
+            // Copy existing entry, update fields, write back to map
+            struct session_info updated = *info;
+            updated.family = family;
+            updated.fd = fd;
+            bpf_map_update_elem(&tracked_sessions, &ssl_ctx, &updated, BPF_ANY);
         }
     } else {
         // Create new session entry with just fd/family (protocol TBD via ALPN)
@@ -2788,12 +2855,28 @@ static __always_inline __u8 xdp_classify_protocol(void *payload, void *data_end,
     return CAT_UNKNOWN;
 }
 
-// XDP helper: Build flow key from packet headers
-// Parses: Ethernet → IPv4/IPv6 → TCP
-// Returns: 0 on success, -1 if not TCP/IP or malformed
-// Takes pre-cached data/data_end pointers to avoid ctx access issues
+/**
+ * @brief XDP helper: Build flow key from packet headers
+ *
+ * Parses: Ethernet → IPv4/IPv6 → TCP
+ * Returns: 0 on success, -1 if not TCP/IP or malformed
+ * Takes pre-cached data/data_end pointers to avoid ctx access issues
+ *
+ * @param[in]  data          Start of packet data
+ * @param[in]  data_end      End of packet data
+ * @param[out] key           Flow key (always filled for flow_states lookup)
+ * @param[out] key_v6        IPv6 full key (filled only for IPv6 packets, can be nullptr)
+ * @param[out] payload_out   Pointer to L7 payload start
+ * @param[out] payload_len_out  Length of L7 payload
+ * @param[out] tcp_flags_out TCP flags byte
+ *
+ * @note FIX M1: For IPv6, key_v6 is filled with full 128-bit addresses for
+ *       flow_cookie_map_v6 lookup (zero collisions), while key is still filled
+ *       with XOR hash for flow_states compatibility.
+ */
 static __always_inline int xdp_parse_packet_cached(void *data, void *data_end,
                                                     struct flow_key *key,
+                                                    struct flow_key_v6 *key_v6,
                                                     void **payload_out, __u16 *payload_len_out,
                                                     __u8 *tcp_flags_out) {
 
@@ -2839,8 +2922,13 @@ static __always_inline int xdp_parse_packet_cached(void *data, void *data_end,
         key->ip_version = 4;
         l4_proto = ip->protocol;
         l4_hdr = (void *)ip + ihl;
+
+        /* Clear IPv6 key for IPv4 packets */
+        if (key_v6) {
+            __builtin_memset(key_v6, 0, sizeof(*key_v6));
+        }
     }
-    // IPv6 header (40 bytes, no extension header parsing)
+    // IPv6 header (40 bytes) with extension header walking (FIX M1)
     else if (eth_proto == ETH_P_IPV6) {
         struct ipv6hdr_simple {
             __be32 flow_lbl_ver;
@@ -2854,8 +2942,7 @@ static __always_inline int xdp_parse_packet_cached(void *data, void *data_end,
         if ((void *)(ip6 + 1) > data_end)
             return -1;
 
-        // Hash IPv6 addresses to 32-bit for flow_key (XOR all 4 dwords)
-        // Note: This loses precision but fits in flow_key structure
+        /* FIX M1: Still use XOR hash for flow_key (flow_states compatibility) */
         __u32 *s = (__u32 *)ip6->saddr;
         __u32 *d = (__u32 *)ip6->daddr;
         if ((void *)(s + 4) > data_end || (void *)(d + 4) > data_end)
@@ -2864,8 +2951,59 @@ static __always_inline int xdp_parse_packet_cached(void *data, void *data_end,
         key->saddr = s[0] ^ s[1] ^ s[2] ^ s[3];
         key->daddr = d[0] ^ d[1] ^ d[2] ^ d[3];
         key->ip_version = 6;
-        l4_proto = ip6->nexthdr;
-        l4_hdr = (void *)(ip6 + 1);
+
+        /* FIX M1: Fill full IPv6 key for flow_cookie_map_v6 lookup (zero collisions) */
+        if (key_v6) {
+            __builtin_memcpy(key_v6->saddr, ip6->saddr, 16);
+            __builtin_memcpy(key_v6->daddr, ip6->daddr, 16);
+        }
+
+        /*
+         * FIX M1: Walk extension headers to find L4 protocol (bounded loop).
+         * IPv6 can have multiple extension headers (Hop-by-Hop, Routing, Fragment,
+         * Destination Options) before the TCP/UDP header.
+         */
+        __u8 nexthdr = ip6->nexthdr;
+        void *cursor = (void *)(ip6 + 1);
+
+        #pragma unroll
+        for (int i = 0; i < MAX_IPV6_EXT_HEADERS; i++) {
+            /* Check if we've reached a known L4 protocol */
+            if (nexthdr == IPPROTO_TCP_VAL || nexthdr == IPPROTO_UDP_VAL) {
+                break;
+            }
+
+            /* Check for extension headers we can skip */
+            if (nexthdr == 0   ||   /* Hop-by-Hop Options */
+                nexthdr == 43  ||   /* Routing Header */
+                nexthdr == 44  ||   /* Fragment Header */
+                nexthdr == 60) {    /* Destination Options */
+
+                /* Extension header format: [next_header][hdr_ext_len][...data...] */
+                if (cursor + 2 > data_end)
+                    break;
+
+                __u8 *hdr = (__u8 *)cursor;
+                nexthdr = hdr[0];
+
+                /* hdr_ext_len is in 8-byte units, excluding first 8 bytes */
+                __u8 hdr_len = hdr[1];
+                __u32 ext_len = ((__u32)hdr_len + 1) * 8;
+
+                /* Fragment header is always 8 bytes (hdr_len is not used) */
+                if (hdr[0] == 44) {
+                    ext_len = 8;
+                }
+
+                cursor = cursor + ext_len;
+            } else {
+                /* Unknown extension header or L4 protocol */
+                break;
+            }
+        }
+
+        l4_proto = nexthdr;
+        l4_hdr = cursor;
     }
     else {
         return -1;  // Not IPv4/IPv6
@@ -2897,6 +3035,16 @@ static __always_inline int xdp_parse_packet_cached(void *data, void *data_end,
     key->dport = tcp->dest;
     key->_pad[0] = 0;
     key->_pad[1] = 0;
+
+    /* FIX M1: Fill IPv6 full key ports and protocol for flow_cookie_map_v6 */
+    if (key_v6 && key->ip_version == 6) {
+        key_v6->sport = tcp->source;
+        key_v6->dport = tcp->dest;
+        key_v6->protocol = l4_proto;
+        key_v6->_pad[0] = 0;
+        key_v6->_pad[1] = 0;
+        key_v6->_pad[2] = 0;
+    }
 
     *tcp_flags_out = tcp->flags;
 
@@ -2967,13 +3115,15 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
     if (stats)
         stats->packets_total++;
 
-    // Parse packet headers into flow key
+    /* Parse packet headers into flow key
+     * FIX M1: fkey_v6 holds full IPv6 addresses for flow_cookie_map_v6 lookup */
     struct flow_key fkey = {};
+    struct flow_key_v6 fkey_v6 = {};
     void *payload = NULL;
     __u16 payload_len = 0;
     __u8 tcp_flags = 0;
 
-    if (xdp_parse_packet_cached(data, data_end, &fkey, &payload, &payload_len, &tcp_flags) < 0)
+    if (xdp_parse_packet_cached(data, data_end, &fkey, &fkey_v6, &payload, &payload_len, &tcp_flags) < 0)
         return XDP_PASS;  // Not TCP/IP, pass through
 
     if (stats)
@@ -3130,31 +3280,83 @@ int xdp_flow_tracker(struct xdp_md *ctx) {
     // Now safe to do map lookups (classification already done above)
     // -------------------------------------------------------------------------
 
-    // Get socket cookie from sock_ops cache (the "Golden Thread")
     /**
-     * @brief Socket cookie lookup for XDP-SSL correlation
+     * @brief Socket cookie lookup for XDP-SSL correlation ("Golden Thread")
      *
      * The sock_ops program caches cookies when connections are established
      * because bpf_get_socket_cookie() is NOT available in XDP context.
      * Userspace warm-up seeds this map with existing connections at startup.
+     *
+     * FIX M1: IPv6 uses flow_cookie_map_v6 with full 128-bit addresses
+     * to eliminate XOR hash collisions (~50% at 65K flows).
      */
     __u64 cookie = 0;
+    struct flow_cookie_entry *cookie_entry = NULL;
 
-    struct flow_cookie_entry *cookie_entry = bpf_map_lookup_elem(&flow_cookie_map, &fkey);
-    if (cookie_entry) {
-        cookie = cookie_entry->socket_cookie;
-        // DEBUG: Found cookie in map
-        bpf_printk("XDP LOOKUP: HIT cookie=%llu", cookie);
+    if (fkey.ip_version == 6) {
+        /* FIX M1: IPv6 - use flow_cookie_map_v6 with full addresses (zero collisions) */
+        cookie_entry = bpf_map_lookup_elem(&flow_cookie_map_v6, &fkey_v6);
+        if (cookie_entry) {
+            cookie = cookie_entry->socket_cookie;
+            bpf_printk("XDP LOOKUP: HIT IPv6 cookie=%llu (forward)", cookie);
+        } else {
+            /* Try reverse key for IPv6 */
+            struct flow_key_v6 reverse_fkey_v6;
+            __builtin_memcpy(reverse_fkey_v6.saddr, fkey_v6.daddr, 16);
+            __builtin_memcpy(reverse_fkey_v6.daddr, fkey_v6.saddr, 16);
+            reverse_fkey_v6.sport = fkey_v6.dport;
+            reverse_fkey_v6.dport = fkey_v6.sport;
+            reverse_fkey_v6.protocol = fkey_v6.protocol;
+            reverse_fkey_v6._pad[0] = 0;
+            reverse_fkey_v6._pad[1] = 0;
+            reverse_fkey_v6._pad[2] = 0;
+
+            cookie_entry = bpf_map_lookup_elem(&flow_cookie_map_v6, &reverse_fkey_v6);
+            if (cookie_entry) {
+                cookie = cookie_entry->socket_cookie;
+                bpf_printk("XDP LOOKUP: HIT IPv6 cookie=%llu (reverse)", cookie);
+            } else {
+                if (stats)
+                    stats->cookie_failures++;
+                bpf_printk("XDP LOOKUP: MISS IPv6 for key sport=0x%x dport=0x%x",
+                           fkey_v6.sport, fkey_v6.dport);
+            }
+        }
     } else {
-        /* Cookie not cached yet - sock_ops may not have run for this flow.
-         * This happens for: mid-connection captures, packets before socket setup,
-         * or connections established before program attachment.
-         * Classification still works, but correlation with uprobes limited. */
-        if (stats)
-            stats->cookie_failures++;
-        // DEBUG: Cookie miss
-        bpf_printk("XDP LOOKUP: MISS for key saddr=0x%x daddr=0x%x sport=0x%x",
-                   fkey.saddr, fkey.daddr, fkey.sport);
+        /* IPv4 - use flow_cookie_map with 32-bit addresses */
+        cookie_entry = bpf_map_lookup_elem(&flow_cookie_map, &fkey);
+        if (cookie_entry) {
+            cookie = cookie_entry->socket_cookie;
+            bpf_printk("XDP LOOKUP: HIT cookie=%llu (forward)", cookie);
+        } else {
+            /* FIX H2: Try reverse flow key lookup before declaring failure.
+             * sock_ops stores cookies for BOTH forward and reverse keys, but the
+             * packet we see might be from the other direction than expected.
+             * This reduces cookie_failures by catching asymmetric flow scenarios. */
+            struct flow_key reverse_fkey = {
+                .saddr = fkey.daddr,
+                .daddr = fkey.saddr,
+                .sport = fkey.dport,
+                .dport = fkey.sport,
+                .protocol = fkey.protocol,
+                .ip_version = fkey.ip_version,
+                ._pad = {0, 0}
+            };
+            cookie_entry = bpf_map_lookup_elem(&flow_cookie_map, &reverse_fkey);
+            if (cookie_entry) {
+                cookie = cookie_entry->socket_cookie;
+                bpf_printk("XDP LOOKUP: HIT cookie=%llu (reverse)", cookie);
+            } else {
+                /* Cookie not cached yet - sock_ops may not have run for this flow.
+                 * This happens for: mid-connection captures, packets before socket setup,
+                 * or connections established before program attachment.
+                 * Classification still works, but correlation with uprobes limited. */
+                if (stats)
+                    stats->cookie_failures++;
+                bpf_printk("XDP LOOKUP: MISS for key saddr=0x%x daddr=0x%x sport=0x%x",
+                           fkey.saddr, fkey.daddr, fkey.sport);
+            }
+        }
     }
 
     // Determine if userspace PCRE2-JIT is needed for ambiguous traffic
@@ -3457,12 +3659,27 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
     bpf_printk("SOCKOPS RAW: local_port=%u(0x%x) remote_port=%u(0x%x)",
                local_port, local_port, remote_port, remote_port);
 
-    // Port extraction FIX: remote_port has port in UPPER 16 bits as __be16
-    // The lower 16 bits are zero, so we need to shift right to extract the port
-    __u16 rport_net = (__u16)(remote_port >> 16);      // Upper 16 bits contain port
-    __u16 lport_net = bpf_htons((__u16)local_port);    // local_port is host order → __be16
+    /*
+     * BPF sock_ops port semantics (kernel 5.x+) - FIX H3 documentation:
+     * - remote_port: __be32 with port value in UPPER 16 bits (network byte order)
+     *   The lower 16 bits are always zero. Extract by right-shifting 16 bits.
+     * - local_port: __u32 in HOST byte order (requires bpf_htons conversion)
+     *
+     * This asymmetry is a kernel implementation detail documented in
+     * include/linux/bpf.h struct bpf_sock_ops comments.
+     */
+    __u16 rport_net = (__u16)(remote_port >> 16);      // Already network order
+    __u16 lport_net = bpf_htons((__u16)local_port);    // Convert host→network
 
     bpf_printk("SOCKOPS CONV: rport_net=0x%x lport_net=0x%x", rport_net, lport_net);
+
+    /*
+     * FIX M1: Build both flow_key (for flow_states) and flow_key_v6 (for IPv6 cookie lookup).
+     * IPv6 uses separate map with full 128-bit addresses to eliminate XOR hash collisions.
+     */
+    struct flow_key_v6 fkey_v6 = {};
+    struct flow_key_v6 reverse_fkey_v6 = {};
+    bool is_ipv6 = false;
 
     if (family == AF_INET) {
         // Build from OUTGOING packet perspective (us → peer)
@@ -3474,13 +3691,61 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
         fkey.dport = rport_net;    // Peer port
         fkey.ip_version = 4;
     } else if (family == AF_INET6) {
-        // XOR-hash 128-bit addresses to 32-bit (matches XDP algorithm)
-        // Build from OUTGOING packet perspective
+        is_ipv6 = true;
+
+        /* Still build XOR hash for flow_states compatibility */
         fkey.saddr = lip6_0 ^ lip6_1 ^ lip6_2 ^ lip6_3;  // Our IP hash
         fkey.daddr = rip6_0 ^ rip6_1 ^ rip6_2 ^ rip6_3;  // Peer IP hash
         fkey.sport = lport_net;
         fkey.dport = rport_net;
         fkey.ip_version = 6;
+
+        /*
+         * FIX M1: Build full IPv6 key for flow_cookie_map_v6 (zero collisions).
+         * sockops provides IPv6 addresses as 4 x __u32 in network byte order.
+         */
+        __u32 *saddr_v6 = (__u32 *)fkey_v6.saddr;
+        __u32 *daddr_v6 = (__u32 *)fkey_v6.daddr;
+
+        /* Local IP = source when we send */
+        saddr_v6[0] = lip6_0;
+        saddr_v6[1] = lip6_1;
+        saddr_v6[2] = lip6_2;
+        saddr_v6[3] = lip6_3;
+
+        /* Remote IP = destination when we send */
+        daddr_v6[0] = rip6_0;
+        daddr_v6[1] = rip6_1;
+        daddr_v6[2] = rip6_2;
+        daddr_v6[3] = rip6_3;
+
+        fkey_v6.sport = lport_net;
+        fkey_v6.dport = rport_net;
+        fkey_v6.protocol = IPPROTO_TCP_VAL;
+        fkey_v6._pad[0] = 0;
+        fkey_v6._pad[1] = 0;
+        fkey_v6._pad[2] = 0;
+
+        /* Reverse IPv6 key */
+        __u32 *rev_saddr = (__u32 *)reverse_fkey_v6.saddr;
+        __u32 *rev_daddr = (__u32 *)reverse_fkey_v6.daddr;
+
+        rev_saddr[0] = rip6_0;
+        rev_saddr[1] = rip6_1;
+        rev_saddr[2] = rip6_2;
+        rev_saddr[3] = rip6_3;
+
+        rev_daddr[0] = lip6_0;
+        rev_daddr[1] = lip6_1;
+        rev_daddr[2] = lip6_2;
+        rev_daddr[3] = lip6_3;
+
+        reverse_fkey_v6.sport = rport_net;
+        reverse_fkey_v6.dport = lport_net;
+        reverse_fkey_v6.protocol = IPPROTO_TCP_VAL;
+        reverse_fkey_v6._pad[0] = 0;
+        reverse_fkey_v6._pad[1] = 0;
+        reverse_fkey_v6._pad[2] = 0;
     } else {
         return 0;  // Unknown address family
     }
@@ -3506,6 +3771,11 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
         bpf_printk("SOCKOPS CLEANUP: deleting cookie entries");
         bpf_map_delete_elem(&flow_cookie_map, &fkey);
         bpf_map_delete_elem(&flow_cookie_map, &reverse_fkey);
+        if (is_ipv6) {
+            /* FIX M1: Also clean up IPv6 map entries */
+            bpf_map_delete_elem(&flow_cookie_map_v6, &fkey_v6);
+            bpf_map_delete_elem(&flow_cookie_map_v6, &reverse_fkey_v6);
+        }
         return 0;
     }
 
@@ -3522,11 +3792,18 @@ int sockops_cache_cookie(struct bpf_sock_ops *skops) {
         .timestamp_ns = bpf_ktime_get_ns()
     };
 
+    /* Always update flow_cookie_map (used for flow_states) */
     bpf_map_update_elem(&flow_cookie_map, &fkey, &entry, BPF_ANY);
     bpf_map_update_elem(&flow_cookie_map, &reverse_fkey, &entry, BPF_ANY);
 
-    // DEBUG: Confirm map update with cookie
-    bpf_printk("SOCKOPS STORE: cookie=%llu stored OK", socket_cookie);
+    if (is_ipv6) {
+        /* FIX M1: Also update IPv6 map with full addresses for XDP lookup */
+        bpf_map_update_elem(&flow_cookie_map_v6, &fkey_v6, &entry, BPF_ANY);
+        bpf_map_update_elem(&flow_cookie_map_v6, &reverse_fkey_v6, &entry, BPF_ANY);
+        bpf_printk("SOCKOPS STORE: IPv6 cookie=%llu stored OK", socket_cookie);
+    } else {
+        bpf_printk("SOCKOPS STORE: IPv4 cookie=%llu stored OK", socket_cookie);
+    }
 
     return 0;
 }

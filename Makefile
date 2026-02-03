@@ -14,8 +14,10 @@
         package-deb package-rpm docs clean-docs help
 
 # Build directories
+# Each build type gets its own directory to prevent overwrites
 BUILD_DIR_DEBUG := build-debug
 BUILD_DIR_RELEASE := build-release
+BUILD_DIR_SANITIZE := build-sanitize
 
 # Number of parallel jobs (default: number of CPUs)
 JOBS := $(shell nproc 2>/dev/null || echo 4)
@@ -52,23 +54,23 @@ debug:
 # Release build with sanitizers (for testing optimized code)
 relsan:
 	@echo "==> Configuring release+sanitizers build..."
-	@cmake -B $(BUILD_DIR_DEBUG) \
+	@cmake -B $(BUILD_DIR_SANITIZE) \
 		-DCMAKE_BUILD_TYPE=RelWithSan \
 		-DENABLE_SANITIZERS=ON
 	@echo "==> Building release+sanitizers..."
-	@cmake --build $(BUILD_DIR_DEBUG) --parallel $(JOBS)
-	@ln -sf $(BUILD_DIR_DEBUG)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_DEBUG)/spliff spliff
+	@cmake --build $(BUILD_DIR_SANITIZE) --parallel $(JOBS)
+	@ln -sf $(BUILD_DIR_SANITIZE)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_SANITIZE)/spliff spliff
 	@echo "==> RelWithSan build complete: ./spliff"
 
 # Sanitize build (optimized for maximum ASan/UBSan accuracy with -O1)
 sanitize:
 	@echo "==> Configuring sanitize build (ASan/UBSan optimized)..."
-	@cmake -B $(BUILD_DIR_DEBUG) \
+	@cmake -B $(BUILD_DIR_SANITIZE) \
 		-DCMAKE_BUILD_TYPE=Sanitize \
 		-DENABLE_SANITIZERS=ON
 	@echo "==> Building sanitize..."
-	@cmake --build $(BUILD_DIR_DEBUG) --parallel $(JOBS)
-	@ln -sf $(BUILD_DIR_DEBUG)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_DEBUG)/spliff spliff
+	@cmake --build $(BUILD_DIR_SANITIZE) --parallel $(JOBS)
+	@ln -sf $(BUILD_DIR_SANITIZE)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_SANITIZE)/spliff spliff
 	@echo "==> Sanitize build complete: ./spliff"
 	@echo "    Run with: ASAN_OPTIONS=check_initialization_order=1 ./spliff"
 
@@ -113,7 +115,7 @@ clean-docs:
 # Clean all build artifacts and CMake configuration
 clean:
 	@echo "==> Cleaning build directories..."
-	@rm -rf $(BUILD_DIR_DEBUG) $(BUILD_DIR_RELEASE)
+	@rm -rf $(BUILD_DIR_DEBUG) $(BUILD_DIR_RELEASE) $(BUILD_DIR_SANITIZE)
 	@rm -f spliff
 	@rm -f compile_commands.json
 	@echo "==> Clean complete"
@@ -227,7 +229,8 @@ help:
 	@echo ""
 	@echo "Build directories:"
 	@echo "  build-release/        Release builds (make, make release)"
-	@echo "  build-debug/          Debug builds (make debug, make tests)"
+	@echo "  build-debug/          Debug builds (make debug, make tests, make coverage)"
+	@echo "  build-sanitize/       Sanitizer builds (make relsan, make sanitize)"
 	@echo ""
 	@echo "Required dependencies:"
 	@echo "  Fedora:   libbpf-devel elfutils-libelf-devel zlib-ng-devel"

@@ -52,6 +52,10 @@
 #include <errno.h>
 #include <arpa/inet.h>  /* For ntohl/ntohs */
 
+/* liburcu thread registration for RCU-safe memory reclamation (FIX M9) */
+#define RCU_MEMBARRIER
+#include <urcu/urcu-memb.h>
+
 /** Global dispatcher context for BPF callback access */
 static dispatcher_ctx_t *g_dispatcher = NULL;
 
@@ -125,6 +129,14 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
                     (unsigned long long)bpf_event->socket_cookie);
         }
     } else {
+        /*
+         * FIX C4: Merge SSL info into existing flow (single-writer context).
+         * flow_lookup_ex() is now read-only for SPMC safety.
+         * We must explicitly merge ssl_ctx/pid from SSL events into XDP-created flows.
+         */
+        flow_merge_ssl_info(&ctx->flow_mgr, flow_ctx,
+                            bpf_event->pid, bpf_event->ssl_ctx);
+
         /* Show correlation path in debug mode */
         if (g_config.debug_mode) {
             const char *path_name = (lookup_path == FLOW_PATH_COOKIE) ? "COOKIE" : "SHADOW";
@@ -185,9 +197,10 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
     /* Allocate event from worker's pool */
     worker_event_t *event = pool_alloc(&worker->event_pool);
     if (!event) {
-        /* Pool empty - drop event */
-        atomic_fetch_add(&ctx->events_dropped, 1);
-        atomic_fetch_add(&worker->events_dropped, 1);
+        /* Pool empty - drop event
+         * FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        atomic_fetch_add_explicit(&ctx->events_dropped, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&worker->events_dropped, 1, memory_order_relaxed);
         return -1;
     }
 
@@ -292,8 +305,9 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
             atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
         pool_free(&worker->event_pool, event);
-        atomic_fetch_add(&ctx->events_dropped, 1);
-        atomic_fetch_add(&worker->events_dropped, 1);
+        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        atomic_fetch_add_explicit(&ctx->events_dropped, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&worker->events_dropped, 1, memory_order_relaxed);
         return -1;
     }
 
@@ -304,7 +318,8 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
         (void)n;  /* Ignore write result */
     }
 
-    atomic_fetch_add(&ctx->events_dispatched, 1);
+    /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+    atomic_fetch_add_explicit(&ctx->events_dispatched, 1, memory_order_relaxed);
     return 0;
 }
 
@@ -481,6 +496,11 @@ void *dispatcher_thread_main(void *arg) {
     pthread_setname_np(pthread_self(), "spliff-disp");
 #endif
 
+    /* FIX M9: Register this thread with liburcu.
+     * Dispatcher is the single-writer for CK hash tables. It needs RCU registration
+     * so call_rcu() callbacks know when the dispatcher has passed quiescent states. */
+    urcu_memb_register_thread();
+
     /* Register our callback with probe handler */
     probe_handler_set_callback(ctx->handler, dispatcher_event_callback, ctx);
 
@@ -538,6 +558,9 @@ void *dispatcher_thread_main(void *arg) {
             fprintf(stderr, "Dispatcher: drained %d XDP events on shutdown\n", drained);
         }
     }
+
+    /* FIX M9: Unregister from liburcu before thread exit */
+    urcu_memb_unregister_thread();
 
     return NULL;
 }
@@ -718,7 +741,8 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
              */
             atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
-        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
         return false;
     }
 
@@ -731,7 +755,8 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
              */
             atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
-        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
         return false;
     }
 
@@ -841,7 +866,8 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
              */
             atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
-        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
         return false;
     }
 
@@ -854,7 +880,8 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
              */
             atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
         }
-        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
         return false;
     }
 
@@ -897,11 +924,13 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
         return 0;  /* Continue processing */
     }
 
-    /* Track total events received for debugging ring buffer consumption */
-    atomic_fetch_add(&dispatcher->xdp_events_received, 1);
+    /* Track total events received for debugging ring buffer consumption
+     * FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+    atomic_fetch_add_explicit(&dispatcher->xdp_events_received, 1, memory_order_relaxed);
 
-    /* Sampling counter for debug output */
-    uint64_t sample_count = atomic_fetch_add(&dispatcher->xdp_debug_samples, 1);
+    /* Sampling counter for debug output
+     * FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+    uint64_t sample_count = atomic_fetch_add_explicit(&dispatcher->xdp_debug_samples, 1, memory_order_relaxed);
     bool should_debug = g_config.debug_mode &&
                         (sample_count % XDP_DEBUG_SAMPLE_RATE == 0);
 
@@ -913,7 +942,8 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
          */
         const xdp_payload_event_t *payload_evt = (const xdp_payload_event_t *)data;
 
-        atomic_fetch_add(&dispatcher->xdp_ambiguous_events, 1);
+        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        atomic_fetch_add_explicit(&dispatcher->xdp_ambiguous_events, 1, memory_order_relaxed);
 
         if (should_debug) {
             char src_ip[16], dst_ip[16];
@@ -970,7 +1000,8 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
             /* ==================== FLOW_END ====================
              * Flow terminated (FIN or RST)
              */
-            atomic_fetch_add(&dispatcher->xdp_flows_terminated, 1);
+            /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+            atomic_fetch_add_explicit(&dispatcher->xdp_flows_terminated, 1, memory_order_relaxed);
 
             /* Terminate flow from Shared Pool if present */
             flow_context_t *flow_ctx = flow_lookup(&dispatcher->flow_mgr,
@@ -1005,7 +1036,8 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
              * Workers set FLOW_FLAG_HAS_XDP before processing SSL events,
              * ensuring proper correlation timing.
              */
-            atomic_fetch_add(&dispatcher->xdp_flows_discovered, 1);
+            /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+            atomic_fetch_add_explicit(&dispatcher->xdp_flows_discovered, 1, memory_order_relaxed);
 
             /*
              * Route to worker for HAS_XDP flag setting.
@@ -1032,8 +1064,9 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
         }
 
     } else {
-        /* Unknown struct size - should not happen */
-        atomic_fetch_add(&dispatcher->xdp_events_dropped, 1);
+        /* Unknown struct size - should not happen
+         * FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
 
         if (should_debug) {
             fprintf(stderr, "[XDP] WARNING: Unknown event size %zu "

@@ -38,7 +38,7 @@
  */
 
 /** @brief Full version string (major.minor.patch) */
-#define SPLIFF_VERSION "0.9.9"
+#define SPLIFF_VERSION "0.9.10"
 
 /** @brief Major version number (breaking changes) */
 #define SPLIFF_VERSION_MAJOR 0
@@ -47,7 +47,7 @@
 #define SPLIFF_VERSION_MINOR 9
 
 /** @brief Patch version number (bug fixes) */
-#define SPLIFF_VERSION_PATCH 9
+#define SPLIFF_VERSION_PATCH 10
 
 /** @} */ /* end of version group */
 
@@ -237,13 +237,13 @@ typedef enum {
 } xdp_category_t;
 
 /**
- * @brief Network flow key (5-tuple)
+ * @brief Network flow key (5-tuple) for IPv4 and flow_states
  *
  * Uniquely identifies a network flow for BPF map lookups. This structure
  * is 16 bytes and must match struct flow_key in spliff.bpf.c exactly.
  *
  * @note IPv6 flows use XOR-hashed addresses (32-bit) stored in saddr/daddr
- * fields. This loses some precision but allows unified IPv4/IPv6 handling.
+ * fields for flow_states. For zero-collision IPv6 correlation, use flow_key_v6_t.
  *
  * @warning All IP addresses and ports are in network byte order.
  */
@@ -256,6 +256,27 @@ typedef struct {
     uint8_t  ip_version; /**< IP version: 4 or 6 */
     uint8_t  _pad[2];    /**< Padding for 16-byte alignment */
 } __attribute__((packed)) flow_key_t;
+
+/**
+ * @brief IPv6 flow key with full 128-bit addresses (FIX M1)
+ *
+ * Eliminates XOR hash collisions (~50% at 65K flows) by storing full
+ * IPv6 addresses. Used with flow_cookie_map_v6 for zero-collision
+ * XDP-SSL correlation.
+ *
+ * @par Size
+ * 40 bytes (16+16+2+2+1+3 padding)
+ *
+ * @warning Must match struct flow_key_v6 in spliff.bpf.c exactly.
+ */
+typedef struct {
+    uint8_t  saddr[16];  /**< Full IPv6 source address, network byte order */
+    uint8_t  daddr[16];  /**< Full IPv6 destination address, network byte order */
+    uint16_t sport;      /**< Source port, network byte order */
+    uint16_t dport;      /**< Destination port, network byte order */
+    uint8_t  protocol;   /**< IP protocol: IPPROTO_TCP (6) or IPPROTO_UDP (17) */
+    uint8_t  _pad[3];    /**< Padding for 40-byte alignment */
+} __attribute__((packed)) flow_key_v6_t;
 
 /**
  * @brief XDP packet event (metadata only)

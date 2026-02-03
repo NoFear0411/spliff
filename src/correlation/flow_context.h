@@ -352,10 +352,12 @@ typedef struct flow_context {
     uint64_t last_seen_ns;          /**< Last activity timestamp */
 
     /*=== Traffic Counters (16 bytes) ===*/
-    uint32_t pkts_in;               /**< Ingress packet count */
-    uint32_t pkts_out;              /**< Egress packet count */
-    uint32_t bytes_in;              /**< Ingress byte count */
-    uint32_t bytes_out;             /**< Egress byte count */
+    /* FIX H6: Make counters atomic to prevent lost updates from concurrent access.
+     * Multiple threads may update these (dispatcher via XDP, workers via SSL). */
+    _Atomic uint32_t pkts_in;       /**< Ingress packet count (atomic) */
+    _Atomic uint32_t pkts_out;      /**< Egress packet count (atomic) */
+    _Atomic uint32_t bytes_in;      /**< Ingress byte count (atomic) */
+    _Atomic uint32_t bytes_out;     /**< Egress byte count (atomic) */
 
     /*=== Application View - from SSL (48 bytes) ===*/
     char comm[16];                  /**< Process command name */
@@ -739,6 +741,27 @@ flow_context_t *flow_lookup(flow_manager_t *mgr, uint64_t cookie,
 flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
                                uint32_t pid, uint64_t ssl_ctx,
                                flow_lookup_path_t *path_out);
+
+/**
+ * @brief Merge SSL info into XDP-created flow (single-writer only)
+ *
+ * FIX C4: This function performs write operations and MUST only be called
+ * from the dispatcher thread (single-writer context).
+ *
+ * XDP-SSL Correlation: XDP events create flows with ssl_ctx=0.
+ * When SSL events arrive with the same cookie, call this to merge
+ * the SSL context and PID into the XDP-created flow.
+ *
+ * @param mgr      Flow manager
+ * @param ctx      Flow context to update (must be active)
+ * @param pid      Process ID to merge (0 = don't update)
+ * @param ssl_ctx  SSL context to merge (0 = don't update)
+ * @return 0 on success, -1 on error
+ *
+ * @thread_safety Single-writer only (dispatcher thread)
+ */
+int flow_merge_ssl_info(flow_manager_t *mgr, flow_context_t *ctx,
+                        uint32_t pid, uint64_t ssl_ctx);
 
 /**
  * @brief Get or create flow context

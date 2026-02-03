@@ -35,8 +35,12 @@ extern "C" {
  * Constants
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** Ring buffer size (must be power of 2) */
+/** Ring buffer size (must be power of 2 for CK ring) */
 #define LOG_RING_SIZE       8192
+
+/* Batch 5.1: Compile-time verification of ring size invariant */
+_Static_assert((LOG_RING_SIZE & (LOG_RING_SIZE - 1)) == 0,
+               "LOG_RING_SIZE must be power of 2 for CK ring");
 
 /** Maximum messages per writev() batch */
 #define LOG_BATCH_SIZE      64
