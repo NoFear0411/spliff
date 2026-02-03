@@ -3,6 +3,7 @@
 **eBPF-based SSL/TLS Traffic Sniffer**
 
 [![Version](https://img.shields.io/badge/version-0.9.10-blue.svg)](CHANGELOG.md)
+[![Release](https://github.com/NoFear0411/spliff/actions/workflows/release.yml/badge.svg)](https://github.com/NoFear0411/spliff/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
@@ -66,49 +67,66 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 
   Application Layer (SSL/TLS)
   ----------------------------------------------
-  Events:      50 captured -> 50 processed
-  Output:      18 messages (1.8 KB)
+  Events:      1435 captured -> 2328 processed
+  Output:      0 messages (0 B)
+
+  Async Logger
+  ----------------------------------------------
+  Messages: 531 (79.9 KB)
+  Batches:  396 (avg 1.3 msgs/batch)
 
   Workers (16)
   ----------------------------------------------
-  Worker  1: 3 events
-  Worker  2: 6 events
-  Worker  3: 2 events
+  Worker  0: 4 events
+  Worker  2: 41 events
+  Worker  3: 1 events
+  Worker  4: 24 events
+  Worker  5: 10 events
+  Worker  6: 4 events
   Worker  7: 7 events
-  Worker  9: 8 events
-  Worker 10: 5 events
+  Worker  8: 5 events
+  Worker 10: 1886 events
+  Worker 11: 326 events
   Worker 12: 4 events
-  Worker 14: 3 events
-  Worker 15: 12 events
-  CPU: Good (NAPI-style, 4338 sleep cycles)
+  Worker 13: 7 events
+  Worker 14: 4 events
+  Worker 15: 5 events
+  CPU: Good (NAPI-style, 33661 sleep cycles)
+
+  Deferred Display Queue (XDP Correlation)
+  ----------------------------------------------
+  Matched:     0 (XDP arrived in time)
+  Timed out:   6 (no XDP within timeout)
+  Match rate:  0.0%
+  Health:      Critical (XDP correlation failing)
 
   Flow Pool
   ----------------------------------------------
-  Active:      5 flows, peak 6
-  Throughput:  12 allocs, 7 frees
-  Cookie index: 1 entries, 36 hits (81.8%), 8 misses
-  Shadow index: 0 entries, 19 hits, 2 promotions
-  Promotion:    16.7% of flows got socket_cookie
+  Active:      3 flows, peak 19
+  Throughput:  27 allocs, 24 frees
+  Cookie index: 2 entries, 2267 hits (98.8%), 28 misses
+  Shadow index: 1 entries, 34 hits, 0 promotions
+  Promotion:    0.0% of flows got socket_cookie
 
   Network Layer (XDP)
   ----------------------------------------------
-  Packets:     124 processed (91 TCP)
-  Connections: 8 tracked, 8 classified
+  Packets:     2145 processed (2063 TCP)
+  Connections: 20 tracked, 20 classified
   Correlation: 100.0% socket cookie success
-  Classified:  8 flows
-  Ambiguous:   12 (deeper inspection needed)
-  Terminated:  7 (FIN/RST)
+  Classified:  20 flows
+  Ambiguous:   867 (deeper inspection needed)
+  Terminated:  14 (FIN/RST)
   Cache hits:  0 (fast-path gatekeeper)
   Cookie miss: 0 (correlation gaps)
 
   Sockops (cookie caching)
   ----------------------------------------------
-  Events:  8 (active: 8, passive: 0)
+  Events:  16 (active: 14, passive: 2)
   Cleanup: 0
 
   SSL Probes
   ----------------------------------------------
-  SSL_read/SSL_write intercepted: 50
+  SSL_read/SSL_write intercepted: 16
 
 ============================================
 ```
