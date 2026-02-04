@@ -117,7 +117,7 @@
 │  │  ║                                                                           ║   │     │
 │  │  ║              ┌─────────────────┐       ┌─────────────────┐                ║   │     │
 │  │  ║              │ flow_cookie_map │       │   ssl_to_fd     │                ║   │     │
-│  │  ║              │ (5-tuple:cookie)│       │ (LRU_HASH v0.9.10)              ║   │     │
+│  │  ║              │ (5-tuple:cookie)│       │   (LRU_HASH)    │                ║   │     │
 │  │  ║              │ + map_v6 (IPv6) │       │                 │                ║   │     │
 │  │  ║              └────────┬────────┘       └────────┬────────┘                ║   │     │
 │  │  ║                       │                         │                         ║   │     │
@@ -195,7 +195,7 @@
         │  │  ┌──────────────────────────────────────────────┐  │
         │  │  │              DUAL-INDEX LOOKUP               │  │
         │  │  │                                              │  │
-        │  │  │  1. cookie_index: cookie → flow_ctx* (fast)   │  │
+        │  │  │  1. cookie_index: cookie → flow_ctx* (fast)  │  │
         │  │  │  2. shadow_index: (pid,ssl_ctx) → flow_ctx*  │  │
         │  │  │                                              │  │
         └──┼──┼──► flow_promote_cookie() links cookie later  │  │
@@ -203,7 +203,7 @@
            │                       │                            │
            │                       ▼                            │
            │  ┌──────────────────────────────────────────────┐  │
-           │  │           flow_pool (dynamic allocation)       │  │
+           │  │           flow_pool (dynamic allocation)     │  │
            │  │  ┌────────────────────────────────────────┐  │  │
            │  │  │           flow_context_t               │  │  │
            │  │  │  • socket_cookie, pid, ssl_ctx         │  │  │
@@ -248,12 +248,12 @@ connection from which process.
 │  ┌────────────────────────────────────────────────────────────────┐  │
 │  │           flow_pool (on-demand via jemalloc)                   │  │
 │  │                                                                │  │
-│  │  active_head → [ctx_A] ⇄ [ctx_B] ⇄ [ctx_D] → NULL            │  │
+│  │  active_head → [ctx_A] ⇄ [ctx_B] ⇄ [ctx_D] → NULL             │  │
 │  │                 gen=5     gen=12     gen=8                     │  │
 │  │                 pid=100   pid=200    pid=300                   │  │
-│  │                 wkr=2     wkr=0      wkr=1                    │  │
+│  │                 wkr=2     wkr=0      wkr=1                     │  │
 │  │                                                                │  │
-│  │  deferred_head → [ctx_C] → NULL  (freed after 2s grace)       │  │
+│  │  deferred_head → [ctx_C] → NULL  (freed after 2s grace)        │  │
 │  │                   gen=3                                        │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 │              ▲                                   ▲                   │
@@ -282,9 +282,9 @@ connection from which process.
 │  │                                                                │  │
 │  │ Cache line 2+ (protocol state):                                │  │
 │  │ • flags, home_worker_id, inflight_events (atomic)              │  │
-│  │ • parser.h2 (nghttp2 + streams[64] + hpack_corrupted)         │  │
-│  │ • parser.h1 (llhttp + current_txn)                            │  │
-│  │ • alpn, body buffers, proto                                   │  │
+│  │ • parser.h2 (nghttp2 + streams[64] + hpack_corrupted)          │  │
+│  │ • parser.h1 (llhttp + current_txn)                             │  │
+│  │ • alpn, body buffers, proto                                    │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 │  flow_transaction_t (per HTTP/2 stream):                             │
@@ -310,17 +310,19 @@ connection from which process.
 - **IPv6 zero-collision**: Separate 40-byte `flow_key_v6` with full 128-bit addresses (v0.9.10)
 - **Secondary cookie index**: O(1) lookup by socket_cookie in shadow_index (v0.9.10)
 - **Dynamic cgroup2**: Parses `/proc/mounts` for cgroup2 mount point (v0.9.10)
+- **Per-flow H2 sessions**: HTTP/2 sessions live in `flow_ctx->parser.h2`, not per-worker pools (v0.9.11)
+- **Centralized display API**: Startup/diagnostic output via display.c module (v0.9.11)
 
 ## XDP Event Delivery (v0.9.9+)
 
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                   PER-WORKER XDP RING ARCHITECTURE                     │
-├────────────────────────────────────────────────────────────────────────┤
-│                                                                        │
-│  Dispatcher Thread                                                     │
-│  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │  BPF Ring Poll ──► xdp_events ──► flow_context lookup           │   │
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   PER-WORKER XDP RING ARCHITECTURE                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Dispatcher Thread                                                      │
+│  ┌──────────────────────────────────────────────────────────────────┐   │
+│  │  BPF Ring Poll ──► xdp_events ──► flow_context lookup            │   │
 │  │                                           │                      │   │
 │  │                           ┌───────────────┼───────────────┐      │   │
 │  │                           ▼               ▼               ▼      │   │
@@ -340,11 +342,11 @@ connection from which process.
 │  │  │ 3. Process SSL events   │  │ 3. SSL evts │  │ 3. SSL evts│    │   │
 │  │  └─────────────────────────┘  └─────────────┘  └────────────┘    │   │
 │  └──────────────────────────────────────────────────────────────────┘   │
-│                                                                        │
-│  **Problem solved:** Workers check HAS_XDP before dispatcher polls     │
-│  **Solution:** Workers drain their XDP ring BEFORE processing SSL      │
-│                                                                        │
-└────────────────────────────────────────────────────────────────────────┘
+│                                                                         │
+│  **Problem solved:** Workers check HAS_XDP before dispatcher polls      │
+│  **Solution:** Workers drain their XDP ring BEFORE processing SSL       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Deferred Display Queue (v0.9.9+)
@@ -365,9 +367,9 @@ connection from which process.
 │               │                                  │                     │
 │               ▼                                  ▼                     │
 │    ┌─────────────────────┐            ┌─────────────────────┐          │
-│    │   DISPLAY IMMEDIATELY│            │   ENQUEUE DEFERRED  │          │
-│    │   [XDP:TLS][App:H2]  │            │   (wait for XDP)    │          │
-│    │        ✓✓            │            │                     │          │
+│    │  DISPLAY IMMEDIATELY│            │   ENQUEUE DEFERRED  │          │
+│    │  [XDP:TLS][App:H2]  │            │   (wait for XDP)    │          │
+│    │      ✓✓            │            │                     │          │
 │    └─────────────────────┘            └──────────┬──────────┘          │
 │                                                  │                     │
 │                                                  ▼                     │
@@ -399,11 +401,11 @@ connection from which process.
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │                    DISPATCHER THREAD (SINGLE WRITER)            │   │
 │  │                                                                 │   │
-│  │  • Owns all write operations to flow indexes                   │   │
-│  │  • Creates flows via flow_get_or_create()                      │   │
-│  │  • Merges SSL info via flow_merge_ssl_info() (single-writer)   │   │
-│  │  • Promotes flows: shadow_index → cookie_index                 │   │
-│  │  • Terminates flows via flow_terminate()                       │   │
+│  │  • Owns all write operations to flow indexes                    │   │
+│  │  • Creates flows via flow_get_or_create()                       │   │
+│  │  • Merges SSL info via flow_merge_ssl_info() (single-writer)    │   │
+│  │  • Promotes flows: shadow_index → cookie_index                  │   │
+│  │  • Terminates flows via flow_terminate()                        │   │
 │  │                                                                 │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                              │                                         │
@@ -474,73 +476,4 @@ connection from which process.
 9. **Output** → Serialized display with request/response correlation, ALPN indicator
 10. **Cleanup** → Process exit triggers flow eviction, deferred free (2s grace + inflight drain), stream body buffer free
 
-## Project Structure
-
-```
-spliff/
-├── CMakeLists.txt              # CMake build configuration (C23, LTO, packaging)
-├── Makefile                    # Convenience wrapper for CMake
-├── Doxyfile                    # Doxygen documentation config
-├── CHANGELOG.md                # Version history
-├── ISSUES.md                   # Known issues tracker
-├── LICENSE                     # GPL-3.0 license
-├── README.md                   # Project overview
-├── ISSUES.md                       # Known issues, limitations, resolved bugs
-├── docs/
-│   ├── ARCHITECTURE.md         # This file
-│   ├── CODE-MAP.md             # Comprehensive code-level reference
-│   ├── EDR_XDR_ROADMAP.md      # Long-term EDR/XDR vision
-│   └── TROUBLESHOOTING.md      # Common issues and solutions
-├── src/
-│   ├── main.c                  # Entry point, CLI, orchestration
-│   ├── include/
-│   │   └── spliff.h            # Public header, shared types, version
-│   ├── bpf/
-│   │   ├── spliff.bpf.c        # eBPF programs (XDP, sock_ops, uprobes)
-│   │   ├── bpf_loader.c        # BPF loader, XDP attach, library discovery
-│   │   ├── bpf_loader.h        # BPF loader API
-│   │   ├── probe_handler.c     # Event filtering and callback dispatch
-│   │   ├── probe_handler.h     # Probe handler API
-│   │   ├── binary_scanner.c    # BoringSSL offset detection
-│   │   ├── binary_scanner.h    # Binary scanner API
-│   │   ├── boringssl_offsets.h # Known BoringSSL offsets by build ID
-│   │   └── vmlinux.h           # Kernel BTF type definitions (CO-RE)
-│   ├── protocol/
-│   │   ├── detector.c          # Vectorscan protocol detection
-│   │   ├── detector.h          # Protocol detector API
-│   │   ├── http1.c             # HTTP/1.1 parser (llhttp)
-│   │   ├── http1.h             # HTTP/1.1 API
-│   │   ├── http2.c             # HTTP/2 parser (nghttp2)
-│   │   ├── http2.h             # HTTP/2 API
-│   │   ├── websocket.c         # WebSocket frame parser
-│   │   └── websocket.h         # WebSocket API
-│   ├── content/
-│   │   ├── decompressor.c      # gzip/brotli/zstd decompression
-│   │   ├── decompressor.h      # Decompressor API
-│   │   ├── signatures.c        # File magic detection (50+ formats)
-│   │   └── signatures.h        # Signatures API
-│   ├── output/
-│   │   ├── display.c           # Terminal output, colors
-│   │   └── display.h           # Display API
-│   ├── correlation/
-│   │   ├── flow_context.c      # Shared pool, dual-index lookup
-│   │   └── flow_context.h      # flow_context_t, pool types
-│   ├── threading/
-│   │   ├── threading.h         # Threading API, structures
-│   │   ├── dispatcher.c        # BPF ring consumer, worker routing
-│   │   ├── worker.c            # Worker thread main loop
-│   │   ├── output.c            # Output serialization thread
-│   │   ├── state.c             # Per-worker state management
-│   │   ├── pool.c              # Lock-free object pool
-│   │   └── manager.c           # Thread lifecycle management
-│   └── util/
-│       ├── safe_str.c          # Safe string operations
-│       └── safe_str.h          # String API
-└── tests/
-    ├── test_common.c           # Shared test utilities
-    ├── test_http1.c            # HTTP/1.1 parser tests
-    ├── test_http2.c            # HTTP/2 parser tests
-    └── test_xdp.c              # XDP structure tests
-```
-
-Build output goes to `build/` directory (gitignored). Run `make docs` to generate Doxygen HTML documentation in `build/docs/html/`.
+See [CODE-MAP.md](CODE-MAP.md) for complete project structure and source file reference.

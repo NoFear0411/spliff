@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.9.10-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.11-blue.svg)](CHANGELOG.md)
 [![Release](https://github.com/NoFear0411/spliff/actions/workflows/release.yml/badge.svg)](https://github.com/NoFear0411/spliff/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
@@ -26,36 +26,44 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | HTTP/1.1 | llhttp  | Full header parsing, chunked transfer encoding, body aggregation, request-response correlation |
 | HTTP/2   | nghttp2 | Frame parsing, HPACK decompression, stream tracking, mid-stream recovery, multiplexed request/response correlation |
 
-### Thread Safety Audit & IPv6 Correlation (v0.9.10)
-- **IPv6 Full Correlation**: Zero-collision 40-byte flow keys with separate `flow_cookie_map_v6`
-- **Secondary Cookie Index**: O(1) lookup by socket_cookie (replaces O(n) scan)
-- **Dynamic cgroup2 Detection**: Parses `/proc/mounts` for any cgroup2 mount location
-- **RCU-Safe Memory Reclamation**: liburcu `call_rcu()` for safe deferred hash table frees
-- **Atomic Counters**: Per-flow packet/byte counters now use `_Atomic` with relaxed ordering
-- **Cache-Line Alignment**: Verified via `_Static_assert`, aligned_alloc for response buffers
+### Flow Correlation & Thread Safety
+- **Dual-Index Flow Lookup**: O(1) correlation via socket cookie index + shadow index (pid, ssl_ctx)
+- **IPv6 Full Correlation**: Zero-collision 40-byte flow keys with separate BPF maps
+- **Dynamic Flow Pool**: On-demand allocation via jemalloc with cache-line alignment
+- **Generation Counters**: Safe pointer validation across worker threads
+- **RCU-Safe Memory**: liburcu `call_rcu()` for safe deferred hash table frees
+- **Inflight Event Counting**: Reference counting prevents use-after-free during cleanup
 
-### Async Logging & XDP Correlation (v0.9.9)
-- **MPSC Logger**: Lock-free async logging pipeline with eventfd notification
-- **Per-Worker XDP Rings**: SPSC rings deliver XDP events to workers for correct ordering
+### XDP Packet-Level Tracking
+- **High-Performance Flow Tracking**: XDP programs at network interface level
+- **Auto-Attach**: Discovers and attaches to all suitable interfaces (native with SKB fallback)
+- **Protocol Detection**: TLS, HTTP/2, HTTP/1.x classification at packet level
+- **sock_ops Cookie Caching**: "Golden Thread" correlation between packets and SSL sessions
+- **Dual Warm-up Strategy**: BPF map + Netlink SOCK_DIAG for pre-existing connections
+
+### Multi-Threaded Architecture
+- **Lock-Free Event Processing**: Dispatcher → Worker threads via SPSC ring buffers
+- **Connection Affinity**: Same (pid, ssl_ctx) always routes to same worker
+- **Per-Flow HTTP/2 Sessions**: 64-stream pool per flow with O(1) free-list allocation
+- **Async MPSC Logger**: Lock-free logging pipeline with eventfd notification
 - **Deferred Display Queue**: Waits for XDP correlation before display (100ms timeout)
-- **Dual Checkmark Output**: `[XDP:TLS][App:H2] ✓✓` shows both layers verified
-- **CK Hash Tables**: Lock-free cookie/shadow indexes using Concurrency Kit
 
-### Dynamic Flow Pool Architecture (v0.9.8)
-- **On-Demand Allocation**: Flow contexts allocated via jemalloc as needed (no pre-allocated pool)
-- **Incremental Hash Tables**: Cookie and shadow indexes grow automatically at 75% load factor
-- **Zero Latency Spikes**: Incremental migration (8 entries/op) avoids stop-the-world rehashing
-- **Generation Counters**: Safe pointer validation across worker threads (catches stale/reused flows)
-- **Inflight Event Counting**: Reference counting prevents use-after-free during flow cleanup
-- **Deferred Free**: 2-second grace period ensures safe memory reclamation
+### BPF-Level Filtering
+- **Socket Family Detection**: Filters AF_UNIX (IPC) at kernel level
+- **Dynamic cgroup2 Detection**: Parses `/proc/mounts` for any cgroup2 mount
+- **SSL Session Tracking**: Maps SSL* to file descriptors for socket lookup
+- **NSS SSL Verification**: Filters non-SSL NSPR file descriptors
 
-### Centralized Session Statistics (v0.9.7)
-- **Unified Shutdown Report**: All subsystem metrics collected and displayed from one place
-- **Production-Grade Metrics**: Full pipeline visibility in every build (no debug flag required)
-- **Per-Worker Breakdown**: Individual event counts, retry stats, CPU efficiency
-- **Flow Pool Analytics**: Active count, peak, cookie/shadow index hit rates, promotion rate
-- **XDP Classification**: Packet counts, flow classification, sockops, correlation success rate
-- **SSL Probe Counters**: Total SSL_read/SSL_write interceptions
+### Dynamic Process Monitoring
+- **EDR-Style Process Scanning**: Discovers SSL libraries via `/proc/PID/maps`
+- **Runtime Browser Detection**: Detects Chrome/Chromium/Brave (experimental)
+- **Process Lifecycle Events**: BPF tracepoints for exec, fork, and exit
+- **Embedded BPF Skeleton**: Single binary deployment with embedded bytecode
+
+### Session Statistics
+- **Unified Shutdown Report**: All subsystem metrics collected at exit
+- **Production-Grade Visibility**: Full pipeline metrics in every build
+- **XDP Classification**: Packets, flows, correlation success rate
 
 <details>
 <summary>Sample Session Statistics Output</summary>
@@ -68,123 +76,29 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
   Application Layer (SSL/TLS)
   ----------------------------------------------
   Events:      1435 captured -> 2328 processed
-  Output:      0 messages (0 B)
-
-  Async Logger
-  ----------------------------------------------
-  Messages: 531 (79.9 KB)
-  Batches:  396 (avg 1.3 msgs/batch)
 
   Workers (16)
   ----------------------------------------------
-  Worker  0: 4 events
-  Worker  2: 41 events
-  Worker  3: 1 events
-  Worker  4: 24 events
-  Worker  5: 10 events
-  Worker  6: 4 events
-  Worker  7: 7 events
-  Worker  8: 5 events
   Worker 10: 1886 events
   Worker 11: 326 events
-  Worker 12: 4 events
-  Worker 13: 7 events
-  Worker 14: 4 events
-  Worker 15: 5 events
+  (workers with activity shown)
   CPU: Good (NAPI-style, 33661 sleep cycles)
-
-  Deferred Display Queue (XDP Correlation)
-  ----------------------------------------------
-  Matched:     0 (XDP arrived in time)
-  Timed out:   6 (no XDP within timeout)
-  Match rate:  0.0%
-  Health:      Critical (XDP correlation failing)
 
   Flow Pool
   ----------------------------------------------
   Active:      3 flows, peak 19
-  Throughput:  27 allocs, 24 frees
-  Cookie index: 2 entries, 2267 hits (98.8%), 28 misses
-  Shadow index: 1 entries, 34 hits, 0 promotions
-  Promotion:    0.0% of flows got socket_cookie
+  Cookie index: 2 entries, 2267 hits (98.8%)
+  Shadow index: 1 entries, 34 hits
 
   Network Layer (XDP)
   ----------------------------------------------
   Packets:     2145 processed (2063 TCP)
   Connections: 20 tracked, 20 classified
   Correlation: 100.0% socket cookie success
-  Classified:  20 flows
-  Ambiguous:   867 (deeper inspection needed)
-  Terminated:  14 (FIN/RST)
-  Cache hits:  0 (fast-path gatekeeper)
-  Cookie miss: 0 (correlation gaps)
-
-  Sockops (cookie caching)
-  ----------------------------------------------
-  Events:  16 (active: 14, passive: 2)
-  Cleanup: 0
-
-  SSL Probes
-  ----------------------------------------------
-  SSL_read/SSL_write intercepted: 16
 
 ============================================
 ```
 </details>
-
-### Embedded BPF Skeleton (v0.9.6)
-- **Single Binary Deployment**: BPF bytecode embedded directly via `bpftool gen skeleton`
-- **No External Files**: No separate .bpf.o file needed - binary is self-contained
-- **Strip-Safe**: Debug symbols can be removed without breaking BPF loading
-- **Tamper-Resistant**: Embedded bytecode cannot be modified separately
-
-### Modular Protocol Architecture (v0.9.5+)
-- **Unified Protocol Entry Points**: `http1_try_process_event()` and `http2_try_process_event()`
-- **Vectorscan Protocol Detection**: O(n) NFA-based pattern matching for HTTP identification
-- **Clean Orchestration**: main.c reduced to ~50 lines of protocol routing logic
-- **Enterprise-Grade Separation**: Each protocol handler returns `true` if processed, enabling fallback chain
-
-### Flow Pool Architecture (v0.9.3+, dynamic since v0.9.8)
-- **Dynamic Flow Context**: On-demand allocation via jemalloc with cache-line alignment
-- **Zero-Copy Correlation**: Socket cookie index + shadow index (pid, ssl_ctx) for O(1) lookup
-- **Incremental Resizing**: Hash tables grow without latency spikes (8 entries migrated per operation)
-- **Per-Flow HTTP/2 Streams**: 64-stream pool per flow with O(1) free-list allocation
-- **Worker Affinity**: Atomic CAS claim ensures single-writer guarantee per flow
-- **Generation + Inflight Safety**: Stale pointer detection and reference-counted deferred free
-- **HPACK Corruption Detection**: Connection-fatal flag per RFC 7540 Section 4.3
-- **Ghost Stream Reaping**: 10-second timeout for idle stream cleanup
-- **Pool Statistics**: Centralized shutdown report with active count, peak, index hit rates
-- **BPF Map Warm-up**: Direct iteration of BPF flow_states for accurate pre-existing connection correlation
-
-### Dynamic Process Monitoring (v0.9.0+)
-- **EDR-Style Process Scanning**: Discovers SSL libraries in running processes via `/proc/PID/maps`
-- **Runtime Browser Detection**: Detects Chrome/Chromium/Brave/ at startup (experimental)
-- **BoringSSL Binary Scanning**: Heuristic function offset detection for stripped binaries
-- **Process Lifecycle Events**: BPF tracepoints for `sched_process_exec` and `sched_process_fork`
-- **Deduplication**: Path-based caching prevents duplicate probe attachment
-
-### XDP Packet-Level Tracking (v0.8.0+)
-- **High-Performance Flow Tracking**: XDP programs at network interface level
-- **Auto-Attach**: Discovers and attaches to all suitable interfaces (physical/virtual)
-- **Protocol Detection**: TLS, HTTP/2, HTTP/1.x classification at packet level
-- **sock_ops Cookie Caching**: "Golden Thread" correlation between packets and SSL sessions
-- **Dual Warm-up Strategy** (v0.9.3):
-  - BPF map warm-up: iterates `flow_states` for real socket cookies
-  - Netlink warm-up: seeds `flow_cookie_map` via SOCK_DIAG for XDP visibility
-- **XDP Statistics**: Full session metrics (packets, flows, classification, sockops, gatekeeper hits)
-
-### BPF-Level Filtering (v0.7.0+)
-- **Socket Family Detection**: Filters AF_UNIX (IPC) at kernel level
-- **CO-RE BTF Access**: Walks `task_struct → files_struct → socket → sock → skc_family`
-- **SSL Session Tracking**: Maps SSL* to file descriptors for socket lookup
-- **NSS SSL Verification**: Filters non-SSL NSPR file descriptors
-
-### Multi-Threaded Architecture (v0.6.0+)
-- **Lock-Free Event Processing**: Dispatcher → Worker threads with SPSC ring buffers
-- **Connection Affinity**: Same (pid, ssl_ctx) always routes to same worker
-- **Per-Worker State**: Isolated HTTP/2 sessions, ALPN cache, pending bodies
-- **Serialized Output**: Dedicated output thread prevents interleaved lines
-- **Adaptive Wait**: spin → yield → eventfd for efficient CPU usage
 
 ### Advanced Capabilities
 - **ALPN Detection**: Hooks ALPN negotiation for definitive HTTP/1.1 vs HTTP/2 detection
@@ -434,38 +348,20 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and data 
 
 ## Roadmap
 
-| Version | Feature | Status |
-|---------|---------|--------|
-| v0.5.x | HTTP/1.1 + HTTP/2 + Multi-library support | ✅ Complete |
-| v0.6.x | Multi-threaded event processing | ✅ Complete |
-| v0.7.x | BPF-level IPC filtering + Unified display | ✅ Complete |
-| v0.8.x | XDP packet-level flow tracking + sock_ops | ✅ Complete |
-| v0.9.0-0.9.4 | Dynamic process monitoring + Shared Pool Architecture | ✅ Complete |
-| v0.9.5 | Modular Protocol Architecture + Vectorscan detection | ✅ Complete |
-| v0.9.6 | Embedded BPF Skeleton + XDP-SSL correlation fix + Thread cleanup | ✅ Complete |
-| v0.9.7 | Centralized session statistics + Production-grade shutdown metrics | ✅ Complete |
-| v0.9.8 | Dynamic flow pool + Generation safety + Mandatory libs + Scanner dedup | ✅ Complete |
-| v0.9.9 | Async MPSC logger + XDP correlation rings + Deferred display + CK hash tables | ✅ Complete |
-| v0.9.10 | Thread safety audit + IPv6 full correlation + Secondary cookie index + Dynamic cgroup2 | ✅ **Current** |
-| v0.10.0 | Content-based protocol detection fallback + ZSTD streaming | 🔄 Next |
-| v0.11.0 | HTTP/3 + QUIC protocol support (ngtcp2/nghttp3) | Planned |
-| v1.0.0 | WebSocket support + Production hardening | Planned |
-| v1.1.0+ | EDR agent mode + Event streaming | Planned |
+| Version | Milestone | Status |
+|---------|-----------|--------|
+| v0.1-0.8 | Core interception, XDP tracking, multi-threading | ✅ Complete |
+| **v0.9.11** | Lock-free architecture, thread safety, IPv6 | ✅ **Current** |
+| v0.10 | Plain HTTP capture, ZSTD streaming | 🔄 Next |
+| v0.11 | HTTP/3 + QUIC (ngtcp2/nghttp3) | Planned |
+| v1.0 | WebSocket, production hardening | Planned |
+| v2.0+ | EDR agent mode, event streaming | Future |
 
-### Near-Term Goals (v0.10.x - v1.0)
-- **BPF/XDP Improvements**: ~~IPv6 correlation~~ ✅ (v0.9.10), expanded ring buffers, atomic state machine
-- **Plain HTTP Capture**: XDP payload extraction for unencrypted traffic
-- **WebSocket Support**: Frame parsing and message reconstruction
-- **Enhanced Display**: XDP flow metrics in output, connection timeline
+### Goals
+- **Near-Term**: Plain HTTP via XDP, WebSocket frames, enhanced metrics
+- **Long-Term**: Agent mode, NATS/Kafka streaming, behavioral analysis, threat intel
 
-### Long-Term Vision (EDR/XDR Platform)
-- **Agent Mode**: Daemonized operation with configuration management
-- **Event Streaming**: NATS.io, Kafka, or custom protocol for centralized collection
-- **Behavioral Analysis**: ML-based anomaly detection on traffic patterns
-- **Threat Intel Integration**: IOC matching, signature-based detection
-- **Multi-Protocol Support**: DNS, SMTP, database protocols
-
-See [docs/](docs/) for detailed implementation plans.
+See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
 
 ## Known Limitations
 

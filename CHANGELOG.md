@@ -2,6 +2,90 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.9.11] - 2026-02-04
+
+### Architecture Simplification Release
+
+Major architectural cleanup removing legacy per-worker HTTP/2 pools in favor of
+the unified per-flow session management introduced in v0.9.5. This release
+removes ~1,300 lines of dead code and consolidates display functions into a
+dedicated API.
+
+### Removed
+
+#### Per-Worker HTTP/2 Pools (~935 lines from threading module)
+- **h2_connections[]**: Per-worker H2 connection array (MAX_H2_SESSIONS_PER_WORKER)
+- **h2_streams[]**: Per-worker stream tracking array
+- **alpn_cache[]**: Per-worker ALPN negotiation cache
+- **pending_bodies[]**: Per-worker HTTP/1.1 body accumulation buffers
+- **h1_request_cache[]**: Per-worker request correlation cache
+- **H2_CONN_STATE enum**: Legacy connection state machine (IDLE, CONNECTING, ESTABLISHED, ERROR, CLOSING)
+- **h2_shadow_queue_t**: Deferred cleanup queue for H2 sessions
+- **h2_deferred_cleanup_t**: Cleanup entry structure
+- **h2_connection_local_t**: Per-connection local state structure
+
+#### Dead Functions (~128 lines from protocol modules)
+- **http1_parse_headers()**: Unused wrapper around http1_parse()
+- **http1_find_body_start()**: Unused body boundary finder (llhttp handles this)
+- **http1_decode_chunked()**: Unused chunked decoder (llhttp handles internally)
+- **signature_is_binary()**: Deprecated in favor of signature_detect_full()
+
+#### No-Op Stubs (~25 lines)
+- **flow_manager_print_stats()**: Stats now centralized in main.c
+- **threading_print_stats()**: Stats now centralized in main.c
+- **dispatcher_cleanup_pid()**: Flow cleanup centralized in flow_free_resources()
+- **get_worker_id()**: Replaced by get_worker_id_ex() with socket_cookie support
+
+### Added
+
+#### Centralized Display API (~355 lines in output module)
+- **Startup Display Functions**:
+  - `display_banner()`: Startup header with version
+  - `display_lib_found()`: Library discovery messages
+  - `display_probe_attached()`: Probe attachment status
+  - `display_xdp_attached()`: XDP interface attachment status
+  - `display_cgroup_attached()`: Cgroup sock_ops attachment status
+  - `display_warmup_status()`: BPF map warmup statistics
+
+- **Diagnostic Functions**:
+  - `display_error()`: Thread-safe error output to stderr
+  - `display_warning()`: Thread-safe warning output to stderr
+  - `display_debug()`: Debug-mode-only output
+
+- **Thread Safety**: stderr output protected by pthread mutex
+
+#### Process Utilities Module (NEW: src/util/process.c/h)
+- **proc_get_name()**: Unified /proc/PID/comm reader (C23 with [[nodiscard]])
+- **proc_exists()**: Process existence check
+- Consolidates duplicate implementations from main.c and dispatcher.c
+- Defensive input validation and null-terminated output guarantees
+
+### Changed
+
+#### HTTP/2 Session Management
+- Sessions now exclusively managed per-flow via `flow_ctx->parser.h2`
+- Worker state reduced to: decomp_buf, body_buf, h2_callbacks only
+- Eliminates per-worker session isolation overhead
+
+#### Code Organization
+- Startup/diagnostic printing moved from main.c to display module
+- Process name resolution consolidated in util module
+- Timing function get_time_ns() unified (removed duplicate in flow_context.c)
+
+### Technical Details
+- **Files modified**: 21 source files
+- **Insertions**: 566 lines
+- **Deletions**: 1,323 lines
+- **Net change**: -757 lines (36% reduction in touched modules)
+- **New files**: src/util/process.c, src/util/process.h
+- **Threading state reduction**: ~619 lines removed from state.c
+- **Header reduction**: ~316 lines removed from threading.h
+
+### Migration Notes
+- No API changes for external callers
+- Per-flow H2 sessions (`flow_ctx->parser.h2`) remain the single source of truth
+- All removed code was confirmed dead via Doxygen call graphs and grep analysis
+
 ## [0.9.10] - 2026-02-03
 
 ### Security & Stability Audit Release
