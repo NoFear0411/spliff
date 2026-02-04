@@ -1339,6 +1339,9 @@ void http2_process_frame_flow(const uint8_t *data, int len,
  * Handles detection, session initialization, frame processing,
  * and noise suppression. Keeps all HTTP/2 logic in http2.c.
  *
+ * Uses ONLY the flow-based session system (flow_ctx->parser.h2).
+ * The legacy per-worker h2_connection_local_t pool has been removed.
+ *
  * @param[in] data       Raw data buffer
  * @param[in] len        Data length
  * @param[in] event      Worker event with full context
@@ -1353,14 +1356,11 @@ bool http2_try_process_event(const uint8_t *data, size_t len,
         return false;
     }
 
-    worker_state_t *state = &worker->state;
+    (void)worker;  /* Worker state no longer needed - using flow-based sessions */
 
-    /* Check for existing HTTP/2 session (per-worker) */
-    h2_connection_local_t *h2_conn = worker_get_h2_connection(state,
-                                        event->pid, event->ssl_ctx, false);
-    /* Use relaxed load for hot-path check - no barrier needed for read-only access */
-    if (h2_conn && atomic_load_explicit(&h2_conn->state, memory_order_relaxed) == H2_CONN_STATE_ACTIVE) {
-        /* Process HTTP/2 frame with per-worker session */
+    /* Check for existing HTTP/2 session via flow context */
+    if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_HTTP2) {
+        /* Process HTTP/2 frame with flow-based session */
         ssl_data_event_t bpf_event = {
             .timestamp_ns = event->timestamp_ns,
             .delta_ns = event->delta_ns,
@@ -1374,7 +1374,6 @@ bool http2_try_process_event(const uint8_t *data, size_t len,
         memcpy(bpf_event.comm, event->comm, TASK_COMM_LEN);
         memcpy(bpf_event.data, event->data, event->data_len);
 
-        /* Use flow-aware processing when flow_ctx available */
         http2_process_frame_flow(data, len, &bpf_event, event->flow_ctx);
         return true;
     }
@@ -1385,13 +1384,6 @@ bool http2_try_process_event(const uint8_t *data, size_t len,
         if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_UNKNOWN) {
             event->flow_ctx->proto = FLOW_PROTO_HTTP2;
             /* Session initialization is handled lazily in http2_process_frame_flow() */
-        }
-
-        /* Create per-worker H2 connection */
-        h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
-        if (h2_conn) {
-            h2_conn->client_preface_seen = true;
-            safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
         }
 
         /* Process frames after preface */
@@ -1437,11 +1429,6 @@ bool http2_try_process_event(const uint8_t *data, size_t len,
                     event->flow_ctx->proto = FLOW_PROTO_HTTP2;
                 }
 
-                h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, true);
-                if (h2_conn) {
-                    safe_strcpy(h2_conn->comm, sizeof(h2_conn->comm), event->comm);
-                }
-
                 ssl_data_event_t bpf_event = {
                     .timestamp_ns = event->timestamp_ns,
                     .delta_ns = event->delta_ns,
@@ -1472,8 +1459,8 @@ bool http2_try_process_event(const uint8_t *data, size_t len,
 
         /* Small writes (<= 13 bytes) are likely HTTP/2 control frames */
         if (len <= 13 && event->event_type == EVENT_SSL_WRITE) {
-            h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, false);
-            if (h2_conn) {
+            /* Check if this is a known H2 flow */
+            if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_HTTP2) {
                 return true;  /* Known H2 connection - suppress noise */
             }
             /* Also suppress small writes that look like H2 frames */
@@ -1484,8 +1471,7 @@ bool http2_try_process_event(const uint8_t *data, size_t len,
 
         /* Small reads on active H2 connections are partial frames */
         if (len <= 9 && event->event_type == EVENT_SSL_READ) {
-            h2_conn = worker_get_h2_connection(state, event->pid, event->ssl_ctx, false);
-            if (h2_conn && atomic_load_explicit(&h2_conn->state, memory_order_relaxed) == H2_CONN_STATE_ACTIVE) {
+            if (event->flow_ctx && event->flow_ctx->proto == FLOW_PROTO_HTTP2) {
                 return true;
             }
         }

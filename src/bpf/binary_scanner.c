@@ -21,6 +21,7 @@
 
 #include "binary_scanner.h"
 #include "boringssl_offsets.h"
+#include "../util/safe_str.h"
 
 /* BoringSSL signature string to search for (quick presence check) */
 #define BORINGSSL_SIG_THIRD_PARTY "third_party/boringssl"
@@ -46,9 +47,8 @@ static void mark_build_id_reported(const char *build_id) {
     if (g_unknown_build_id_count >= MAX_UNKNOWN_BUILD_IDS) {
         return;  /* Table full — stop tracking, allow repeats */
     }
-    strncpy(g_unknown_build_ids[g_unknown_build_id_count], build_id,
-            BUILD_ID_HEX_LEN - 1);
-    g_unknown_build_ids[g_unknown_build_id_count][BUILD_ID_HEX_LEN - 1] = '\0';
+    safe_strcpy(g_unknown_build_ids[g_unknown_build_id_count],
+                BUILD_ID_HEX_LEN, build_id);
     g_unknown_build_id_count++;
 }
 
@@ -265,7 +265,7 @@ int scan_binary_for_boringssl(const char *binary_path,
         return -1;
 
     memset(offsets, 0, sizeof(*offsets));
-    strncpy(offsets->binary_path, binary_path, sizeof(offsets->binary_path) - 1);
+    safe_strcpy(offsets->binary_path, sizeof(offsets->binary_path), binary_path);
 
     size_t size;
     uint8_t *data = mmap_file(binary_path, &size);

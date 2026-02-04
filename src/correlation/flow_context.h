@@ -758,7 +758,7 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
  * @param ssl_ctx  SSL context to merge (0 = don't update)
  * @return 0 on success, -1 on error
  *
- * @thread_safety Single-writer only (dispatcher thread)
+ * @par Thread Safety: Single-writer only (dispatcher thread)
  */
 int flow_merge_ssl_info(flow_manager_t *mgr, flow_context_t *ctx,
                         uint32_t pid, uint64_t ssl_ctx);
@@ -853,17 +853,6 @@ typedef struct {
  * @param stats  Output structure to fill
  */
 void flow_manager_get_stats(flow_manager_t *mgr, flow_pool_stats_t *stats);
-
-/**
- * @brief Print pool statistics to stderr
- *
- * Displays human-readable pool statistics for debugging and monitoring.
- * Called from threading_print_stats() on shutdown.
- *
- * @param mgr          Flow manager
- * @param debug_mode   If true, show detailed breakdown
- */
-void flow_manager_print_stats(flow_manager_t *mgr, bool debug_mode);
 
 /** @} */
 

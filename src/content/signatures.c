@@ -679,20 +679,6 @@ const char *signature_class_name(file_class_t file_class) {
     }
 }
 
-bool signature_is_binary(const char *description) {
-    if (!description) return false;
-
-    /* Search signature table */
-    for (int i = 0; signatures[i].magic != NULL; i++) {
-        if (strcmp(signatures[i].description, description) == 0) {
-            return signatures[i].is_binary;
-        }
-    }
-
-    /* Special detections (ISOBMFF, RIFF, TAR) are all binary */
-    return true;
-}
-
 bool signature_is_local_file(const char *description) {
     if (!description) return false;
 

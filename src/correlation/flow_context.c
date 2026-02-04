@@ -30,6 +30,7 @@
 
 #include "flow_context.h"
 #include "../protocol/http2.h"
+#include "../util/safe_str.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -78,12 +79,8 @@ static inline uint64_t hash_shadow_key(uint32_t pid, uint64_t ssl_ctx) {
     return hash;
 }
 
-/** Get nanosecond timestamp for deferred free */
-static inline uint64_t get_time_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-}
+/* Use extern get_time_ns() from threading/state.c to avoid duplication */
+extern uint64_t get_time_ns(void);
 
 /*============================================================================
  * Flow Pool Implementation
@@ -500,7 +497,7 @@ flow_context_t *flow_lookup_ex(flow_manager_t *mgr, uint64_t cookie,
  * @param ssl_ctx  SSL context to merge (0 = don't update)
  * @return 0 on success, -1 on error
  *
- * @thread_safety Single-writer only (dispatcher thread)
+ * @par Thread Safety: Single-writer only (dispatcher thread)
  */
 int flow_merge_ssl_info(flow_manager_t *mgr, flow_context_t *ctx,
                         uint32_t pid, uint64_t ssl_ctx) {
@@ -643,7 +640,11 @@ int flow_promote_cookie(flow_manager_t *mgr, uint32_t pid,
 
             /* Copy XDP metadata */
             ssl_flow->ifindex = xdp_flow->ifindex;
-            ssl_flow->xdp_category = xdp_flow->xdp_category;
+            /* Only copy category if XDP flow has classification.
+             * Don't overwrite existing classification with UNKNOWN. */
+            if (xdp_flow->xdp_category != XDP_CAT_UNKNOWN) {
+                ssl_flow->xdp_category = xdp_flow->xdp_category;
+            }
             ssl_flow->first_seen_ns = xdp_flow->first_seen_ns;
             if (xdp_flow->last_seen_ns > ssl_flow->last_seen_ns) {
                 ssl_flow->last_seen_ns = xdp_flow->last_seen_ns;
@@ -761,7 +762,11 @@ void flow_update_xdp(flow_context_t *ctx, const xdp_packet_event_t *evt) {
 
     /* Interface info */
     ctx->ifindex = evt->ifindex;
-    ctx->xdp_category = evt->category;
+    /* Only update category if this event has a classification.
+     * Don't overwrite existing classification with UNKNOWN (e.g., from ACK packets). */
+    if (evt->category != XDP_CAT_UNKNOWN) {
+        ctx->xdp_category = evt->category;
+    }
     ctx->xdp_direction = evt->direction;  /* Store direction (1=ingress, 2=egress) */
 
     /* Convert ifindex to interface name if not already done */
@@ -876,8 +881,7 @@ int flow_init_parser(flow_context_t *ctx, const char *alpn) {
         return 0;
     }
 
-    strncpy(ctx->alpn, alpn, sizeof(ctx->alpn) - 1);
-    ctx->alpn[sizeof(ctx->alpn) - 1] = '\0';
+    safe_strcpy(ctx->alpn, sizeof(ctx->alpn), alpn);
 
     if (strcmp(alpn, "h2") == 0) {
         ctx->proto = FLOW_PROTO_HTTP2;
@@ -1220,10 +1224,4 @@ void flow_manager_get_stats(flow_manager_t *mgr, flow_pool_stats_t *stats) {
     stats->shadow_hits = atomic_load(&mgr->shadow_idx.hits);
     stats->shadow_promotions = atomic_load(&mgr->shadow_idx.promotions);
     stats->shadow_merges = atomic_load(&mgr->shadow_idx.merges);
-}
-
-void flow_manager_print_stats(flow_manager_t *mgr, bool debug_mode) {
-    /* No-op: stats printing is centralized in main.c print_shutdown_stats() */
-    (void)mgr;
-    (void)debug_mode;
 }
