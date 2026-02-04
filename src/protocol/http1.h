@@ -134,80 +134,9 @@ bool http1_is_response(const uint8_t *data, size_t len);
  *
  * @note The msg structure is zeroed before parsing begins
  * @note Partial parses return bytes consumed; caller should buffer remaining
- *
- * @see http1_parse_headers() for header-only parsing
  */
 int http1_parse(const uint8_t *data, size_t len, http_message_t *msg,
                 uint8_t *body_buf, size_t body_buf_size, size_t *body_len_out);
-
-/**
- * @brief Parse HTTP/1.1 headers only (compatibility wrapper)
- *
- * Simplified API for parsing only the header section of an HTTP message.
- * Body data is not accumulated.
- *
- * @param[in]  data Data buffer containing HTTP message
- * @param[in]  len  Length of data buffer
- * @param[out] msg  Output message structure
- * @param[in]  dir  Direction hint (ignored - llhttp auto-detects)
- *
- * @note The direction parameter is ignored; llhttp automatically
- *       detects whether data is a request or response
- *
- * @deprecated Use http1_parse() for new code
- */
-void http1_parse_headers(const uint8_t *data, size_t len, http_message_t *msg, direction_t dir);
-
-/**
- * @brief Find the body start position in HTTP/1.1 message
- *
- * Locates the position after the header terminator (\\r\\n\\r\\n)
- * where the body content begins.
- *
- * @param[in] data Data buffer containing HTTP message
- * @param[in] len  Length of data buffer
- *
- * @return Byte offset of body start, or -1 if not found
- *
- * @note With llhttp, prefer http1_parse() which handles body via callbacks
- *
- * @par Example:
- * @code
- * int body_start = http1_find_body_start(data, len);
- * if (body_start > 0) {
- *     uint8_t *body = data + body_start;
- *     size_t body_len = len - body_start;
- * }
- * @endcode
- */
-int http1_find_body_start(const uint8_t *data, size_t len);
-
-/**
- * @brief Decode chunked transfer encoding
- *
- * Decodes HTTP/1.1 chunked transfer encoding, reassembling
- * the original content from chunk-encoded data.
- *
- * @par Chunked Format:
- * @code
- * <size-hex>\r\n
- * <chunk-data>\r\n
- * ...
- * 0\r\n
- * \r\n
- * @endcode
- *
- * @param[in]  in       Input buffer with chunked data
- * @param[in]  in_len   Length of input data
- * @param[out] out      Output buffer for decoded data
- * @param[in]  out_size Size of output buffer
- *
- * @return Number of bytes written to out, or -1 on error
- *
- * @note llhttp handles this automatically in http1_parse();
- *       this function is provided for direct data processing
- */
-int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_size);
 
 /**
  * @defgroup http1_flow Flow-Based HTTP/1 Parsing

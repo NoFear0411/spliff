@@ -191,20 +191,6 @@ bool signature_detect_full(const uint8_t *data, size_t len,
 const char *signature_class_name(file_class_t file_class);
 
 /**
- * @brief Check if content type is binary
- *
- * Determines if content with the given description should be
- * treated as binary (displayed as hexdump rather than text).
- *
- * @param[in] description File type description from detection
- *
- * @return true if binary content, false if text
- *
- * @deprecated Use signature_detect_full() and check result.is_binary instead
- */
-bool signature_is_binary(const char *description);
-
-/**
  * @brief Check if content is local file I/O
  *
  * Identifies file signatures that indicate local file operations

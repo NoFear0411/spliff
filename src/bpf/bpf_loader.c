@@ -21,6 +21,7 @@
 #include "binary_scanner.h"
 #include "boringssl_offsets.h"
 #include "../include/spliff.h"
+#include "../util/safe_str.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -237,8 +238,7 @@ static bool path_already_tracked(lib_discovery_result_t *result, lib_type_t type
 static void add_extended_path(lib_discovery_result_t *result, lib_type_t type, const char *path) {
     lib_paths_t *ext = &result->extended[type];
     if (ext->path_count < MAX_PATHS_PER_TYPE) {
-        strncpy(ext->paths[ext->path_count], path, 511);
-        ext->paths[ext->path_count][511] = '\0';
+        safe_strcpy(ext->paths[ext->path_count], 512, path);
         ext->path_count++;
         ext->found = true;
         result->total_unique_paths++;
@@ -274,9 +274,8 @@ static int parse_proc_maps(int pid, lib_discovery_result_t *result) {
 
             /* Quick lookup (first path found per type) - backward compatible */
             if (!result->libs[lib_type].found) {
-                strncpy(result->libs[lib_type].path, pathname,
-                        sizeof(result->libs[lib_type].path) - 1);
-                result->libs[lib_type].path[sizeof(result->libs[lib_type].path) - 1] = '\0';
+                safe_strcpy(result->libs[lib_type].path,
+                            sizeof(result->libs[lib_type].path), pathname);
                 result->libs[lib_type].type = lib_type;
                 result->libs[lib_type].found = true;
                 result->libs[lib_type].process_count = 1;
@@ -338,9 +337,8 @@ static void check_firefox_bundled_libs(lib_discovery_result_t *result) {
 
             /* Also update primary if not set */
             if (!result->libs[lib_type].found) {
-                strncpy(result->libs[lib_type].path, path,
-                        sizeof(result->libs[lib_type].path) - 1);
-                result->libs[lib_type].path[sizeof(result->libs[lib_type].path) - 1] = '\0';
+                safe_strcpy(result->libs[lib_type].path,
+                            sizeof(result->libs[lib_type].path), path);
                 result->libs[lib_type].type = lib_type;
                 result->libs[lib_type].found = true;
                 result->libs[lib_type].process_count = 0;  /* Static discovery */
@@ -594,8 +592,7 @@ int bpf_loader_find_library_dynamic(const char *name, char *path, size_t size,
         lib_discovery_result_t result;
         if (bpf_loader_discover_libraries(pids, pid_count, &result) == 0) {
             if (result.libs[target_type].found) {
-                strncpy(path, result.libs[target_type].path, size - 1);
-                path[size - 1] = '\0';
+                safe_strcpy(path, size, result.libs[target_type].path);
                 return 0;
             }
         }
@@ -821,13 +818,11 @@ static void xdp_set_error(xdp_loader_t *xdp, xdp_error_t *err_out,
 
     if (xdp) {
         xdp->last_error.code = code;
-        strncpy(xdp->last_error.message, msg, sizeof(xdp->last_error.message) - 1);
-        xdp->last_error.message[sizeof(xdp->last_error.message) - 1] = '\0';
+        safe_strcpy(xdp->last_error.message, sizeof(xdp->last_error.message), msg);
     }
     if (err_out) {
         err_out->code = code;
-        strncpy(err_out->message, msg, sizeof(err_out->message) - 1);
-        err_out->message[sizeof(err_out->message) - 1] = '\0';
+        safe_strcpy(err_out->message, sizeof(err_out->message), msg);
     }
 }
 
@@ -1106,8 +1101,7 @@ int bpf_loader_xdp_discover_interfaces(xdp_iface_info_t *ifaces, int max,
 
         /* Add to result */
         xdp_iface_info_t *info = &ifaces[*count];
-        strncpy(info->name, name, sizeof(info->name) - 1);
-        info->name[sizeof(info->name) - 1] = '\0';
+        safe_strcpy(info->name, sizeof(info->name), name);
         info->ifindex = ifindex;
         info->mtu = mtu;
         info->flags = if_flags;
@@ -1199,8 +1193,7 @@ int bpf_loader_xdp_attach(bpf_loader_t *loader, const char *ifname,
 
     /* Record attachment (ifname_len validated < IFNAMSIZ at function start) */
     xdp_interface_t *iface = &xdp->interfaces[xdp->interface_count];
-    memcpy(iface->name, ifname, ifname_len);
-    iface->name[ifname_len] = '\0';
+    safe_strcpy(iface->name, sizeof(iface->name), ifname);
     iface->ifindex = ifindex;
     iface->prog_fd = prog_fd;
     iface->mode = actual_mode;
@@ -1245,8 +1238,7 @@ int bpf_loader_xdp_attach_all(bpf_loader_t *loader, bool debug) {
         int mode = bpf_loader_xdp_attach(loader, ifaces[i].name,
                                           XDP_MODE_NATIVE, debug, NULL);
         if (mode >= 0) {
-            strncpy(results[attached].name, ifaces[i].name, IFNAMSIZ - 1);
-            results[attached].name[IFNAMSIZ - 1] = '\0';
+            safe_strcpy(results[attached].name, IFNAMSIZ, ifaces[i].name);
             results[attached].mode = (xdp_mode_t)mode;
 
             if (mode == XDP_MODE_NATIVE) {

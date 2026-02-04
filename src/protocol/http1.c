@@ -483,63 +483,6 @@ int http1_parse(const uint8_t *data, size_t len, http_message_t *msg,
     return (int)len;
 }
 
-
-void http1_parse_headers(const uint8_t *data, size_t len, http_message_t *msg, direction_t dir) {
-    (void)dir;  /* Ignored - llhttp auto-detects direction */
-
-    /* Use http1_parse without body buffer */
-    http1_parse(data, len, msg, NULL, 0, NULL);
-}
-
-
-int http1_find_body_start(const uint8_t *data, size_t len) {
-    const uint8_t *pos = (const uint8_t *)memmem(data, len, "\r\n\r\n", 4);
-    if (pos) {
-        return (int)(pos - data) + 4;
-    }
-    return -1;
-}
-
-
-int http1_decode_chunked(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_size) {
-    const uint8_t *pos = in;
-    const uint8_t *end = in + in_len;
-    uint8_t *out_pos = out;
-    uint8_t *out_end = out + out_size;
-
-    while (pos < end) {
-        /* Read chunk size (hex number followed by \r\n) */
-        const uint8_t *crlf = (const uint8_t *)memmem(pos, (size_t)(end - pos), "\r\n", 2);
-        if (!crlf) break;
-
-        /* Parse hex chunk size */
-        char size_str[32];
-        size_t size_len = (size_t)(crlf - pos);
-        if (size_len >= sizeof(size_str)) return -1;
-
-        memcpy(size_str, pos, size_len);
-        size_str[size_len] = '\0';
-
-        /* Handle chunk extensions (after ';') */
-        char *semicolon = strchr(size_str, ';');
-        if (semicolon) *semicolon = '\0';
-
-        unsigned long chunk_size = strtoul(size_str, NULL, 16);
-        if (chunk_size == 0) break;  /* Last chunk */
-
-        pos = crlf + 2;
-
-        if (pos + chunk_size + 2 > end) break;  /* Incomplete */
-        if (out_pos + chunk_size > out_end) return -1;  /* Output full */
-
-        memcpy(out_pos, pos, chunk_size);
-        out_pos += chunk_size;
-        pos += chunk_size + 2;
-    }
-
-    return (int)(out_pos - out);
-}
-
 /*============================================================================
  * Flow-Based HTTP/1 Parsing (Phase 3.6.5)
  *
