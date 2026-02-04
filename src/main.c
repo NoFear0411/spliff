@@ -40,6 +40,7 @@
 #include "protocol/http2.h"
 #include "protocol/detector.h"
 #include "util/safe_str.h"
+#include "util/process.h"
 
 /* BPF skeleton (generated at build time - embeds CO-RE BPF bytecode)
  * Pragma suppresses -Woverlength-strings: skeleton embeds ~1MB bytecode as
@@ -84,24 +85,6 @@ config_t g_config = {
 /* Forward declarations for cleanup */
 static void cleanup_all_resources(void);
 
-/* Get real process name from /proc/PID/comm (not thread name) */
-static void get_process_name(uint32_t pid, char *buf, size_t bufsize) {
-    char path[64];
-    snprintf(path, sizeof(path), "/proc/%u/comm", pid);
-
-    FILE *f = fopen(path, "r");
-    if (f) {
-        if (fgets(buf, bufsize, f)) {
-            /* Remove trailing newline */
-            size_t len = strlen(buf);
-            if (len > 0 && buf[len-1] == '\n') {
-                buf[len-1] = '\0';
-            }
-        }
-        fclose(f);
-    }
-}
-
 /*
  * NOTE: Single-threaded mode has been retired (Phase 3.6 migration).
  * All event processing now uses multi-threaded flow-based architecture.
@@ -132,10 +115,11 @@ static void get_process_name(uint32_t pid, char *buf, size_t bufsize) {
 /**
  * @brief Track library paths that already have probes attached
  *
- * @thread_safety Main thread only during initialization phase.
- *                Must be fully populated before starting dispatcher and worker
- *                threads. After dispatcher_start(), this data is read-only and
- *                not accessed by any thread. No concurrent access occurs.
+ * @par Thread Safety:
+ * Main thread only during initialization phase.
+ * Must be fully populated before starting dispatcher and worker
+ * threads. After dispatcher_start(), this data is read-only and
+ * not accessed by any thread. No concurrent access occurs.
  *
  * FIX L6: Added explicit thread ownership documentation.
  *
@@ -149,14 +133,18 @@ typedef struct {
 
 /**
  * @brief Global array tracking probed library paths
- * @thread_safety Main thread only. Populated during probe attachment before
- *                worker threads start. No synchronization needed.
+ *
+ * @par Thread Safety:
+ * Main thread only. Populated during probe attachment before
+ * worker threads start. No synchronization needed.
  */
 static probed_path_t g_probed_paths[MAX_PROBED_PATHS];
 
 /**
  * @brief Count of entries in g_probed_paths
- * @thread_safety Main thread only. Modified only during initialization.
+ *
+ * @par Thread Safety:
+ * Main thread only. Modified only during initialization.
  */
 static int g_probed_path_count = 0;
 
@@ -413,7 +401,7 @@ static void handle_process_exec_event(const ssl_data_event_t *event) {
     int attached = attach_probes_for_pid(event->pid);
     if (attached > 0 && g_debug_mode) {
         char proc_name[TASK_COMM_LEN] = {0};
-        get_process_name(event->pid, proc_name, sizeof(proc_name));
+        (void)proc_get_name(event->pid, proc_name, sizeof(proc_name));
         printf("  [DYNAMIC] Process %s (PID %u): attached %d probes\n",
                proc_name[0] ? proc_name : event->comm, event->pid, attached);
     }
@@ -646,16 +634,13 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
 
     /* Handle process exit events - cleanup resources */
     if (event->event_type == EVENT_PROCESS_EXIT) {
-        /* Cleanup HTTP/2 sessions for this PID */
-        for (int i = 0; i < state->h2_connection_capacity; i++) {
-            h2_conn_state_t conn_state = atomic_load_explicit(
-                &state->h2_connections[i].state, memory_order_relaxed);
-            if (conn_state == H2_CONN_STATE_ACTIVE &&
-                state->h2_connections[i].pid == event->pid) {
-                worker_cleanup_h2_connection(state, &state->h2_connections[i]);
-            }
-        }
-        worker_cleanup_h2_streams_for_connection(state, event->pid, 0);
+        /*
+         * HTTP/2 session cleanup removed in v0.9.11.
+         * Sessions are now managed per-flow in flow_ctx->parser.h2 and
+         * cleaned up by flow_terminate() on FIN/RST events.
+         * See flow_context.c for the flow-based implementation.
+         */
+        (void)state;  /* Suppress unused warning */
         return;
     }
 
@@ -692,7 +677,7 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
             }
 
             char proc_name[TASK_COMM_LEN] = {0};
-            get_process_name(event->pid, proc_name, sizeof(proc_name));
+            (void)proc_get_name(event->pid, proc_name, sizeof(proc_name));
             const char *name = proc_name[0] ? proc_name : event->comm;
 
             /* Use extended handshake display with flow context for network info */
@@ -788,7 +773,7 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
     const char *dir = (event->event_type == EVENT_SSL_WRITE) ? "WRITE" : "READ";
 
     char raw_proc_name[TASK_COMM_LEN] = {0};
-    get_process_name(event->pid, raw_proc_name, sizeof(raw_proc_name));
+    (void)proc_get_name(event->pid, raw_proc_name, sizeof(raw_proc_name));
     const char *display_name = raw_proc_name[0] ? raw_proc_name : event->comm;
 
     if (sig) {
@@ -966,8 +951,7 @@ int main(int argc, char **argv) {
 
     /* Check for root privileges (required for BPF) */
     if (geteuid() != 0) {
-        fprintf(stderr, "%sError:%s This program requires root privileges to attach BPF probes.\n",
-                "\033[31m", "\033[0m");
+        display_error("This program requires root privileges to attach BPF probes.");
         fprintf(stderr, "Please run with: sudo %s\n", argv[0]);
         return 1;
     }
@@ -979,8 +963,7 @@ int main(int argc, char **argv) {
          * Without atexit handler, cleanup won't happen on normal exit,
          * leaving BPF probes attached and resources leaked.
          */
-        fprintf(stderr, "%sError:%s Failed to register cleanup handler\n",
-                display_color(C_RED), display_color(C_RESET));
+        display_error("Failed to register cleanup handler");
         return 1;
     }
 
@@ -989,14 +972,14 @@ int main(int argc, char **argv) {
 
     /* Initialize async logger (must be before threading) */
     if (log_init(NULL) != 0) {
-        fprintf(stderr, "Warning: Failed to initialize async logger\n");
+        display_warning("Failed to initialize async logger");
         /* Continue anyway - will fall back to direct output */
     } else {
         g_logger_initialized = true;
     }
 
     if (signatures_init() != 0) {
-        fprintf(stderr, "Warning: Failed to initialize signature detection (memory allocation failure)\n");
+        display_warning("Failed to initialize signature detection (memory allocation failure)");
         /* Continue anyway - detection will work but signatures won't be in priority order */
     }
     decompressor_init();
@@ -1005,18 +988,13 @@ int main(int argc, char **argv) {
 
     /* Initialize protocol detector (vectorscan O(n) matching) */
     if (proto_detector_init() != 0) {
-        fprintf(stderr, "Warning: Failed to initialize protocol detector\n");
+        display_warning("Failed to initialize protocol detector");
         /* Continue anyway - will fall back to manual detection */
     }
 
     g_modules_initialized = true;
 
-    printf("\n%s╔════════════════════════════════════════╗%s\n",
-           display_color(C_CYAN), display_color(C_RESET));
-    printf("%s║        spliff v%-6s                  ║%s\n",
-           display_color(C_CYAN), SPLIFF_VERSION, display_color(C_RESET));
-    printf("%s╚════════════════════════════════════════╝%s\n\n",
-           display_color(C_CYAN), display_color(C_RESET));
+    display_banner(SPLIFF_VERSION);
 
     /* Find SSL libraries - use dynamic discovery if PIDs specified */
     int *discovery_pids = (num_target_pids > 0) ? target_pids : NULL;
@@ -1033,64 +1011,55 @@ int main(int argc, char **argv) {
         if (use_openssl && discovery_result.libs[LIB_OPENSSL].found) {
             safe_strcpy(openssl_path, sizeof(openssl_path),
                        discovery_result.libs[LIB_OPENSSL].path);
-            printf("  %s✓%s OpenSSL: %s\n",
-                   display_color(C_GREEN), display_color(C_RESET), openssl_path);
+            display_lib_found("OpenSSL", openssl_path, NULL);
         }
 
         if (use_gnutls && discovery_result.libs[LIB_GNUTLS].found) {
             safe_strcpy(gnutls_path, sizeof(gnutls_path),
                        discovery_result.libs[LIB_GNUTLS].path);
-            printf("  %s✓%s GnuTLS:  %s\n",
-                   display_color(C_GREEN), display_color(C_RESET), gnutls_path);
+            display_lib_found("GnuTLS", gnutls_path, NULL);
         }
 
         if (use_nss && discovery_result.libs[LIB_NSS].found) {
             safe_strcpy(nss_path, sizeof(nss_path),
                        discovery_result.libs[LIB_NSS].path);
-            printf("  %s✓%s NSS:     %s\n",
-                   display_color(C_GREEN), display_color(C_RESET), nss_path);
+            display_lib_found("NSS", nss_path, NULL);
         }
 
         if (use_nss && discovery_result.libs[LIB_NSS_SSL].found) {
             safe_strcpy(nss_ssl_path, sizeof(nss_ssl_path),
                        discovery_result.libs[LIB_NSS_SSL].path);
-            printf("  %s✓%s NSS SSL: %s\n",
-                   display_color(C_GREEN), display_color(C_RESET), nss_ssl_path);
+            display_lib_found("NSS SSL", nss_ssl_path, NULL);
         }
 
         if (use_wolfssl && discovery_result.libs[LIB_WOLFSSL].found) {
             safe_strcpy(wolfssl_path, sizeof(wolfssl_path),
                        discovery_result.libs[LIB_WOLFSSL].path);
-            printf("  %s✓%s WolfSSL: %s\n",
-                   display_color(C_GREEN), display_color(C_RESET), wolfssl_path);
+            display_lib_found("WolfSSL", wolfssl_path, NULL);
         }
     } else {
         /* Fallback to individual lookups if full discovery fails */
         if (use_openssl && bpf_loader_find_library_dynamic("libssl.so", openssl_path,
                                                             sizeof(openssl_path),
                                                             discovery_pids, discovery_pid_count) == 0) {
-            printf("  %s✓%s OpenSSL: %s\n",
-                   display_color(C_GREEN), display_color(C_RESET), openssl_path);
+            display_lib_found("OpenSSL", openssl_path, NULL);
         }
 
         if (use_gnutls && bpf_loader_find_library_dynamic("libgnutls.so", gnutls_path,
                                                            sizeof(gnutls_path),
                                                            discovery_pids, discovery_pid_count) == 0) {
-            printf("  %s✓%s GnuTLS:  %s\n",
-                   display_color(C_GREEN), display_color(C_RESET), gnutls_path);
+            display_lib_found("GnuTLS", gnutls_path, NULL);
         }
 
         if (use_nss && bpf_loader_find_library_dynamic("libnspr4.so", nss_path,
                                                         sizeof(nss_path),
                                                         discovery_pids, discovery_pid_count) == 0) {
-            printf("  %s✓%s NSS:     %s\n",
-                   display_color(C_GREEN), display_color(C_RESET), nss_path);
+            display_lib_found("NSS", nss_path, NULL);
             /* Also find libssl3.so for NSS handshake probes */
             if (bpf_loader_find_library_dynamic("libssl3.so", nss_ssl_path,
                                                  sizeof(nss_ssl_path),
                                                  discovery_pids, discovery_pid_count) == 0) {
-                printf("  %s✓%s NSS SSL: %s\n",
-                       display_color(C_GREEN), display_color(C_RESET), nss_ssl_path);
+                display_lib_found("NSS SSL", nss_ssl_path, NULL);
             }
         }
     }
@@ -1101,23 +1070,14 @@ int main(int argc, char **argv) {
      * and suggests corrective actions.
      */
     if (!openssl_path[0] && !gnutls_path[0] && !nss_path[0] && !wolfssl_path[0]) {
-        fprintf(stderr, "\n%sWarning:%s No SSL/TLS libraries found!\n",
-                display_color(C_YELLOW), display_color(C_RESET));
-        fprintf(stderr, "  Possible causes:\n");
-        fprintf(stderr, "  - No target processes using SSL/TLS are running\n");
-        fprintf(stderr, "  - Target processes use statically-linked SSL libraries\n");
-        fprintf(stderr, "  - SSL library paths are non-standard\n");
-        if (num_target_pids > 0) {
-            fprintf(stderr, "  - Specified PID(s) don't have SSL libraries loaded\n");
-        }
-        fprintf(stderr, "  The tool will continue but won't capture any traffic.\n\n");
+        display_no_libs_warning();
     }
 
     printf("\n");
 
     /* Initialize BPF */
     if (bpf_loader_init(&g_loader) < 0) {
-        fprintf(stderr, "Error: Failed to initialize BPF loader\n");
+        display_error("Failed to initialize BPF loader");
         return 1;
     }
     g_bpf_initialized = true;
@@ -1127,15 +1087,13 @@ int main(int argc, char **argv) {
      * eliminating external .bpf.o file dependencies and tampering risks. */
     g_skel = spliff_bpf__open();
     if (!g_skel) {
-        fprintf(stderr, "%sError:%s Failed to open embedded BPF program\n",
-                display_color(C_RED), display_color(C_RESET));
+        display_error("Failed to open embedded BPF program");
         return 1;
     }
 
     err = spliff_bpf__load(g_skel);
     if (err) {
-        fprintf(stderr, "%sError:%s Failed to load BPF program: %s\n",
-                display_color(C_RED), display_color(C_RESET), strerror(-err));
+        display_error("Failed to load BPF program: %s", strerror(-err));
         spliff_bpf__destroy(g_skel);
         g_skel = NULL;
         return 1;
@@ -1145,7 +1103,7 @@ int main(int argc, char **argv) {
     bpf_loader_set_object(&g_loader, g_skel->obj);
 
     if (debug_mode) {
-        printf("  [DEBUG] Loaded embedded BPF program (CO-RE skeleton)\n");
+        display_debug("BPF", "Loaded embedded BPF program (CO-RE skeleton)");
     }
 
     /* Initialize XDP subsystem (auto-attach to network interfaces) */
@@ -1168,8 +1126,7 @@ int main(int argc, char **argv) {
              * reach userspace. This is a significant feature degradation that users
              * need to know about.
              */
-            fprintf(stderr, "%s[WARNING]%s XDP event callback not registered (ringbuf unavailable)\n",
-                    display_color(C_YELLOW), display_color(C_RESET));
+            display_warning("XDP event callback not registered (ringbuf unavailable)");
             fprintf(stderr, "          XDP-SSL correlation (\"Golden Thread\") will not work\n");
             /* Note: We keep g_xdp_initialized=true because XDP programs are still
              * attached and doing packet classification. Only event delivery fails. */
@@ -1200,8 +1157,7 @@ int main(int argc, char **argv) {
                 }
             } else {
                 /* CRITICAL: Without sock_ops, XDP correlation will fail */
-                fprintf(stderr, "%sWarning:%s sock_ops attach failed - XDP correlation will be limited\n",
-                        display_color(C_YELLOW), display_color(C_RESET));
+                display_warning("sock_ops attach failed - XDP correlation will be limited");
                 fprintf(stderr, "  This may be due to missing cgroup2 mount or permissions\n");
             }
 
@@ -1209,17 +1165,14 @@ int main(int argc, char **argv) {
              * This enables correlation with connections established before attachment */
             int warmed = bpf_loader_xdp_warmup_cookies(&g_loader, debug_mode);
             if (warmed > 0 && debug_mode) {
-                printf("  %s[DEBUG]%s Warmed up %d existing connections\n",
-                       display_color(C_GREEN), display_color(C_RESET), warmed);
+                display_debug("XDP", "Warmed up %d existing connections", warmed);
             }
         } else if (debug_mode) {
-            printf("  %s[DEBUG]%s No suitable interfaces for XDP attachment\n",
-                   display_color(C_YELLOW), display_color(C_RESET));
+            display_debug("XDP", "No suitable interfaces for XDP attachment");
         }
     } else if (debug_mode) {
-        printf("  %s[DEBUG]%s XDP not available: %s\n",
-               display_color(C_YELLOW), display_color(C_RESET),
-               xdp_err.message[0] ? xdp_err.message : "unknown error");
+        display_debug("XDP", "XDP not available: %s",
+                      xdp_err.message[0] ? xdp_err.message : "unknown error");
     }
 
     setup_signals();
@@ -1479,7 +1432,7 @@ int main(int argc, char **argv) {
     if (bpf_loader_attach_tracepoint(&g_loader, "sched", "sched_process_exit",
                                       "handle_process_exit", debug_mode) == 0) {
         if (debug_mode) {
-            printf("  [DEBUG] Process exit tracepoint attached\n");
+            display_debug("PROC", "Process exit tracepoint attached");
         }
     }
 
@@ -1492,35 +1445,30 @@ int main(int argc, char **argv) {
                                       "handle_process_exec", debug_mode) == 0) {
         lifecycle_hooks++;
         if (debug_mode) {
-            printf("  [DEBUG] Process exec tracepoint attached (dynamic SSL detection)\n");
+            display_debug("PROC", "Process exec tracepoint attached (dynamic SSL detection)");
         }
     }
     if (bpf_loader_attach_tracepoint(&g_loader, "sched", "sched_process_fork",
                                       "handle_process_fork", debug_mode) == 0) {
         lifecycle_hooks++;
         if (debug_mode) {
-            printf("  [DEBUG] Process fork tracepoint attached\n");
+            display_debug("PROC", "Process fork tracepoint attached");
         }
     }
     if (debug_mode && lifecycle_hooks > 0) {
-        printf("  [DEBUG] Dynamic process monitoring enabled (%d hooks)\n", lifecycle_hooks);
+        display_debug("PROC", "Dynamic process monitoring enabled (%d hooks)", lifecycle_hooks);
     }
 
     if (bpf_loader_get_link_count(&g_loader) == 0) {
-        fprintf(stderr, "%sError:%s No probes attached\n",
-                display_color(C_RED), display_color(C_RESET));
+        display_error("No probes attached");
         return 1;  /* atexit handler will cleanup */
     }
 
-    printf("  %s%d probes attached%s\n\n",
-           display_color(C_GREEN),
-           bpf_loader_get_link_count(&g_loader),
-           display_color(C_RESET));
+    display_probe_summary(bpf_loader_get_link_count(&g_loader));
 
     /* Setup probe handler */
     if (probe_handler_init(&g_handler) < 0) {
-        fprintf(stderr, "%sError:%s Failed to initialize probe handler\n",
-                display_color(C_RED), display_color(C_RESET));
+        display_error("Failed to initialize probe handler");
         return 1;  /* atexit handler will cleanup */
     }
 
@@ -1545,41 +1493,22 @@ int main(int argc, char **argv) {
                num_threads == 0 ? " (auto)" : "");
 
     } else {
-        fprintf(stderr, "%sError:%s Failed to initialize threading\n",
-                display_color(C_RED), display_color(C_RESET));
+        display_error("Failed to initialize threading");
         return 1;  /* atexit handler will cleanup */
     }
 
     if (probe_handler_setup_ringbuf(&g_handler, bpf_loader_get_object(&g_loader)) < 0) {
-        fprintf(stderr, "%sError:%s Cannot setup ring buffer\n",
-                display_color(C_RED), display_color(C_RESET));
+        display_error("Cannot setup ring buffer");
         return 1;  /* atexit handler will cleanup */
     }
     g_probe_initialized = true;
 
     /* Show active filters (IPC filtering always on via BPF, not shown) */
-    if (target_comm[0] || num_target_pids > 0 || target_ppid > 0) {
-        printf("  %sFilters:%s", display_color(C_YELLOW), display_color(C_RESET));
-        if (target_comm[0]) {
-            printf(" comm=%s", target_comm);
-        }
-        if (num_target_pids > 0) {
-            printf(" pid=");
-            for (int i = 0; i < num_target_pids; i++) {
-                printf("%s%d", i > 0 ? "," : "", target_pids[i]);
-            }
-        }
-        if (target_ppid > 0) {
-            printf(" ppid=%d (+children)", target_ppid);
-        }
-        printf("\n\n");
-    }
+    display_filters(target_comm[0] ? target_comm : NULL,
+                    num_target_pids > 0 ? (uint32_t *)target_pids : NULL,
+                    num_target_pids, target_ppid);
 
-    printf("%s════════════════════════════════════════════%s\n",
-           display_color(C_DIM), display_color(C_RESET));
-    printf("  Capturing... Press Ctrl+C to stop\n");
-    printf("%s════════════════════════════════════════════%s\n\n",
-           display_color(C_DIM), display_color(C_RESET));
+    display_capture_started();
 
     /* === Main Event Processing Loop ===
      *
@@ -1620,8 +1549,7 @@ int main(int argc, char **argv) {
     /* Start multi-threaded event processing
      * Pass loader for XDP polling in dispatcher thread (single-writer architecture) */
     if (threading_start(&g_threading, &g_handler, g_xdp_initialized ? &g_loader : NULL) != 0) {
-        fprintf(stderr, "%sError:%s Failed to start threading\n",
-                display_color(C_RED), display_color(C_RESET));
+        display_error("Failed to start threading");
         return 1;
     }
 
@@ -1638,8 +1566,7 @@ int main(int argc, char **argv) {
                                           dispatcher_xdp_event_handler,
                                           &g_threading.dispatcher);
         if (debug_mode) {
-            printf("  %s✓%s XDP callback registered with dispatcher (single-writer)\n",
-                   display_color(C_GREEN), display_color(C_RESET));
+            display_debug("XDP", "XDP callback registered with dispatcher (single-writer)");
         }
     }
 
@@ -1662,7 +1589,7 @@ int main(int argc, char **argv) {
         usleep(100000);  /* 100ms - check exit flag periodically */
     }
 
-    printf("\n%sDone.%s\n", display_color(C_GREEN), display_color(C_RESET));
+    display_done();
 
     /* Cleanup is handled by atexit(cleanup_all_resources) */
     return (err < 0 && err != -EINTR) ? 1 : 0;
