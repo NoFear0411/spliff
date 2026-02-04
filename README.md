@@ -75,26 +75,56 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 
   Application Layer (SSL/TLS)
   ----------------------------------------------
-  Events:      1435 captured -> 2328 processed
+  Events:      131 captured -> 216 processed
+  Output:      0 messages (0 B)
+
+  Async Logger
+  ----------------------------------------------
+  Messages: 36 (8.9 KB)
+  Batches:  34 (avg 1.1 msgs/batch)
 
   Workers (16)
   ----------------------------------------------
-  Worker 10: 1886 events
-  Worker 11: 326 events
-  (workers with activity shown)
-  CPU: Good (NAPI-style, 33661 sleep cycles)
+  Worker  1: 1 events
+  Worker  2: 8 events
+  Worker  4: 6 events
+  Worker  5: 1 events
+  Worker  6: 152 events
+  Worker  7: 10 events
+  Worker  8: 1 events
+  Worker  9: 24 events
+  Worker 11: 1 events
+  Worker 14: 4 events
+  Worker 15: 8 events
+  CPU: Good (NAPI-style, 12162 sleep cycles)
 
   Flow Pool
   ----------------------------------------------
-  Active:      3 flows, peak 19
-  Cookie index: 2 entries, 2267 hits (98.8%)
-  Shadow index: 1 entries, 34 hits
+  Active:      9 flows, peak 9
+  Throughput:  15 allocs, 6 frees
+  Cookie index: 3 entries, 193 hits (95.5%), 9 misses
+  Shadow index: 2 entries, 14 hits, 0 promotions
+  Promotion:    0.0% of flows got socket_cookie
 
   Network Layer (XDP)
   ----------------------------------------------
-  Packets:     2145 processed (2063 TCP)
-  Connections: 20 tracked, 20 classified
+  Packets:     205 processed (177 TCP)
+  Connections: 9 tracked, 9 classified
   Correlation: 100.0% socket cookie success
+  Classified:  9 flows
+  Ambiguous:   76 (deeper inspection needed)
+  Terminated:  6 (FIN/RST)
+  Cache hits:  0 (fast-path gatekeeper)
+  Cookie miss: 0 (correlation gaps)
+
+  Sockops (cookie caching)
+  ----------------------------------------------
+  Events:  5 (active: 5, passive: 0)
+  Cleanup: 0
+
+  SSL Probes
+  ----------------------------------------------
+  SSL_read/SSL_write intercepted: 41
 
 ============================================
 ```
@@ -296,33 +326,18 @@ sudo ./spliff --show-libs                # Show all discovered SSL libraries
 
 ### HTTP/2 Request/Response (with XDP Correlation)
 ```
-15:11:59.346 → GET https://api.example.com/users ALPN:h2 192.0.2.10:48372 → 198.51.100.25:443 curl (403410) [63.1us] [stream 1]
-  user-agent: curl/8.15.0
-  accept: application/json
-
-15:11:59.639 ← 200 https://api.example.com/users ALPN:h2 application/json (1247 bytes) 192.0.2.10:48372 → 198.51.100.25:443 curl (403410) [294.29ms] [stream 1]
-  date: Mon, 27 Jan 2026 11:11:59 GMT
-  content-type: application/json
-  content-length: 1247
-─── Body ───
-{"users":[{"id":1,"name":"alice"},{"id":2,"name":"bob"}]}
-────────────
+04:35:19.750 → GET https://httpbin.org/bytes/16384 ALPN:h2 curl (855771) [stream 1] #648f
+              |- 192.168.50.245:42696 → 44.197.91.61:443 [XDP:TLS][App:H2] ✓✓ (wlp0s20f3)
+04:35:20.363 ← 200 https://httpbin.org/bytes/16384 ALPN:h2 application/octet-stream (16384 bytes) curl (855771) [614.81ms] [stream 1] #648f
+              |- 44.197.91.61:443 → 192.168.50.245:42696 [XDP:TLS][App:H2] ✓✓ (wlp0s20f3)
 ```
 
 ### HTTP/1.1 Request/Response (with XDP Correlation)
 ```
-15:12:05.592 → GET https://httpbin.org/get ALPN:http/1.1 192.0.2.10:52418 → 203.0.113.50:443 curl (403422) [31.9us]
-  Host: httpbin.org
-  User-Agent: curl/8.15.0
-  Accept: */*
-
-15:12:05.883 ← 200 https://httpbin.org/get ALPN:http/1.1 application/json (298 bytes) 192.0.2.10:52418 → 203.0.113.50:443 curl (403422) [291.3ms]
-  Date: Mon, 27 Jan 2026 11:12:05 GMT
-  Content-Type: application/json
-  Content-Length: 298
-─── Body (298 bytes) ───
-{"args":{},"headers":{"Accept":"*/*","Host":"httpbin.org"},"origin":"192.0.2.10","url":"https://httpbin.org/get"}
-────────────
+04:35:45.555 → GET https://httpbin.org/get ALPN:http/1.1 curl (855994) [141.7us] #230f
+              |- 192.168.50.245:52274 → 52.204.75.48:443 [XDP:TLS][App:H1] ✓✓ (wlp0s20f3)
+04:35:45.860 ← 200 https://httpbin.org/get ALPN:http/1.1 application/json (256 bytes) curl (855994) [170.9us] #230f
+              |- 52.204.75.48:443 → 192.168.50.245:52274 [XDP:TLS][App:H1] ✓✓ (wlp0s20f3)
 ```
 
 ### TLS Handshake (with -H flag)
@@ -332,9 +347,7 @@ sudo ./spliff --show-libs                # Show all discovered SSL libraries
 
 ### XDP Attachment Status (startup)
 ```
-[XDP] Attached to 2 interfaces (native: 1, SKB fallback: 1)
-  ✓ eth0 (native mode)
-  ✓ wlan0 (SKB mode - driver doesn't support native)
+✓ XDP: enp0s20f0u2u4u2 [skb], wlp0s20f3 [skb], enp0s31f6 [skb]
 ```
 
 ## Architecture
