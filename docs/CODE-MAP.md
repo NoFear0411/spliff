@@ -1,4 +1,4 @@
-# CODE-MAP.md - spliff v0.9.10 Comprehensive Code Map
+# CODE-MAP.md - spliff v0.9.11 Comprehensive Code Map
 
 > **Purpose:** AI-friendly and human-readable architecture reference for understanding, maintaining, and extending the spliff codebase.
 
@@ -16,16 +16,17 @@
 
 ## Project Overview
 
-**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.10 features:
+**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.11 features:
 
 - **Dynamic Flow Pool**: On-demand allocation via jemalloc with incremental hash table resizing
+- **Per-Flow HTTP/2 Sessions**: Sessions managed in `flow_ctx->parser.h2`, not per-worker pools (v0.9.11)
 - **Embedded BPF Skeleton**: CO-RE BTF bytecode embedded in binary, strip-safe
 - **XDP-SSL Correlation**: Socket cookie "Golden Thread" links packets, sockets, and TLS data
 - **Modular Protocol Architecture**: Clean plugin-style routing for HTTP/1, HTTP/2, detection
 - **Multi-threaded Processing**: Lock-free worker threads with connection affinity
-- **Centralized Session Statistics**: Production-grade shutdown metrics with per-worker breakdown
-- **RCU-Safe Memory Reclamation**: liburcu integration for safe deferred memory frees (v0.9.10)
-- **Thread Safety Audit**: Atomic counters, correct ring buffer semantics, single-writer guarantees (v0.9.10)
+- **Centralized Display API**: Startup/diagnostic output via display.c module (v0.9.11)
+- **RCU-Safe Memory Reclamation**: liburcu integration for safe deferred memory frees
+- **Thread Safety**: Atomic counters, correct ring buffer semantics, single-writer guarantees
 
 ---
 
@@ -68,35 +69,37 @@ spliff/
 │   │   ├── decompressor.h          # Decompressor API
 │   │   ├── signatures.c            # File magic detection (50+ formats)
 │   │   └── signatures.h            # Signature database and API
-│   ├── output/                     # Terminal output formatting and colors
-│   │   ├── display.c               # Colored output, latency formatting
+│   ├── output/                     # Terminal output and logging
+│   │   ├── display.c               # Colored output, startup display API (expanded v0.9.11)
 │   │   ├── display.h               # Display API
-│   │   ├── logger.c                # Async SPMC logging pipeline (v0.9.9, fixed v0.9.10)
-│   │   ├── logger.h                # Logger API (v0.9.9, _Static_assert v0.9.10)
-│   │   ├── stats.c                 # Session statistics display (NEW v0.9.9)
-│   │   └── stats.h                 # Stats API (NEW v0.9.9)
+│   │   ├── logger.c                # Async SPMC logging pipeline
+│   │   ├── logger.h                # Logger API
+│   │   ├── stats.c                 # Session statistics display
+│   │   └── stats.h                 # Stats API
 │   ├── correlation/                # XDP-SSL correlation and flow pooling
 │   │   ├── flow_context.c          # Dynamic pool, dual-index lookup, deferred free
 │   │   ├── flow_context.h          # flow_context_t, pool types, index types
-│   │   ├── ck_cookie_index.c       # CK cookie hash table (v0.9.9, RCU v0.9.10)
-│   │   ├── ck_cookie_index.h       # Cookie index API (v0.9.9)
-│   │   ├── ck_shadow_index.c       # CK shadow hash table (v0.9.9, RCU v0.9.10)
-│   │   └── ck_shadow_index.h       # Shadow index API (v0.9.9)
+│   │   ├── ck_cookie_index.c       # CK cookie hash table with RCU
+│   │   ├── ck_cookie_index.h       # Cookie index API
+│   │   ├── ck_shadow_index.c       # CK shadow hash table with RCU + secondary index
+│   │   └── ck_shadow_index.h       # Shadow index API
 │   ├── threading/                  # Multi-threaded event processing
-│   │   ├── threading.h             # Threading API, worker struct, ring buffers
+│   │   ├── threading.h             # Threading API (reduced in v0.9.11)
 │   │   ├── dispatcher.c            # BPF ring consumer, flow routing
 │   │   ├── manager.c               # Thread lifecycle (init, start, shutdown)
 │   │   ├── worker.c                # Worker thread main loop
 │   │   ├── output.c                # Output serialization thread
-│   │   ├── state.c                 # Per-worker state (H2 pools, ALPN cache)
+│   │   ├── state.c                 # Per-worker state (minimal since v0.9.11)
 │   │   ├── pool.c                  # Lock-free object pool
-│   │   ├── deferred.c              # Per-worker deferred display queue (NEW v0.9.9)
-│   │   ├── deferred.h              # Deferred queue API (NEW v0.9.9)
-│   │   ├── xdp_ring.c              # Per-worker XDP SPSC ring (v0.9.9, assertions v0.9.10)
-│   │   └── xdp_ring.h              # XDP ring API (v0.9.9, _Static_assert v0.9.10)
+│   │   ├── deferred.c              # Per-worker deferred display queue
+│   │   ├── deferred.h              # Deferred queue API
+│   │   ├── xdp_ring.c              # Per-worker XDP SPSC ring
+│   │   └── xdp_ring.h              # XDP ring API
 │   └── util/                       # Utility functions
 │       ├── safe_str.c              # Safe string operations
-│       └── safe_str.h              # String API
+│       ├── safe_str.h              # String API
+│       ├── process.c               # Process info utilities (v0.9.11)
+│       └── process.h               # Process API
 ├── tests/                          # Unit tests
 │   ├── test_common.c
 │   ├── test_http1.c
@@ -163,7 +166,7 @@ spliff/
 | `MAX_HEADERS` | 128 |
 | `MAX_BODY_BUFFER` | 1 MB |
 | `XDP_PAYLOAD_MAX` | 128 bytes |
-| `SPLIFF_VERSION` | "0.9.10" |
+| `SPLIFF_VERSION` | "0.9.11" |
 
 ---
 
@@ -428,8 +431,8 @@ typedef struct {
 
 ### Threading
 
-#### `src/threading/threading.h` (~1376 lines)
-**Purpose:** Threading infrastructure definitions
+#### `src/threading/threading.h` (~1060 lines, reduced from ~1376 in v0.9.10)
+**Purpose:** Threading infrastructure definitions (H2 pool types removed in v0.9.11)
 
 **Configuration:**
 | Constant | Value |
@@ -478,13 +481,16 @@ typedef struct {
 
 ---
 
-#### `src/threading/state.c` (~499 lines)
-**Purpose:** Per-worker isolated state
+#### `src/threading/state.c` (~120 lines, reduced from ~620 in v0.9.10)
+**Purpose:** Per-worker isolated state (minimal since v0.9.11)
 
-**Per-Worker:**
-- HTTP/2 session pool (16 sessions)
-- ALPN cache (64 entries)
-- Pending body buffers (256 entries)
+**Per-Worker (v0.9.11):**
+- Decompression buffer
+- Body buffer
+- HTTP/2 callbacks reference
+
+**Removed in v0.9.11:** HTTP/2 session pools, ALPN cache, pending body buffers, H1 request cache
+(all moved to per-flow management in flow_context_t)
 
 ---
 
@@ -526,15 +532,28 @@ typedef struct {
 
 ### Output
 
-#### `src/output/display.c` (~528 lines)
-**Purpose:** Terminal output with ANSI colors, dual checkmark XDP correlation display
+#### `src/output/display.c` (~730 lines, expanded in v0.9.11)
+**Purpose:** Terminal output with ANSI colors, dual checkmark XDP correlation display, centralized startup/diagnostic output
 
 **Colors:** C_RESET, C_DIM, C_RED, C_GREEN, C_YELLOW, C_CYAN, C_MAGENTA
 
-**Output Format (v0.9.9):**
+**Output Format:**
 - `[XDP:TLS][App:H2] ✓✓` - Both XDP and App layer verified
 - `[XDP:?][App:H1] ✓` - App layer only (XDP pending)
 - XDP protocols: TLS, QUIC, HTTP, H2, Other, ?
+
+**Startup Display API (v0.9.11):**
+| Function | Purpose |
+|----------|---------|
+| `display_banner()` | Print startup header with version |
+| `display_lib_found()` | Library discovery messages |
+| `display_probe_attached()` | Probe attachment status |
+| `display_xdp_attached()` | XDP interface attachment |
+| `display_cgroup_attached()` | Cgroup sock_ops attachment |
+| `display_warmup_status()` | BPF map warmup statistics |
+| `display_error()` | Thread-safe stderr error output |
+| `display_warning()` | Thread-safe stderr warning output |
+| `display_debug()` | Debug-mode-only output |
 
 ---
 
@@ -756,9 +775,9 @@ See [../ISSUES.md](../ISSUES.md) for the full list of open issues, known limitat
 
 | Metric | Value |
 |--------|-------|
-| Total Lines of Code | ~19,400 |
+| Total Lines of Code | ~18,600 (reduced ~800 lines in v0.9.11) |
 | BPF Program | ~3,372 lines |
-| Source Files | 25+ |
+| Source Files | 27+ (added process.c/h) |
 | SSL Libraries | 5 (OpenSSL, GnuTLS, NSS, WolfSSL, BoringSSL) |
 | HTTP Protocols | 2 (HTTP/1.1, HTTP/2) |
 | Decompression Formats | 4 |
@@ -768,4 +787,4 @@ See [../ISSUES.md](../ISSUES.md) for the full list of open issues, known limitat
 
 ---
 
-*Last updated: v0.9.10 (February 2026)*
+*Last updated: v0.9.11 (February 2026)*

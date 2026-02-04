@@ -229,7 +229,7 @@ When reporting issues, please include:
 
 **Example report:**
 ```
-Version: spliff 0.9.1
+Version: spliff 0.9.11
 OS: Fedora 43, kernel 6.18.5
 Steps: 1. Start spliff, 2. Connect to VPN, 3. curl https://example.com
 Expected: XDP correlation info shown with HTTP output
