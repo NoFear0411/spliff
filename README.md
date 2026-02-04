@@ -361,17 +361,29 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and data 
 
 ## Roadmap
 
-| Version | Milestone | Status |
-|---------|-----------|--------|
-| v0.1-0.8 | Core interception, XDP tracking, multi-threading | ✅ Complete |
-| **v0.9.11** | Lock-free architecture, thread safety, IPv6 | ✅ **Current** |
-| v0.10 | Plain HTTP capture, ZSTD streaming | 🔄 Next |
-| v0.11 | HTTP/3 + QUIC (ngtcp2/nghttp3) | Planned |
-| v1.0 | WebSocket, production hardening | Planned |
-| v2.0+ | EDR agent mode, event streaming | Future |
+| Version | Theme | Key Deliverables | Status |
+|---------|-------|------------------|--------|
+| v0.1-0.8 | Core | Interception, XDP tracking, multi-threading | ✅ Complete |
+| **v0.9.11** | Stability | Lock-free architecture, thread safety, IPv6 | ✅ **Current** |
+| v0.10.0 | Foundation | Omni-Ring memory, SPMC rings, refcounted flows, ZSTD streaming | 🔄 Next |
+| v0.11.0 | Protocols | Plain HTTP, WebSocket, gRPC, HTTP/3 + QUIC | Planned |
+| v0.12.0 | Operations | Enhanced dispatcher, comprehensive metrics | Planned |
+| v0.13.0+ | Hardening | Security mitigations, performance tuning | Planned |
+| v1.0.0 | Release | Production-ready, stable API, all protocols | Target |
+| v2.0+ | EDR | Agent mode, event streaming, threat intel | Future |
+
+### Architecture Evolution (Omni-Ring)
+The v0.10+ series implements the Omni-Ring architecture for production-grade performance:
+- **Zero-Copy Buffers**: Mirrored virtual memory eliminates wrap-around branching
+- **SPMC Workers**: Single-producer, multi-consumer rings with batch dequeue
+- **Reference Counting**: Clean flow lifecycle without generation-based hacks
+- **Multi-Protocol**: Unified detection/routing for HTTP/1, HTTP/2, HTTP/3, WebSocket, gRPC
+
+See [docs/REFACTOR-PLAN.md](docs/REFACTOR-PLAN.md) for detailed implementation plan.
 
 ### Goals
-- **Near-Term**: Plain HTTP via XDP, WebSocket frames, enhanced metrics
+- **Near-Term**: Omni-Ring foundation, plain HTTP capture, WebSocket integration
+- **Mid-Term**: HTTP/3 + QUIC, comprehensive metrics, security hardening
 - **Long-Term**: Agent mode, NATS/Kafka streaming, behavioral analysis, threat intel
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed version history.
