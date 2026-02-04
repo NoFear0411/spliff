@@ -306,6 +306,158 @@ void display_handshake_ex(uint32_t pid, const char *comm, uint64_t delta_ns,
 void display_hpack_error(int32_t stream_id, const char *host, const char *path,
                          uint32_t pid, const char *comm);
 
+/**
+ * @defgroup startup_display Startup Display
+ * @brief Functions for startup and initialization messages
+ *
+ * These functions output directly to stdout (before async logger starts).
+ * All are single-threaded safe and flush immediately.
+ * @{
+ */
+
+/**
+ * @brief Display application banner with version
+ *
+ * Shows the spliff banner art and version string at startup.
+ *
+ * @param[in] version Version string (e.g., "0.9.11")
+ */
+void display_banner(const char *version);
+
+/**
+ * @brief Display discovered SSL library
+ *
+ * Shows a library found during auto-discovery with path and details.
+ *
+ * @param[in] lib_type Library type (e.g., "OpenSSL", "BoringSSL", "NSS")
+ * @param[in] path     Full path to the library
+ * @param[in] details  Additional details (version, etc.) or NULL
+ *
+ * @par Example Output:
+ * @code
+ * ├─ OpenSSL: /usr/lib/libssl.so.3 (3.0.2)
+ * @endcode
+ */
+void display_lib_found(const char *lib_type, const char *path, const char *details);
+
+/**
+ * @brief Display warning when no SSL libraries found
+ */
+void display_no_libs_warning(void);
+
+/**
+ * @brief Display uprobe attachment success
+ *
+ * @param[in] lib    Library name
+ * @param[in] symbol Function symbol name
+ * @param[in] prog   BPF program name
+ */
+void display_probe_attached(const char *lib, const char *symbol, const char *prog);
+
+/**
+ * @brief Display probe attachment summary
+ *
+ * @param[in] count Total number of probes attached
+ */
+void display_probe_summary(int count);
+
+/**
+ * @brief Display XDP program attachment status
+ *
+ * @param[in] ifaces Array of interface names
+ * @param[in] modes  Array of XDP modes ("native", "skb", etc.)
+ * @param[in] count  Number of interfaces
+ */
+void display_xdp_attached(const char **ifaces, const char **modes, int count);
+
+/**
+ * @brief Display sockops program status
+ *
+ * @param[in] success True if sockops attached successfully
+ */
+void display_sockops_status(bool success);
+
+/**
+ * @brief Display XDP warmup connection count
+ *
+ * @param[in] connections Number of warmup connections
+ */
+void display_xdp_warmup(int connections);
+
+/**
+ * @brief Display capture started message
+ */
+void display_capture_started(void);
+
+/**
+ * @brief Display active filters
+ *
+ * @param[in] comm  Command name filter or NULL
+ * @param[in] pids  Array of PID filters or NULL
+ * @param[in] count Number of PIDs
+ * @param[in] ppid  Parent PID filter or 0
+ */
+void display_filters(const char *comm, const uint32_t *pids, int count, uint32_t ppid);
+
+/**
+ * @brief Display shutdown message
+ */
+void display_done(void);
+
+/** @} */ /* end of startup_display group */
+
+/**
+ * @defgroup diagnostic_display Diagnostic Display
+ * @brief Functions for error, warning, and debug output
+ *
+ * These functions use stderr for diagnostic messages.
+ * Thread-safe via mutex protection.
+ * @{
+ */
+
+/**
+ * @brief Display error message
+ *
+ * Outputs a red-colored error message to stderr.
+ * Thread-safe with mutex protection.
+ *
+ * @param[in] fmt Printf-style format string
+ * @param[in] ... Format arguments
+ */
+void display_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/**
+ * @brief Display warning message
+ *
+ * Outputs a yellow-colored warning message to stderr.
+ * Thread-safe with mutex protection.
+ *
+ * @param[in] fmt Printf-style format string
+ * @param[in] ... Format arguments
+ */
+void display_warning(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/**
+ * @brief Display debug message with category
+ *
+ * Outputs a timestamped debug message to stderr.
+ * Only outputs if g_config.debug_mode is true.
+ * Thread-safe with mutex protection.
+ *
+ * @param[in] category Category tag (e.g., "XDP", "H1", "SSL")
+ * @param[in] fmt      Printf-style format string
+ * @param[in] ...      Format arguments
+ *
+ * @par Example Output:
+ * @code
+ * [DEBUG][10:30:45.123][XDP] Packet classified as TLS
+ * @endcode
+ */
+void display_debug(const char *category, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+/** @} */ /* end of diagnostic_display group */
+
 /** @} */ /* end of display group */
 
 #endif /* DISPLAY_H */

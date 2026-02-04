@@ -761,3 +761,206 @@ void display_hpack_error(int32_t stream_id, const char *host, const char *path,
 
     display_flush();
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Startup Display Functions
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * These functions output directly to stdout before the async logger starts.
+ * All are single-threaded safe (called during initialization).
+ */
+
+void display_banner(const char *version) {
+    printf("%s", display_color(C_MAGENTA));
+    printf("           ____  __   ______\n");
+    printf("   _______/ / /_/ /__/ / __/\n");
+    printf("  (_-</ _ / / _/ _// / _/\n");
+    printf(" /___/ .__/_/_//_/ /_/_/     %s%sv%s%s\n",
+           display_color(C_DIM), display_color(C_GREEN),
+           version ? version : "dev",
+           display_color(C_RESET));
+    printf(" %s   /_/ eBPF SSL/TLS sniffer%s\n\n",
+           display_color(C_DIM), display_color(C_RESET));
+    fflush(stdout);
+}
+
+void display_lib_found(const char *lib_type, const char *path, const char *details) {
+    printf("  %s|-%s %s%s%s: %s",
+           display_color(C_DIM), display_color(C_RESET),
+           display_color(C_CYAN), lib_type ? lib_type : "Unknown",
+           display_color(C_RESET),
+           path ? path : "(unknown path)");
+    if (details && details[0]) {
+        printf(" %s(%s)%s", display_color(C_DIM), details, display_color(C_RESET));
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+void display_no_libs_warning(void) {
+    printf("%s[!] Warning: No SSL libraries found. Check LD_LIBRARY_PATH or specify --lib.%s\n",
+           display_color(C_YELLOW), display_color(C_RESET));
+    fflush(stdout);
+}
+
+void display_probe_attached(const char *lib, const char *symbol, const char *prog) {
+    printf("    %s|-%s %s%s%s @ %s%s%s",
+           display_color(C_DIM), display_color(C_RESET),
+           display_color(C_GREEN), symbol ? symbol : "?", display_color(C_RESET),
+           display_color(C_DIM), prog ? prog : "?", display_color(C_RESET));
+    if (lib && lib[0]) {
+        printf(" %s(%s)%s", display_color(C_DIM), lib, display_color(C_RESET));
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+void display_probe_summary(int count) {
+    printf("  %s|-%s %s%d%s probes attached\n",
+           display_color(C_DIM), display_color(C_RESET),
+           display_color(C_GREEN), count, display_color(C_RESET));
+    fflush(stdout);
+}
+
+void display_xdp_attached(const char **ifaces, const char **modes, int count) {
+    printf("  %s|-%s XDP attached:\n", display_color(C_DIM), display_color(C_RESET));
+    for (int i = 0; i < count; i++) {
+        printf("    %s|-%s %s%s%s %s(%s)%s\n",
+               display_color(C_DIM), display_color(C_RESET),
+               display_color(C_CYAN), ifaces[i] ? ifaces[i] : "?", display_color(C_RESET),
+               display_color(C_DIM), modes[i] ? modes[i] : "?", display_color(C_RESET));
+    }
+    fflush(stdout);
+}
+
+void display_sockops_status(bool success) {
+    if (success) {
+        printf("  %s|-%s sockops: %sattached%s\n",
+               display_color(C_DIM), display_color(C_RESET),
+               display_color(C_GREEN), display_color(C_RESET));
+    } else {
+        printf("  %s|-%s sockops: %sskipped%s\n",
+               display_color(C_DIM), display_color(C_RESET),
+               display_color(C_YELLOW), display_color(C_RESET));
+    }
+    fflush(stdout);
+}
+
+void display_xdp_warmup(int connections) {
+    printf("  %s|-%s XDP warmup: %s%d%s connections\n",
+           display_color(C_DIM), display_color(C_RESET),
+           display_color(C_GREEN), connections, display_color(C_RESET));
+    fflush(stdout);
+}
+
+void display_capture_started(void) {
+    printf("\n%sCapturing traffic... (Ctrl+C to stop)%s\n\n",
+           display_color(C_DIM), display_color(C_RESET));
+    fflush(stdout);
+}
+
+void display_filters(const char *comm, const uint32_t *pids, int count, uint32_t ppid) {
+    bool has_filter = (comm && comm[0]) || count > 0 || ppid > 0;
+    if (!has_filter) return;
+
+    printf("  %s|-%s Filters: ", display_color(C_DIM), display_color(C_RESET));
+
+    bool first = true;
+    if (comm && comm[0]) {
+        printf("comm=%s%s%s", display_color(C_CYAN), comm, display_color(C_RESET));
+        first = false;
+    }
+    if (count > 0 && pids) {
+        if (!first) printf(", ");
+        printf("pids=[");
+        for (int i = 0; i < count; i++) {
+            if (i > 0) printf(",");
+            printf("%s%u%s", display_color(C_CYAN), pids[i], display_color(C_RESET));
+        }
+        printf("]");
+        first = false;
+    }
+    if (ppid > 0) {
+        if (!first) printf(", ");
+        printf("ppid=%s%u%s", display_color(C_CYAN), ppid, display_color(C_RESET));
+    }
+    printf("\n");
+    fflush(stdout);
+}
+
+void display_done(void) {
+    printf("\n%sDone.%s\n", display_color(C_DIM), display_color(C_RESET));
+    fflush(stdout);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Diagnostic Display Functions
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * These functions output to stderr for error/warning/debug messages.
+ * Thread-safe via mutex protection (stderr is shared).
+ */
+
+#include <pthread.h>
+
+/** Mutex for stderr output serialization */
+static pthread_mutex_t g_stderr_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void display_error(const char *fmt, ...) {
+    pthread_mutex_lock(&g_stderr_mutex);
+
+    fprintf(stderr, "%s[ERROR]%s ", display_color(C_RED), display_color(C_RESET));
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+
+    if (fmt[strlen(fmt) - 1] != '\n') {
+        fprintf(stderr, "\n");
+    }
+
+    pthread_mutex_unlock(&g_stderr_mutex);
+}
+
+void display_warning(const char *fmt, ...) {
+    pthread_mutex_lock(&g_stderr_mutex);
+
+    fprintf(stderr, "%s[WARN]%s ", display_color(C_YELLOW), display_color(C_RESET));
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+
+    if (fmt[strlen(fmt) - 1] != '\n') {
+        fprintf(stderr, "\n");
+    }
+
+    pthread_mutex_unlock(&g_stderr_mutex);
+}
+
+void display_debug(const char *category, const char *fmt, ...) {
+    if (!g_config.debug_mode) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_stderr_mutex);
+
+    char ts[32];
+    display_get_timestamp(ts, sizeof(ts));
+
+    fprintf(stderr, "%s[DEBUG][%s][%s]%s ",
+            display_color(C_DIM), ts, category ? category : "?", display_color(C_RESET));
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+
+    if (fmt[strlen(fmt) - 1] != '\n') {
+        fprintf(stderr, "\n");
+    }
+
+    pthread_mutex_unlock(&g_stderr_mutex);
+}
