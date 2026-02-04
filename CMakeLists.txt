@@ -566,6 +566,10 @@ set(SPLIFF_SOURCES
     src/threading/manager.c
     src/threading/deferred.c
     src/threading/xdp_ring.c
+    # Memory infrastructure (Phase 1 - Omni-Ring foundation)
+    src/memory/mirrored_buffer.c
+    src/memory/hugepage.c
+    src/memory/numa_alloc.c
 )
 
 # ============================================================================
@@ -824,6 +828,15 @@ add_executable(test_safe_str EXCLUDE_FROM_ALL
 )
 target_include_directories(test_safe_str PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 add_test(NAME safe_str_tests COMMAND test_safe_str)
+
+# Mirrored buffer tests (Phase 1 - memory infrastructure)
+add_executable(test_mirrored_buffer EXCLUDE_FROM_ALL
+    tests/test_mirrored_buffer.c
+    src/memory/mirrored_buffer.c
+    src/memory/hugepage.c
+)
+target_include_directories(test_mirrored_buffer PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+add_test(NAME mirrored_buffer_tests COMMAND test_mirrored_buffer)
 
 # Flow context tests (P0 - core state management)
 add_executable(test_flow_context EXCLUDE_FROM_ALL
