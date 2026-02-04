@@ -297,11 +297,6 @@ void threading_cleanup(threading_mgr_t *mgr) {
  * @{
  */
 
-void threading_print_stats(threading_mgr_t *mgr) {
-    /* No-op: stats printing is now centralized in main.c print_shutdown_stats() */
-    (void)mgr;
-}
-
 void threading_get_aggregate_stats(threading_mgr_t *mgr, threading_stats_t *stats) {
     if (!mgr || !stats) {
         return;

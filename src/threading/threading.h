@@ -125,7 +125,6 @@ typedef struct xdp_ring xdp_ring_t;
  * Each worker maintains isolated pools sized by these limits.
  * @{
  */
-#define MAX_H2_SESSIONS_PER_WORKER      16   /**< HTTP/2 connections per worker */
 #define MAX_H2_STREAMS_PER_WORKER       128  /**< HTTP/2 streams per worker */
 /** @} */
 
@@ -257,183 +256,27 @@ struct nghttp2_session_callbacks; /**< nghttp2 callback table */
 
 /* Note: h2_stream_state_t and H2_BODY_BUFFER_SIZE are defined in http2.h */
 
-/**
- * @brief HTTP/2 connection lifecycle state (atomic state machine)
+/*
+ * Legacy per-worker H2 connection pool removed in v0.9.11.
  *
- * Implements a state machine for safe concurrent access between
- * dispatcher (cleanup by PID) and worker (allocation/use) threads.
+ * HTTP/2 sessions are now managed per-flow in flow_ctx->parser.h2,
+ * following the FIN lifecycle. This eliminates:
+ * - Arbitrary 16-slot LRU limits
+ * - Race conditions between dispatcher and worker
+ * - Shadow queue complexity for deferred cleanup
  *
- * @par State Transitions:
- * @code
- *   FREE ──CAS──► INITIALIZING ──CAS──► ACTIVE ──exchange──► DYING
- *     ▲                │                                        │
- *     │                │ (CAS fails = race)                     │
- *     │                ▼                                        ▼
- *     └────────── self-cleanup                          worker moves to
- *                                                       shadow queue, then
- *                                                       slot → FREE
- * @endcode
+ * See flow_context.h for flow_context_t::parser.h2 structure.
  */
-typedef enum {
-    H2_CONN_STATE_FREE = 0,         /**< Slot available for allocation */
-    H2_CONN_STATE_INITIALIZING,     /**< Worker allocating resources (owns cleanup) */
-    H2_CONN_STATE_ACTIVE,           /**< Connection ready for use */
-    H2_CONN_STATE_DYING             /**< Dispatcher marked for cleanup */
-} h2_conn_state_t;
 
-/**
- * @brief Deferred cleanup item for shadow queue
+/*
+ * Legacy per-worker H2 stream pool removed in v0.9.11.
  *
- * Holds HTTP/2 resources moved from connection slot for amortized cleanup.
+ * HTTP/2 streams are now managed per-flow in flow_ctx->transactions[],
+ * using flow_transaction_t for unified request/response tracking.
+ * This enables proper FIN-based cleanup and eliminates arbitrary limits.
+ *
+ * See flow_context.h for flow_transaction_t structure.
  */
-typedef struct {
-    struct nghttp2_hd_inflater *inflater;   /**< HPACK inflater to free */
-    uint8_t *response_buf;                  /**< Response buffer to free */
-} h2_deferred_cleanup_t;
-
-/**
- * @brief Shadow cleanup queue for amortized resource freeing
- *
- * Per-worker queue that holds HTTP/2 resources scheduled for cleanup.
- * Workers push dying connections here during event processing and
- * pop/free during quiet phases of the adaptive spin loop.
- *
- * @par Design:
- * - Power-of-2 size for fast bitwise masking
- * - Single-writer (owning worker) - no atomics needed
- * - Amortized cleanup prevents latency spikes
- *
- * @par Backpressure:
- * When queue fills up, cleanup rate increases proportionally.
- */
-/** @brief Size of the shadow queue (must be power of 2) */
-#define H2_SHADOW_QUEUE_SIZE 1024
-
-/** @brief Bitmask for fast modulo on shadow queue index */
-#define H2_SHADOW_QUEUE_MASK (H2_SHADOW_QUEUE_SIZE - 1)
-
-/**
- * @brief Ring buffer queue for deferred HTTP/2 cleanup operations
- *
- * Lock-free single-producer single-consumer queue for scheduling
- * HTTP/2 connection cleanup after a grace period.
- */
-typedef struct {
-    h2_deferred_cleanup_t items[H2_SHADOW_QUEUE_SIZE]; /**< Cleanup items */
-    uint32_t head;  /**< Write position (next push slot) */
-    uint32_t tail;  /**< Read position (next pop slot) */
-} h2_shadow_queue_t;
-
-/**
- * @brief Per-connection HTTP/2 session state (worker-local)
- *
- * Each worker maintains its own pool of HTTP/2 connections. Connection
- * affinity routing ensures the same (pid, ssl_ctx) always goes to the
- * same worker, so no locking is needed on this state.
- *
- * @par Session Parsing Strategy:
- * - server_session parses client requests (we're acting as "server")
- * - response_inflater decodes server response headers (separate HPACK context)
- * - This dual-context approach handles both directions of HTTP/2 traffic
- *
- * @par Atomic State Machine:
- * The state field uses atomic operations to coordinate between dispatcher
- * (marking connections for cleanup) and workers (allocating/using connections).
- * This eliminates the use-after-free race condition without locking.
- */
-typedef struct h2_connection_local {
-    uint32_t pid;           /**< Process ID owning this connection */
-    uint64_t ssl_ctx;       /**< SSL context pointer (connection identifier) */
-    _Atomic h2_conn_state_t state;  /**< Atomic lifecycle state (replaces bool active) */
-
-    /** nghttp2 server session for parsing client->server requests */
-    struct nghttp2_session *server_session;
-
-    /** HPACK inflater for decoding server->client response headers */
-    struct nghttp2_hd_inflater *response_inflater;
-
-    bool client_preface_seen;   /**< Received HTTP/2 client connection preface */
-    bool server_settings_seen;  /**< Received server SETTINGS frame */
-
-    /** Buffer for reassembling fragmented response frames */
-    uint8_t *response_buf;
-    size_t response_buf_len;    /**< Current data in response_buf */
-
-    uint64_t last_activity_ns;  /**< Timestamp for LRU eviction */
-
-    char comm[TASK_COMM_LEN];   /**< Cached process name */
-    char alpn_proto[16];        /**< Negotiated ALPN protocol (e.g., "h2") */
-} h2_connection_local_t;
-
-/**
- * @brief Per-stream HTTP/2 state (worker-local)
- *
- * Tracks individual HTTP/2 streams within a connection. HTTP/2 multiplexes
- * multiple request/response pairs over a single connection, each identified
- * by a unique stream ID.
- *
- * @par Stream Lifecycle:
- * 1. Created when HEADERS frame opens new stream
- * 2. Accumulates request headers, then request body (if any)
- * 3. Receives response headers, then response body
- * 4. Freed when stream closes (END_STREAM, RST_STREAM, or connection close)
- *
- * @par Lookup Key:
- * Streams are uniquely identified by (pid, ssl_ctx, stream_id).
- */
-typedef struct h2_stream_local {
-    /** @name Stream Identity (Lookup Key) */
-    /** @{ */
-    uint32_t pid;           /**< Process ID */
-    uint64_t ssl_ctx;       /**< SSL context pointer */
-    int32_t stream_id;      /**< HTTP/2 stream identifier (odd=client, even=server) */
-    bool active;            /**< true if slot is in use */
-    /** @} */
-
-    h2_stream_state_t state;  /**< Current stream state (IDLE, OPEN, HALF_CLOSED, etc.) */
-
-    /** @name Request Information */
-    /** @{ */
-    char method[MAX_METHOD_LEN];        /**< HTTP method (GET, POST, etc.) */
-    char path[MAX_PATH_LEN];            /**< Request path with query string */
-    char authority[MAX_HEADER_VALUE];   /**< :authority pseudo-header (host) */
-    char scheme[16];                    /**< :scheme pseudo-header (https) */
-    uint64_t request_time_ns;           /**< Timestamp when request started */
-    bool request_headers_done;          /**< All request headers received */
-    bool request_complete;              /**< Request fully received (including body) */
-    /** @} */
-
-    /** @name Response Information */
-    /** @{ */
-    int status_code;                /**< HTTP status code (200, 404, etc.) */
-    char content_type[256];         /**< Content-Type header value */
-    char content_encoding[64];      /**< Content-Encoding (gzip, br, etc.) */
-    size_t content_length;          /**< Content-Length if specified, 0 otherwise */
-    uint64_t response_time_ns;      /**< Timestamp when response started */
-    bool response_headers_done;     /**< All response headers received */
-    bool response_complete;         /**< Response fully received */
-    /** @} */
-
-    /** @name Headers Storage */
-    /** @{ */
-    http_header_t headers[MAX_HEADERS]; /**< Collected headers array */
-    int header_count;                   /**< Number of headers stored */
-    bool headers_displayed;             /**< Already output to user */
-    /** @} */
-
-    /** @name Body Accumulation */
-    /** @{ */
-    uint8_t *body_buf;      /**< Dynamically allocated body buffer */
-    size_t body_buf_size;   /**< Allocated capacity of body_buf */
-    size_t body_len;        /**< Actual body bytes received */
-    /** @} */
-
-    /** @name Display Metadata */
-    /** @{ */
-    uint64_t delta_ns;          /**< Time delta for output formatting */
-    char comm[TASK_COMM_LEN];   /**< Process name for display */
-    /** @} */
-} h2_stream_local_t;
 
 /** @} */ /* end threading_h2 group */
 
@@ -664,20 +507,11 @@ void pool_free(object_pool_t *pool, void *obj);
 typedef struct worker_state {
     int worker_id;          /**< Worker index (0 to num_workers-1) */
 
-    /** @name HTTP/2 Connection Pool */
-    /** @{ */
-    h2_connection_local_t *h2_connections;  /**< Connection state array */
-    int h2_connection_count;                /**< Active connections */
-    int h2_connection_capacity;             /**< Array capacity */
-    h2_shadow_queue_t h2_shadow_queue;      /**< Deferred cleanup queue */
-    /** @} */
-
-    /** @name HTTP/2 Stream Pool */
-    /** @{ */
-    h2_stream_local_t *h2_streams;  /**< Stream state array */
-    int h2_stream_count;            /**< Active streams */
-    int h2_stream_capacity;         /**< Array capacity */
-    /** @} */
+    /*
+     * HTTP/2 connection and stream pools removed in v0.9.11.
+     * Sessions are now managed per-flow in flow_ctx->parser.h2.
+     * Streams are tracked in flow_ctx->transactions[].
+     */
 
     /** @name Scratch Buffers */
     /** @{ */
@@ -1001,17 +835,6 @@ void dispatcher_set_lifecycle_callback(dispatcher_ctx_t *ctx,
                                         void *user_ctx);
 
 /**
- * @brief Cleanup all state for a terminated process
- *
- * Called when a process exits. Cleans up HTTP/2 sessions, streams,
- * caches, and pending bodies across all workers.
- *
- * @param[in] ctx Dispatcher context
- * @param[in] pid Process ID that exited
- */
-void dispatcher_cleanup_pid(dispatcher_ctx_t *ctx, uint32_t pid);
-
-/**
  * @brief XDP event handler callback
  *
  * Can be registered with bpf_loader_xdp_set_event_callback() to handle
@@ -1208,16 +1031,6 @@ void threading_shutdown(threading_mgr_t *mgr);
 void threading_cleanup(threading_mgr_t *mgr);
 
 /**
- * @brief Print threading statistics
- *
- * Outputs statistics for dispatcher, workers, and output thread
- * including events processed, dropped, and wait cycle breakdown.
- *
- * @param[in] mgr Manager to print stats for
- */
-void threading_print_stats(threading_mgr_t *mgr);
-
-/**
  * @brief Calculate optimal worker count
  *
  * Returns CPU_CORES - 2 (reserving cores for dispatcher and output),
@@ -1299,15 +1112,6 @@ static inline int get_worker_id_ex(uint64_t socket_cookie, uint32_t pid,
 }
 
 /**
- * @brief Legacy get_worker_id for backward compatibility
- *
- * @deprecated Use get_worker_id_ex() with socket_cookie for XDP correlation
- */
-static inline int get_worker_id(uint32_t pid, uint64_t ssl_ctx, int num_workers) {
-    return flow_hash(pid, ssl_ctx) % num_workers;
-}
-
-/**
  * @brief Get current time in nanoseconds
  *
  * Returns CLOCK_MONOTONIC time for consistent timestamps.
@@ -1337,85 +1141,15 @@ void set_current_worker_state(worker_state_t *state);
 
 /** @} */ /* end threading_util group */
 
-/**
- * @defgroup threading_h2mgmt Per-Worker HTTP/2 Management
- * @brief Worker-local HTTP/2 session and stream management
- * @{
+/*
+ * Per-Worker HTTP/2 Management functions removed in v0.9.11.
+ *
+ * HTTP/2 sessions and streams are now managed per-flow:
+ * - Sessions: flow_ctx->parser.h2 (created lazily, freed on FIN)
+ * - Streams: flow_ctx->transactions[] via flow_h2_alloc_stream()
+ *
+ * See flow_context.h for the flow-based API.
  */
-
-/**
- * @name Connection Management
- * @{
- */
-
-/**
- * @brief Get or create HTTP/2 connection state
- *
- * @param[in] state   Worker state
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- * @param[in] create  true to create if not found
- *
- * @return Connection state, or NULL if not found/couldn't create
- */
-h2_connection_local_t *worker_get_h2_connection(worker_state_t *state,
-                                                  uint32_t pid, uint64_t ssl_ctx,
-                                                  bool create);
-
-/**
- * @brief Cleanup HTTP/2 connection and associated streams
- *
- * Destroys nghttp2 session, HPACK inflater, and all streams.
- *
- * @param[in] state Worker state
- * @param[in] conn  Connection to cleanup
- */
-void worker_cleanup_h2_connection(worker_state_t *state, h2_connection_local_t *conn);
-
-/** @} */
-
-/**
- * @name Stream Management
- * @{
- */
-
-/**
- * @brief Get or create HTTP/2 stream state
- *
- * @param[in] state     Worker state
- * @param[in] pid       Process ID
- * @param[in] ssl_ctx   SSL context pointer
- * @param[in] stream_id HTTP/2 stream identifier
- * @param[in] create    true to create if not found
- *
- * @return Stream state, or NULL if not found/couldn't create
- */
-h2_stream_local_t *worker_get_h2_stream(worker_state_t *state,
-                                          uint32_t pid, uint64_t ssl_ctx,
-                                          int32_t stream_id, bool create);
-
-/**
- * @brief Free HTTP/2 stream state
- *
- * @param[in] state  Worker state
- * @param[in] stream Stream to free
- */
-void worker_free_h2_stream(worker_state_t *state, h2_stream_local_t *stream);
-
-/**
- * @brief Cleanup all streams for a connection
- *
- * Called when connection closes to free all associated streams.
- *
- * @param[in] state   Worker state
- * @param[in] pid     Process ID
- * @param[in] ssl_ctx SSL context pointer
- */
-void worker_cleanup_h2_streams_for_connection(worker_state_t *state,
-                                                uint32_t pid, uint64_t ssl_ctx);
-
-/** @} */
-/** @} */ /* end threading_h2mgmt group */
 
 /**
  * @defgroup threading_stats Statistics Functions

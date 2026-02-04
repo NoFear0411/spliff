@@ -44,6 +44,7 @@
 #include "threading.h"
 #include "xdp_ring.h"
 #include "../util/safe_str.h"
+#include "../util/process.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -52,7 +53,14 @@
 #include <errno.h>
 #include <arpa/inet.h>  /* For ntohl/ntohs */
 
-/* liburcu thread registration for RCU-safe memory reclamation (FIX M9) */
+/**
+ * @def RCU_MEMBARRIER
+ * @brief Enable membarrier-based RCU synchronization
+ *
+ * Must be defined before including urcu headers. Uses sys_membarrier()
+ * for efficient cross-CPU memory barriers instead of signal-based IPI.
+ * Required for FIX M9: RCU-safe memory reclamation in flow indexes.
+ */
 #define RCU_MEMBARRIER
 #include <urcu/urcu-memb.h>
 
@@ -256,7 +264,16 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
         if (flow_ctx->ssl_ctx == 0) {
             flow_ctx->ssl_ctx = bpf_event->ssl_ctx;
         }
-        if (bpf_event->comm[0] != '\0') {
+        /*
+         * Process name resolution: Get actual process name from /proc/PID/comm
+         * instead of using thread name from BPF (which can be "Socket Thread"
+         * for Firefox worker threads, etc.)
+         */
+        if (flow_ctx->comm[0] == '\0' && bpf_event->pid != 0) {
+            (void)proc_get_name(bpf_event->pid, flow_ctx->comm, sizeof(flow_ctx->comm));
+        }
+        /* Fallback to BPF comm if /proc lookup failed */
+        if (flow_ctx->comm[0] == '\0' && bpf_event->comm[0] != '\0') {
             safe_strcpy(flow_ctx->comm, sizeof(flow_ctx->comm), bpf_event->comm);
         }
         flow_ctx->uid = bpf_event->uid;
@@ -355,8 +372,12 @@ static int dispatcher_bpf_callback(const ssl_data_event_t *event, void *ctx_arg)
 
     /* Process lifecycle events - handle directly (not dispatched to workers) */
     if (event->event_type == EVENT_PROCESS_EXIT) {
-        /* Cleanup all worker resources for this PID */
-        dispatcher_cleanup_pid(ctx, event->pid);
+        /*
+         * Flow cleanup is now handled by:
+         * 1. BPF FLOW_END on FIN/RST → dispatcher_xdp_event_handler()
+         * 2. flow_terminate() removes from indexes
+         * 3. flow_evict_stale() janitor for timeout
+         */
         return 0;
     }
 
@@ -446,35 +467,6 @@ void dispatcher_set_lifecycle_callback(dispatcher_ctx_t *ctx, process_lifecycle_
     if (!ctx) return;
     ctx->lifecycle_cb = cb;
     ctx->lifecycle_ctx = user_ctx;
-}
-
-/* See declaration in threading.h for documentation */
-void dispatcher_cleanup_pid(dispatcher_ctx_t *ctx, uint32_t pid) {
-    if (!ctx || !ctx->workers) return;
-
-    for (int i = 0; i < ctx->num_workers; i++) {
-        worker_state_t *state = &ctx->workers[i].state;
-        if (!state->h2_connections) continue;
-
-        for (int j = 0; j < state->h2_connection_capacity; j++) {
-            h2_connection_local_t *conn = &state->h2_connections[j];
-
-            /* Skip slots not matching this PID */
-            if (conn->pid != pid) continue;
-
-            /* Atomically mark as DYING - worker will handle cleanup */
-            h2_conn_state_t old_state = atomic_exchange_explicit(
-                &conn->state, H2_CONN_STATE_DYING, memory_order_release);
-
-            /* Restore if slot was already FREE or DYING */
-            if (old_state == H2_CONN_STATE_FREE ||
-                old_state == H2_CONN_STATE_DYING) {
-                atomic_store_explicit(&conn->state, old_state, memory_order_relaxed);
-            }
-            /* If was INITIALIZING, worker's CAS will fail and self-clean */
-            /* If was ACTIVE, worker will detect DYING and move to shadow queue */
-        }
-    }
 }
 
 /** @} */ /* end dispatcher_init */

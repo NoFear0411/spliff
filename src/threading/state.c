@@ -3,31 +3,29 @@
  * @brief Per-worker state management
  *
  * @details Each worker thread has isolated state for:
- * - HTTP/2 connections and streams (nghttp2 sessions, HPACK contexts)
- * - ALPN cache (protocol negotiation results)
- * - Pending body buffers (chunked response assembly)
  * - Decompression scratch buffers
+ * - HTTP/1 body parsing buffers
+ * - nghttp2 session callbacks
  *
  * @par Connection Affinity:
  * The same (pid, ssl_ctx) pair always routes to the same worker via
  * flow_hash(). This eliminates the need for any locking on per-worker
  * state - each worker is the sole accessor of its state.
  *
+ * @par HTTP/2 Session Management (v0.9.11+):
+ * HTTP/2 sessions are now managed per-flow in flow_ctx->parser.h2,
+ * not in per-worker pools. This eliminates:
+ * - Arbitrary 16-slot LRU limits
+ * - Race conditions between dispatcher and worker
+ * - Shadow queue complexity for deferred cleanup
+ *
  * @par Memory Layout (per worker):
  * @code
  *   worker_state_t
  *       │
- *       ├── h2_connections[]      [16 slots, LRU eviction]
- *       │       └── nghttp2_session, HPACK inflater, response_buf
- *       │
- *       ├── h2_streams[]          [128 slots, pre-allocated body_bufs]
- *       │       └── request/response state, headers[], body_buf
- *       │
- *       ├── alpn_cache[]          [32 slots, FIFO eviction]
- *       ├── pending_bodies[]      [4 slots, on-demand accum_buf]
- *       ├── h1_request_cache[]    [16 slots]
  *       ├── decomp_buf            [MAX_BODY_BUFFER, shared scratch]
- *       └── body_buf              [MAX_BODY_BUFFER, HTTP/1 parsing]
+ *       ├── body_buf              [MAX_BODY_BUFFER, HTTP/1 parsing]
+ *       └── h2_callbacks          [nghttp2 session callbacks]
  * @endcode
  *
  * @author spliff authors
@@ -91,42 +89,11 @@ int worker_state_init(worker_state_t *state, int worker_id) {
     memset(state, 0, sizeof(*state));
     state->worker_id = worker_id;
 
-    /* Allocate HTTP/2 connection pool */
-    state->h2_connection_capacity = MAX_H2_SESSIONS_PER_WORKER;
-    size_t conn_size = state->h2_connection_capacity * sizeof(h2_connection_local_t);
-    state->h2_connections = aligned_alloc(64, conn_size);
-    if (!state->h2_connections) {
-        fprintf(stderr, "Worker %d: failed to allocate H2 connections\n", worker_id);
-        goto cleanup;
-    }
-    memset(state->h2_connections, 0, conn_size);
-
-    /* Allocate HTTP/2 stream pool */
-    state->h2_stream_capacity = MAX_H2_STREAMS_PER_WORKER;
-    size_t stream_size = state->h2_stream_capacity * sizeof(h2_stream_local_t);
-    state->h2_streams = aligned_alloc(64, stream_size);
-    if (!state->h2_streams) {
-        fprintf(stderr, "Worker %d: failed to allocate H2 streams\n", worker_id);
-        goto cleanup;
-    }
-    memset(state->h2_streams, 0, stream_size);
-
-    /* Allocate body buffers for each stream slot */
-    h2_stream_local_t *streams = (h2_stream_local_t *)state->h2_streams;
-    for (int i = 0; i < state->h2_stream_capacity; i++) {
-        streams[i].body_buf = aligned_alloc(64, H2_BODY_BUFFER_SIZE);
-        if (!streams[i].body_buf) {
-            fprintf(stderr, "Worker %d: failed to allocate stream %d body buffer\n",
-                    worker_id, i);
-            /* Clean up already allocated buffers */
-            for (int j = 0; j < i; j++) {
-                free(streams[j].body_buf);
-                streams[j].body_buf = NULL;
-            }
-            goto cleanup;
-        }
-        streams[i].body_buf_size = H2_BODY_BUFFER_SIZE;
-    }
+    /*
+     * HTTP/2 connection and stream pools removed in v0.9.11.
+     * Sessions are now managed per-flow in flow_ctx->parser.h2.
+     * Streams are tracked in flow_ctx->transactions[].
+     */
 
     /* Allocate decompression buffer */
     state->decomp_buf_size = MAX_BODY_BUFFER;
@@ -150,10 +117,6 @@ int worker_state_init(worker_state_t *state, int worker_id) {
         goto cleanup;
     }
 
-    /* Note: The actual callback setup will be done by http2 module
-     * when it's updated to use per-worker state. For now, we just
-     * create the callback object. */
-
     state->initialized = true;
     return 0;
 
@@ -162,240 +125,33 @@ cleanup:
     return -1;
 }
 
-/**
- * @defgroup state_shadow Shadow Queue Helpers
- * @brief Per-worker deferred cleanup queue for amortized resource freeing
- * @{
+/*
+ * Shadow queue helpers removed in v0.9.11.
+ *
+ * The shadow queue was used for deferred cleanup of per-worker H2 connection
+ * resources. Now that H2 sessions are per-flow, cleanup happens automatically
+ * when flow_terminate() is called on FIN/RST events.
  */
-
-/**
- * @brief Get number of pending items in shadow queue
- *
- * Works correctly with wraparound due to unsigned integer arithmetic.
- *
- * @param[in] q Shadow queue
- * @return Number of pending cleanup items
- */
-static inline uint32_t h2_shadow_queue_pending(h2_shadow_queue_t *q) {
-    return q->head - q->tail;
-}
-
-/**
- * @brief Push dying session resources to shadow queue
- *
- * O(1) operation with no syscalls. Called during event processing
- * when a connection transitions to DYING state.
- *
- * @param[in] q         Shadow queue
- * @param[in] inflater  HPACK inflater to defer for cleanup
- * @param[in] buf       Response buffer to defer for cleanup
- *
- * @return true if pushed successfully, false if queue full
- */
-static inline bool h2_shadow_queue_push(h2_shadow_queue_t *q,
-                                         struct nghttp2_hd_inflater *inflater,
-                                         uint8_t *buf) {
-    if (h2_shadow_queue_pending(q) >= H2_SHADOW_QUEUE_SIZE - 1) {
-        return false;  /* Queue full - backpressure */
-    }
-
-    uint32_t idx = q->head & H2_SHADOW_QUEUE_MASK;
-    q->items[idx].inflater = inflater;
-    q->items[idx].response_buf = buf;
-    q->head++;
-    return true;
-}
-
-/**
- * @brief Pop one session for cleanup
- *
- * Called during quiet phase of adaptive spin loop. Pops at most one
- * item per call to amortize cleanup cost.
- *
- * @param[in]  q   Shadow queue
- * @param[out] out Cleanup item (filled if returning true)
- *
- * @return true if item popped, false if queue empty
- */
-static inline bool h2_shadow_queue_pop(h2_shadow_queue_t *q,
-                                        h2_deferred_cleanup_t *out) {
-    if (q->tail == q->head) {
-        return false;  /* Empty */
-    }
-
-    uint32_t idx = q->tail & H2_SHADOW_QUEUE_MASK;
-    *out = q->items[idx];
-    q->items[idx].inflater = NULL;
-    q->items[idx].response_buf = NULL;
-    q->tail++;
-    return true;
-}
-
-/**
- * @brief Move DYING connection resources to shadow queue
- *
- * Worker detects DYING state and moves resources to shadow queue
- * for deferred cleanup. Slot immediately becomes FREE for reuse.
- *
- * @param[in] state Worker state
- * @param[in] slot  Connection slot in DYING state
- */
-void worker_move_dying_to_shadow(worker_state_t *state, h2_connection_local_t *slot) {
-    h2_conn_state_t expected = H2_CONN_STATE_DYING;
-    if (!atomic_compare_exchange_strong_explicit(
-            &slot->state, &expected, H2_CONN_STATE_FREE,
-            memory_order_acquire, memory_order_relaxed)) {
-        /* Not in DYING state - nothing to do */
-        return;
-    }
-
-    /* Move resources to shadow queue */
-    if (!h2_shadow_queue_push(&state->h2_shadow_queue,
-                               slot->response_inflater,
-                               slot->response_buf)) {
-        /* Queue full - clean up immediately (rare) */
-        if (slot->response_inflater) {
-            nghttp2_hd_inflate_del(slot->response_inflater);
-        }
-        if (slot->response_buf) {
-            free(slot->response_buf);
-        }
-    }
-
-    /* Clean up nghttp2 session immediately (not in shadow queue) */
-    if (slot->server_session) {
-        nghttp2_session_del(slot->server_session);
-        slot->server_session = NULL;
-    }
-
-    /* Wipe slot metadata - now safe for reuse */
-    slot->response_inflater = NULL;
-    slot->response_buf = NULL;
-    slot->pid = 0;
-    slot->ssl_ctx = 0;
-
-    state->h2_connection_count--;
-}
-
-/**
- * @brief Amortized cleanup with backpressure handling
- *
- * Called during quiet phase of worker loop. Cleans up one or more
- * sessions depending on queue fill level to prevent unbounded growth.
- *
- * @param[in] state Worker state
- *
- * @return Number of sessions cleaned (for metrics)
- */
-int worker_cleanup_deferred(worker_state_t *state) {
-    h2_deferred_cleanup_t item;
-
-    /* Backpressure: clean more if queue is filling up */
-    uint32_t pending = h2_shadow_queue_pending(&state->h2_shadow_queue);
-    int credits = 1;
-    if (pending > H2_SHADOW_QUEUE_SIZE / 2) credits = 2;
-    if (pending > H2_SHADOW_QUEUE_SIZE * 3 / 4) credits = 4;
-
-    int cleaned = 0;
-    while (credits-- > 0 && h2_shadow_queue_pop(&state->h2_shadow_queue, &item)) {
-        if (item.inflater) nghttp2_hd_inflate_del(item.inflater);
-        if (item.response_buf) free(item.response_buf);
-        cleaned++;
-    }
-    return cleaned;
-}
-
-/** @} */ /* end state_shadow */
 
 /**
  * @brief Cleanup per-worker state
  *
  * Frees all allocated resources for a worker including:
- * - nghttp2 sessions and HPACK inflaters
- * - HTTP/2 connection response buffers
- * - Stream body buffers
- * - Shadow queue pending items
  * - Decompression and parsing scratch buffers
  * - nghttp2 callback structure
  *
- * @par Atomic State Machine:
- * During shutdown, we force all active/dying connections to shadow queue,
- * then drain the queue completely. This ensures no resources leak even
- * if cleanup races with allocation.
+ * HTTP/2 sessions are now managed per-flow and cleaned up by
+ * flow_terminate() on FIN/RST events. See flow_context.c.
  */
 void worker_state_cleanup(worker_state_t *state) {
     if (!state) {
         return;
     }
 
-    /* Free HTTP/2 stream body buffers */
-    if (state->h2_streams) {
-        h2_stream_local_t *streams = (h2_stream_local_t *)state->h2_streams;
-        for (int i = 0; i < state->h2_stream_capacity; i++) {
-            if (streams[i].body_buf) {
-                free(streams[i].body_buf);
-                streams[i].body_buf = NULL;
-            }
-        }
-    }
-
-    /* Force all active/dying connections to shadow queue then drain */
-    if (state->h2_connections) {
-        h2_connection_local_t *conns = (h2_connection_local_t *)state->h2_connections;
-
-        /* Step 1: Move all non-FREE connections to shadow queue */
-        for (int i = 0; i < state->h2_connection_capacity; i++) {
-            h2_conn_state_t current = atomic_load_explicit(&conns[i].state,
-                                                            memory_order_relaxed);
-
-            if (current == H2_CONN_STATE_ACTIVE ||
-                current == H2_CONN_STATE_DYING ||
-                current == H2_CONN_STATE_INITIALIZING) {
-
-                /* Push resources to shadow queue */
-                h2_shadow_queue_push(&state->h2_shadow_queue,
-                                     conns[i].response_inflater,
-                                     conns[i].response_buf);
-
-                /* Free session directly (not in shadow queue) */
-                if (conns[i].server_session) {
-                    nghttp2_session_del(conns[i].server_session);
-                    conns[i].server_session = NULL;
-                }
-
-                /* Wipe slot */
-                conns[i].response_inflater = NULL;
-                conns[i].response_buf = NULL;
-            }
-
-            /* Mark slot as FREE */
-            atomic_store_explicit(&conns[i].state, H2_CONN_STATE_FREE,
-                                  memory_order_relaxed);
-        }
-
-        /* Step 2: FINAL FLUSH - drain entire shadow queue */
-        h2_deferred_cleanup_t item;
-        int drained = 0;
-        while (h2_shadow_queue_pop(&state->h2_shadow_queue, &item)) {
-            if (item.inflater) nghttp2_hd_inflate_del(item.inflater);
-            if (item.response_buf) free(item.response_buf);
-            drained++;
-        }
-
-        if (drained > 0 && g_config.debug_mode) {
-            fprintf(stderr, "DEBUG: worker %d drained %d items from shadow queue\n",
-                    state->worker_id, drained);
-        }
-
-        free(state->h2_connections);
-        state->h2_connections = NULL;
-    }
-
-    /* Free HTTP/2 stream pool */
-    if (state->h2_streams) {
-        free(state->h2_streams);
-        state->h2_streams = NULL;
-    }
+    /*
+     * HTTP/2 connection and stream pools removed in v0.9.11.
+     * Sessions are now cleaned up when flow_terminate() is called.
+     */
 
     /* Free buffers */
     if (state->decomp_buf) {
@@ -417,319 +173,14 @@ void worker_state_cleanup(worker_state_t *state) {
     state->initialized = false;
 }
 
-/**
- * @defgroup state_h2conn HTTP/2 Connection Management
- * @brief Worker-local HTTP/2 connection pool operations
- * @{
+/*
+ * HTTP/2 Connection and Stream Management functions removed in v0.9.11.
+ *
+ * Sessions are now managed per-flow in flow_ctx->parser.h2:
+ * - flow_h2_session_init() creates nghttp2 session
+ * - flow_h2_alloc_stream() allocates transaction for stream
+ * - flow_h2_find_stream() looks up stream by ID
+ * - flow_terminate() cleans up session on FIN/RST
+ *
+ * See flow_context.c for the flow-based implementation.
  */
-
-/**
- * @brief Find or create HTTP/2 connection for (pid, ssl_ctx)
- *
- * Looks up existing connection in worker's pool. If not found and
- * create=true, allocates a new slot (evicting LRU if pool is full).
- *
- * @par LRU Eviction:
- * When pool is full, the connection with oldest last_activity_ns is
- * evicted. This cleans up associated streams and nghttp2 resources.
- *
- * @par New Connection Setup:
- * - Allocates response reassembly buffer (H2_REASSEMBLY_BUF_SIZE)
- * - Creates HPACK inflater for response header decoding
- * - nghttp2_session is created lazily when first frame is processed
- *
- * @par Atomic State Machine (Two-Phase Commit):
- * 1. CAS FREE → INITIALIZING (claim slot atomically)
- * 2. Allocate resources
- * 3. CAS INITIALIZING → ACTIVE (publish resources)
- * If step 3 CAS fails, dispatcher killed us - self-cleanup.
- */
-h2_connection_local_t *worker_get_h2_connection(worker_state_t *state,
-                                                  uint32_t pid, uint64_t ssl_ctx,
-                                                  bool create) {
-    if (!state || !state->h2_connections) {
-        return NULL;
-    }
-
-    h2_connection_local_t *conns = (h2_connection_local_t *)state->h2_connections;
-
-    /* 1. Check existing active connections (HOT PATH - relaxed load) */
-    for (int i = 0; i < state->h2_connection_capacity; i++) {
-        h2_conn_state_t current = atomic_load_explicit(&conns[i].state,
-                                                        memory_order_relaxed);
-        if (current == H2_CONN_STATE_ACTIVE &&
-            conns[i].pid == pid &&
-            conns[i].ssl_ctx == ssl_ctx) {
-            conns[i].last_activity_ns = get_time_ns();
-            return &conns[i];
-        }
-    }
-
-    if (!create) {
-        return NULL;
-    }
-
-    /* 2. Find free slot and transition to INITIALIZING */
-    h2_connection_local_t *slot = NULL;
-    for (int i = 0; i < state->h2_connection_capacity; i++) {
-        h2_conn_state_t expected = H2_CONN_STATE_FREE;
-        if (atomic_compare_exchange_strong_explicit(
-                &conns[i].state, &expected, H2_CONN_STATE_INITIALIZING,
-                memory_order_relaxed, memory_order_relaxed)) {
-            slot = &conns[i];
-            break;
-        }
-    }
-
-    /* If no free slot, try to evict LRU (only ACTIVE connections) */
-    if (!slot) {
-        uint64_t oldest_time = UINT64_MAX;
-        int oldest_idx = -1;
-        for (int i = 0; i < state->h2_connection_capacity; i++) {
-            h2_conn_state_t current = atomic_load_explicit(&conns[i].state,
-                                                            memory_order_relaxed);
-            if (current == H2_CONN_STATE_ACTIVE &&
-                conns[i].last_activity_ns < oldest_time) {
-                oldest_time = conns[i].last_activity_ns;
-                oldest_idx = i;
-            }
-        }
-
-        if (oldest_idx >= 0) {
-            /* Try to mark LRU slot as DYING for cleanup */
-            h2_conn_state_t expected = H2_CONN_STATE_ACTIVE;
-            if (atomic_compare_exchange_strong_explicit(
-                    &conns[oldest_idx].state, &expected, H2_CONN_STATE_DYING,
-                    memory_order_release, memory_order_relaxed)) {
-                /* Successfully marked for cleanup - move to shadow queue */
-                worker_move_dying_to_shadow(state, &conns[oldest_idx]);
-
-                /* Now claim the freed slot */
-                expected = H2_CONN_STATE_FREE;
-                if (atomic_compare_exchange_strong_explicit(
-                        &conns[oldest_idx].state, &expected, H2_CONN_STATE_INITIALIZING,
-                        memory_order_relaxed, memory_order_relaxed)) {
-                    slot = &conns[oldest_idx];
-                }
-            }
-        }
-    }
-
-    if (!slot) {
-        return NULL;  /* No free slots available */
-    }
-
-    /* 3. Allocate resources (slot is INITIALIZING - we own it) */
-    slot->pid = pid;
-    slot->ssl_ctx = ssl_ctx;
-    slot->last_activity_ns = get_time_ns();
-    slot->client_preface_seen = false;
-    slot->server_settings_seen = false;
-    slot->response_buf_len = 0;
-    slot->server_session = NULL;
-    slot->comm[0] = '\0';
-    slot->alpn_proto[0] = '\0';
-
-    /*
-     * FIX M6: Use aligned_alloc for cache-line alignment of 65KB response buffer.
-     * Cache-line alignment (64 bytes) improves memcpy/memset performance by
-     * avoiding false sharing and enabling SIMD optimizations.
-     * H2_REASSEMBLY_BUF_SIZE (65536) is divisible by 64, satisfying aligned_alloc.
-     */
-    slot->response_buf = aligned_alloc(64, H2_REASSEMBLY_BUF_SIZE);
-    if (!slot->response_buf) {
-        atomic_store_explicit(&slot->state, H2_CONN_STATE_FREE, memory_order_relaxed);
-        return NULL;
-    }
-    memset(slot->response_buf, 0, H2_REASSEMBLY_BUF_SIZE);
-
-    if (nghttp2_hd_inflate_new(&slot->response_inflater) != 0) {
-        free(slot->response_buf);
-        slot->response_buf = NULL;
-        atomic_store_explicit(&slot->state, H2_CONN_STATE_FREE, memory_order_relaxed);
-        return NULL;
-    }
-
-    /* 4. THE HANDSHAKE: Transition INITIALIZING → ACTIVE */
-    h2_conn_state_t expected = H2_CONN_STATE_INITIALIZING;
-    if (!atomic_compare_exchange_strong_explicit(
-            &slot->state, &expected, H2_CONN_STATE_ACTIVE,
-            memory_order_release, memory_order_acquire)) {
-        /* RACE DETECTED: Dispatcher marked us DYING while allocating.
-         * Clean up our own resources (we own cleanup responsibility). */
-        nghttp2_hd_inflate_del(slot->response_inflater);
-        slot->response_inflater = NULL;
-        free(slot->response_buf);
-        slot->response_buf = NULL;
-        atomic_store_explicit(&slot->state, H2_CONN_STATE_FREE, memory_order_relaxed);
-        return NULL;
-    }
-
-    state->h2_connection_count++;
-    return slot;
-}
-
-/**
- * @brief Cleanup HTTP/2 connection and associated resources
- *
- * Destroys nghttp2 session, HPACK inflater, response buffer, and
- * all streams associated with this connection.
- *
- * @par Atomic State Machine:
- * Only cleans up connections in ACTIVE state. Marks as DYING and
- * moves resources to shadow queue for deferred cleanup.
- */
-void worker_cleanup_h2_connection(worker_state_t *state, h2_connection_local_t *conn) {
-    if (!state || !conn) {
-        return;
-    }
-
-    /* Only cleanup ACTIVE connections */
-    h2_conn_state_t expected = H2_CONN_STATE_ACTIVE;
-    if (!atomic_compare_exchange_strong_explicit(
-            &conn->state, &expected, H2_CONN_STATE_DYING,
-            memory_order_release, memory_order_relaxed)) {
-        /* Not ACTIVE - already cleaned or being cleaned */
-        return;
-    }
-
-    /* Cleanup associated streams first */
-    worker_cleanup_h2_streams_for_connection(state, conn->pid, conn->ssl_ctx);
-
-    /* Move resources to shadow queue for deferred cleanup */
-    worker_move_dying_to_shadow(state, conn);
-}
-
-/** @} */ /* end state_h2conn */
-
-/**
- * @defgroup state_h2stream HTTP/2 Stream Management
- * @brief Worker-local HTTP/2 stream pool operations
- * @{
- */
-
-/**
- * @brief Find or create HTTP/2 stream for (pid, ssl_ctx, stream_id)
- *
- * Looks up existing stream in worker's pool. If not found and create=true,
- * allocates a new slot. Prefers evicting closed streams before failing.
- *
- * @par Body Buffer Preservation:
- * Stream body_bufs are pre-allocated during worker_state_init() and
- * preserved across stream reuse. Only the metadata is cleared.
- *
- * @par Eviction Strategy:
- * 1. First try to find an empty (inactive) slot
- * 2. If none, evict a stream in H2_STREAM_CLOSED state
- * 3. If still none, return NULL (caller should retry later)
- */
-h2_stream_local_t *worker_get_h2_stream(worker_state_t *state,
-                                          uint32_t pid, uint64_t ssl_ctx,
-                                          int32_t stream_id, bool create) {
-    if (!state || !state->h2_streams) {
-        return NULL;
-    }
-
-    h2_stream_local_t *streams = (h2_stream_local_t *)state->h2_streams;
-
-    /* Find existing */
-    for (int i = 0; i < state->h2_stream_capacity; i++) {
-        if (streams[i].active &&
-            streams[i].pid == pid &&
-            streams[i].ssl_ctx == ssl_ctx &&
-            streams[i].stream_id == stream_id) {
-            return &streams[i];
-        }
-    }
-
-    if (!create) {
-        return NULL;
-    }
-
-    /* Find empty slot */
-    h2_stream_local_t *slot = NULL;
-    for (int i = 0; i < state->h2_stream_capacity; i++) {
-        if (!streams[i].active) {
-            slot = &streams[i];
-            break;
-        }
-    }
-
-    /* If no empty slot, evict closed stream */
-    if (!slot) {
-        for (int i = 0; i < state->h2_stream_capacity; i++) {
-            if (streams[i].state == H2_STREAM_CLOSED) {
-                worker_free_h2_stream(state, &streams[i]);
-                slot = &streams[i];
-                break;
-            }
-        }
-    }
-
-    if (!slot) {
-        return NULL;
-    }
-
-    /* Initialize stream (body_buf already allocated in state_init) */
-    uint8_t *saved_body_buf = slot->body_buf;
-    size_t saved_body_buf_size = slot->body_buf_size;
-
-    memset(slot, 0, sizeof(*slot));
-    slot->pid = pid;
-    slot->ssl_ctx = ssl_ctx;
-    slot->stream_id = stream_id;
-    slot->active = true;
-    slot->state = H2_STREAM_OPEN;
-    slot->body_buf = saved_body_buf;
-    slot->body_buf_size = saved_body_buf_size;
-    slot->body_len = 0;
-
-    state->h2_stream_count++;
-    return slot;
-}
-
-/**
- * @brief Free HTTP/2 stream (clear metadata but preserve body_buf)
- *
- * Clears all stream state except the pre-allocated body_buf, which
- * is reused for the next stream in this slot.
- */
-void worker_free_h2_stream(worker_state_t *state, h2_stream_local_t *stream) {
-    if (!state || !stream || !stream->active) {
-        return;
-    }
-
-    /* Preserve body_buf - it's pre-allocated */
-    uint8_t *saved_body_buf = stream->body_buf;
-    size_t saved_body_buf_size = stream->body_buf_size;
-
-    memset(stream, 0, sizeof(*stream));
-    stream->body_buf = saved_body_buf;
-    stream->body_buf_size = saved_body_buf_size;
-
-    state->h2_stream_count--;
-}
-
-/**
- * @brief Cleanup all streams for a connection
- *
- * Called when connection closes. Frees all streams matching the
- * (pid, ssl_ctx) pair.
- */
-void worker_cleanup_h2_streams_for_connection(worker_state_t *state,
-                                                uint32_t pid, uint64_t ssl_ctx) {
-    if (!state || !state->h2_streams) {
-        return;
-    }
-
-    h2_stream_local_t *streams = (h2_stream_local_t *)state->h2_streams;
-    for (int i = 0; i < state->h2_stream_capacity; i++) {
-        if (streams[i].active &&
-            streams[i].pid == pid &&
-            streams[i].ssl_ctx == ssl_ctx) {
-            worker_free_h2_stream(state, &streams[i]);
-        }
-    }
-}
-
-/** @} */ /* end state_h2stream */

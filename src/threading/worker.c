@@ -552,36 +552,13 @@ static void worker_drain_queues(worker_ctx_t *ctx) {
     }
 }
 
-/* Forward declarations from state.c */
-extern void worker_move_dying_to_shadow(worker_state_t *state, h2_connection_local_t *slot);
-extern int worker_cleanup_deferred(worker_state_t *state);
-
-/**
- * @brief Check for DYING connections and move to shadow queue
+/*
+ * worker_check_dying_connections() and worker_cleanup_deferred() removed in v0.9.11.
  *
- * Scans connection pool for connections marked DYING by dispatcher
- * and moves their resources to the shadow queue. This is O(N) but
- * the pool is small (16 slots) and only needs to run occasionally.
- *
- * @param[in] state Worker state
- * @return Number of connections moved to shadow queue
+ * These functions were for the legacy per-worker H2 connection pool cleanup.
+ * HTTP/2 sessions are now managed per-flow in flow_ctx->parser.h2 and cleaned
+ * up automatically by flow_terminate() on FIN/RST events.
  */
-static int worker_check_dying_connections(worker_state_t *state) {
-    if (!state->h2_connections) return 0;
-
-    int moved = 0;
-    h2_connection_local_t *conns = (h2_connection_local_t *)state->h2_connections;
-
-    for (int i = 0; i < state->h2_connection_capacity; i++) {
-        h2_conn_state_t current = atomic_load_explicit(&conns[i].state,
-                                                        memory_order_relaxed);
-        if (current == H2_CONN_STATE_DYING) {
-            worker_move_dying_to_shadow(state, &conns[i]);
-            moved++;
-        }
-    }
-    return moved;
-}
 
 /**
  * @brief NAPI-style main worker processing loop
@@ -947,9 +924,6 @@ static void worker_loop(worker_ctx_t *ctx) {
         uint64_t now_ns = get_time_ns();
         work_done += deferred_drain(&ctx->deferred, now_ns);
 
-        /* Check for DYING connections and move to shadow queue */
-        worker_check_dying_connections(&ctx->state);
-
         /* Update events processed counter */
         if (work_done > 0) {
             atomic_fetch_add(&ctx->events_processed, work_done);
@@ -957,9 +931,6 @@ static void worker_loop(worker_ctx_t *ctx) {
 
         /* NAPI decision: sleep only if caught up with traffic */
         if (work_done < NAPI_BUDGET) {
-            /* QUIET PHASE: Amortized cleanup with backpressure */
-            worker_cleanup_deferred(&ctx->state);
-
             /* Select timeout based on queue state */
             int timeout = (atomic_load(&ctx->deferred_count) > 0)
                          ? EPOLL_RETRY_TIMEOUT_MS   /* Short timeout for fast retry */
