@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(spliff
-    VERSION 0.9.10
+    VERSION 0.9.11
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C
@@ -538,6 +538,7 @@ message(STATUS "Found strip: ${STRIP_EXECUTABLE}")
 set(SPLIFF_SOURCES
     src/main.c
     src/util/safe_str.c
+    src/util/process.c
     src/content/signatures.c
     src/content/decompressor.c
     # Protocol parsing and detection
@@ -760,6 +761,8 @@ target_link_libraries(test_http1 PRIVATE
     PkgConfig::NGHTTP2
     PkgConfig::CK
     PkgConfig::JEMALLOC
+    PkgConfig::LIBURCU
+    PkgConfig::LIBURCU_CDS
     ${ZLIB_TARGET}
     PkgConfig::ZSTD
     PkgConfig::BROTLI
@@ -791,6 +794,8 @@ target_link_libraries(test_http2 PRIVATE
     PkgConfig::NGHTTP2
     PkgConfig::CK
     PkgConfig::JEMALLOC
+    PkgConfig::LIBURCU
+    PkgConfig::LIBURCU_CDS
     ${ZLIB_TARGET}
     PkgConfig::ZSTD
     PkgConfig::BROTLI
@@ -845,6 +850,8 @@ target_link_libraries(test_flow_context PRIVATE
     PkgConfig::NGHTTP2
     PkgConfig::CK
     PkgConfig::JEMALLOC
+    PkgConfig::LIBURCU
+    PkgConfig::LIBURCU_CDS
     ${ZLIB_TARGET}
     PkgConfig::ZSTD
     PkgConfig::BROTLI
@@ -892,6 +899,8 @@ target_link_libraries(test_detector PRIVATE
     PkgConfig::NGHTTP2
     PkgConfig::CK
     PkgConfig::JEMALLOC
+    PkgConfig::LIBURCU
+    PkgConfig::LIBURCU_CDS
     ${ZLIB_TARGET}
     PkgConfig::ZSTD
     PkgConfig::BROTLI
