@@ -570,6 +570,9 @@ set(SPLIFF_SOURCES
     src/memory/mirrored_buffer.c
     src/memory/hugepage.c
     src/memory/numa_alloc.c
+    # Ring buffer infrastructure (Phase 2 - SPMC transport)
+    src/ring/spmc_ring.c
+    src/ring/affinity.c
 )
 
 # ============================================================================
@@ -838,6 +841,51 @@ add_executable(test_mirrored_buffer EXCLUDE_FROM_ALL
 target_include_directories(test_mirrored_buffer PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 add_test(NAME mirrored_buffer_tests COMMAND test_mirrored_buffer)
 
+# SPMC ring tests (Phase 2 - lock-free transport)
+add_executable(test_spmc_ring EXCLUDE_FROM_ALL
+    tests/test_spmc_ring.c
+    src/ring/spmc_ring.c
+)
+target_include_directories(test_spmc_ring PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_spmc_ring PRIVATE
+    PkgConfig::CK
+    pthread
+)
+add_test(NAME spmc_ring_tests COMMAND test_spmc_ring)
+
+# Affinity + MPSC overflow tests (Phase 2 - worker routing)
+add_executable(test_affinity EXCLUDE_FROM_ALL
+    tests/test_affinity.c
+    src/ring/affinity.c
+)
+target_include_directories(test_affinity PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_affinity PRIVATE
+    PkgConfig::CK
+    pthread
+)
+add_test(NAME affinity_tests COMMAND test_affinity)
+
+# Concurrent stress tests (Phase 2 - lock-free verification)
+add_executable(test_concurrent EXCLUDE_FROM_ALL
+    tests/test_concurrent.c
+    src/ring/spmc_ring.c
+    src/ring/affinity.c
+)
+target_include_directories(test_concurrent PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_concurrent PRIVATE
+    PkgConfig::CK
+    pthread
+)
+add_test(NAME concurrent_tests COMMAND test_concurrent)
+
+# Backpressure state machine tests (Phase 2 - flow control)
+add_executable(test_backpressure EXCLUDE_FROM_ALL
+    tests/test_backpressure.c
+    src/ring/backpressure.c
+)
+target_include_directories(test_backpressure PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+add_test(NAME backpressure_tests COMMAND test_backpressure)
+
 # Flow context tests (P0 - core state management)
 add_executable(test_flow_context EXCLUDE_FROM_ALL
     tests/test_flow_context.c
@@ -947,7 +995,7 @@ add_test(NAME display_tests COMMAND test_display)
 # Custom target to build all tests
 # Note: test_http1 and test_http2 need API updates for current codebase
 add_custom_target(build_tests
-    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_decompressor test_detector test_websocket test_display
+    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_mirrored_buffer test_spmc_ring test_affinity test_concurrent test_backpressure test_decompressor test_detector test_websocket test_display
     # Note: test_flow_context excluded until API updated for CK hash tables (v0.9.9)
     COMMENT "Building all test executables..."
 )
