@@ -128,7 +128,8 @@ typedef enum {
  *   0x10-0x1F  XDP / packet layer
  *   0x20-0x2F  TLS / uprobe layer
  *   0x30-0x3F  Socket / sockops layer
- *   0x40-0x5F  Kernel / kprobe layer
+ *   0x40-0x4F  Kernel / kprobe layer (tcp_sendmsg, dns, etc.)
+ *   0x50-0x5F  io_uring operations (create, connect, sendmsg — evasion detection)
  *   0x60-0x9F  Protocol modules (DNS, QUIC, gRPC, HTTP/3, ...)
  *   0xA0-0xAF  Process lifecycle (exec, exit, fork, privesc)
  *   0xB0-0xBF  File integrity (open, write, exec, delete)
