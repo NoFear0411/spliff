@@ -49,6 +49,7 @@ _CPack_Packages/
 .claude/
 CLAUDE.md
 **/CLAUDE.md
+.cache
 
 # OS files
 .DS_Store
@@ -63,6 +64,7 @@ Thumbs.db
 *.crt
 .env
 .env.*
+research/
 
 # Old/legacy files (pre-refactor)
 sslsniff.c
