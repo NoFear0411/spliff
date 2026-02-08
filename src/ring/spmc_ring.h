@@ -14,7 +14,8 @@
  * - Three-stage batch enqueue: data copy → fence → publish
  * - CAS backoff via ck_pr_stall() prevents coherency storms
  * - Software prefetching on predictable ring access patterns
- * - FAM allocation: header + slots in one contiguous hugepage-friendly block
+ * - Mirrored buffer slots: zero-copy wrap-around for batch operations
+ * - Graceful fallback to aligned heap for small or oversized capacities
  *
  * @par Atomics
  * All atomic operations use Concurrency Kit (ck_pr_*) primitives, not GCC
@@ -50,6 +51,7 @@
 #include <ck_pr.h>
 
 #include "../memory/alignment.h"
+#include "../memory/mirrored_buffer.h"
 #include "ring_event.h"
 
 /**
@@ -75,6 +77,14 @@
 #ifndef SPMC_BATCH_MAX_RETRIES
 #define SPMC_BATCH_MAX_RETRIES      3
 #endif
+
+/*
+ * Sanity: default capacity must leave room for batch operations.
+ * Production rings should be at least 4× batch max. Capacity < 64
+ * is permitted for unit tests but not recommended in production.
+ */
+_Static_assert(SPMC_RING_DEFAULT_CAPACITY >= SPMC_BATCH_MAX * 4,
+               "Default capacity must be at least 4x max batch size");
 
 /*============================================================================
  * Ring Slot (64 bytes = 1 hardware cache line)
@@ -103,19 +113,22 @@ _Static_assert(sizeof(spmc_slot_t) == 64,
                "spmc_slot_t must be exactly 64 bytes (1 hardware cache line)");
 
 /*============================================================================
- * Ring Buffer Structure (FAM, cache-line isolated)
+ * Ring Buffer Structure (cache-line isolated, separate slot storage)
  *============================================================================*/
 
 /**
  * @brief SPMC ring with cache-line-isolated hot fields
  *
- * @par Memory Layout (3 × 128-byte project cache lines + FAM slots)
+ * @par Memory Layout (3 × 128-byte project cache lines)
  * @code
  *   [0x000..0x07F]  Producer: head, head_mask, cached_tail
  *   [0x080..0x0FF]  Consumer: tail, tail_mask
- *   [0x100..0x17F]  Config:   capacity, drops, dequeues, cas_retries
- *   [0x180...]      Slots:    FAM, contiguous with header
+ *   [0x100..0x17F]  Config:   capacity, stats, slots ptr, slot_buf ptr
  * @endcode
+ *
+ * Slot storage is allocated separately from the header:
+ * - Capacities 1024..8192: mirrored buffer (zero-copy wrap-around)
+ * - Smaller/larger capacities: aligned heap allocation (fallback)
  *
  * @warning Allocate via spmc_ring_create() which handles alignment.
  * @warning All threads must stop before spmc_ring_destroy().
@@ -153,13 +166,26 @@ typedef struct spmc_ring {
     uint64_t dequeues;                  /**< Successful dequeues */
     uint64_t cas_retries;               /**< Consumer CAS failures */
 
-    /** Explicit padding so FAM slots[] starts at next 128-byte boundary */
-    char _stats_pad[CACHELINE_SIZE - 4 * sizeof(uint64_t)];
+    /**
+     * @brief Pointer to slot array (mirrored or heap-allocated)
+     *
+     * Lives on the config (read-only) line, NOT producer or consumer line,
+     * to avoid false sharing: both producer and consumers read this pointer
+     * on every operation, but neither writes to this cache line.
+     */
+    spmc_slot_t *slots;
 
-    /*--- Slot array (FAM, contiguous with header) -------------------------*/
+    /**
+     * @brief Mirrored buffer handle owning slot storage, NULL for heap slots
+     *
+     * When non-NULL, spmc_ring_destroy() calls mirrored_buffer_destroy()
+     * to unmap the double-mapped virtual memory and close the memfd.
+     * When NULL, slots were allocated via aligned_alloc() and freed directly.
+     */
+    mirrored_buffer_t *slot_buf;
 
-    /** Ring slots - flexible array member, allocated in single block */
-    spmc_slot_t slots[];
+    /** Explicit padding to fill config cache line */
+    char _stats_pad[CACHELINE_SIZE - 4 * sizeof(uint64_t) - 2 * sizeof(void *)];
 
 } spmc_ring_t;
 
@@ -170,7 +196,11 @@ typedef struct spmc_ring {
 /**
  * @brief Create an SPMC ring buffer
  *
- * Single contiguous allocation (header + slots) for hugepage friendliness.
+ * Allocates the ring header (384 bytes, cache-line aligned) and slot
+ * storage separately. Slot storage uses a mirrored buffer when the
+ * total slot size falls within [MIN_BUFFER_SIZE, MAX_BUFFER_SIZE],
+ * otherwise falls back to aligned heap allocation.
+ *
  * Initializes Vyukov slot sequences: slots[i].seq = i.
  *
  * @param capacity Number of slots (must be power of 2, >= 4)
@@ -313,6 +343,11 @@ static inline uint64_t spmc_ring_stat_dequeues(const spmc_ring_t *ring) {
 /** Total consumer CAS failures (contention indicator) */
 static inline uint64_t spmc_ring_stat_cas_retries(const spmc_ring_t *ring) {
     return ring ? ck_pr_load_64(&((spmc_ring_t *)ring)->cas_retries) : 0;
+}
+
+/** Check if ring uses mirrored buffer for slot storage */
+static inline bool spmc_ring_is_mirrored(const spmc_ring_t *ring) {
+    return ring && ring->slot_buf != NULL;
 }
 
 /** @} */ /* end of spmc_ring group */

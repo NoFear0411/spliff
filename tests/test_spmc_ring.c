@@ -102,8 +102,20 @@ static void test_ring_capacity_isolation(void) {
 }
 
 static void test_ring_slots_offset(void) {
-    TEST("Ring: slots[] FAM at offset 384");
-    CHECK(offsetof(spmc_ring_t, slots) == 384, "slots must be at offset 384");
+    TEST("Ring: slots ptr on config line (offset 288)");
+    CHECK(offsetof(spmc_ring_t, slots) == 288, "slots ptr must be at offset 288");
+    PASS();
+}
+
+static void test_ring_slot_buf_offset(void) {
+    TEST("Ring: slot_buf ptr on config line (offset 296)");
+    CHECK(offsetof(spmc_ring_t, slot_buf) == 296, "slot_buf must be at offset 296");
+    PASS();
+}
+
+static void test_ring_header_size(void) {
+    TEST("Ring: header is 384 bytes (3 cache lines)");
+    CHECK(sizeof(spmc_ring_t) == 384, "ring header must be 384 bytes");
     PASS();
 }
 
@@ -212,6 +224,64 @@ static void test_create_reject_too_small(void) {
 static void test_destroy_null_safe(void) {
     TEST("Destroy NULL is safe no-op");
     spmc_ring_destroy(NULL); /* Should not crash */
+    PASS();
+}
+
+static void test_create_mirrored_path(void) {
+    TEST("Create ring with mirrored buffer (capacity=1024)");
+    /* 1024 slots × 64 bytes = 64KB = MIN_BUFFER_SIZE → mirrored path */
+    spmc_ring_t *ring = spmc_ring_create(1024);
+    CHECK(ring != NULL, "create with cap=1024 failed");
+    CHECK(spmc_ring_get_capacity(ring) == 1024, "capacity should be 1024");
+    CHECK(spmc_ring_is_mirrored(ring), "should use mirrored buffer");
+    CHECK(ring->slots != NULL, "slots pointer must be set");
+    CHECK(ring->slot_buf != NULL, "slot_buf must be set");
+
+    /* Verify basic operation through mirrored buffer */
+    ring_event_t ev = { .socket_cookie = 0xBEEF };
+    CHECK(spmc_ring_enqueue(ring, &ev), "enqueue failed");
+    ring_event_t out = {0};
+    CHECK(spmc_ring_dequeue(ring, &out), "dequeue failed");
+    CHECK(out.socket_cookie == 0xBEEF, "data mismatch");
+
+    spmc_ring_destroy(ring);
+    PASS();
+}
+
+static void test_create_heap_fallback(void) {
+    TEST("Create small ring uses heap fallback (capacity=4)");
+    /* 4 slots × 64 bytes = 256 bytes < MIN_BUFFER_SIZE → heap path */
+    spmc_ring_t *ring = spmc_ring_create(4);
+    CHECK(ring != NULL, "create with cap=4 failed");
+    CHECK(!spmc_ring_is_mirrored(ring), "small ring should NOT be mirrored");
+    CHECK(ring->slots != NULL, "slots pointer must be set");
+    CHECK(ring->slot_buf == NULL, "slot_buf must be NULL for heap path");
+    spmc_ring_destroy(ring);
+    PASS();
+}
+
+static void test_mirrored_wraparound(void) {
+    TEST("Mirrored ring wrap-around correctness");
+    spmc_ring_t *ring = spmc_ring_create(1024);
+    CHECK(ring != NULL, "create failed");
+    CHECK(spmc_ring_is_mirrored(ring), "should be mirrored");
+
+    /* Fill and drain 3 full cycles (3072 enqueue/dequeue on 1024-slot ring) */
+    ring_event_t ev, out;
+    for (int cycle = 0; cycle < 3; cycle++) {
+        for (int i = 0; i < 1024; i++) {
+            ev = (ring_event_t){ .socket_cookie = (uint64_t)(cycle * 1024 + i) };
+            CHECK(spmc_ring_enqueue(ring, &ev), "enqueue failed at wrap");
+        }
+        for (int i = 0; i < 1024; i++) {
+            CHECK(spmc_ring_dequeue(ring, &out), "dequeue failed at wrap");
+            CHECK(out.socket_cookie == (uint64_t)(cycle * 1024 + i),
+                  "data wrong at wrap");
+        }
+    }
+
+    CHECK(spmc_ring_empty(ring), "should be empty after cycles");
+    spmc_ring_destroy(ring);
     PASS();
 }
 
@@ -479,6 +549,8 @@ int main(void) {
     test_ring_tail_isolation();
     test_ring_capacity_isolation();
     test_ring_slots_offset();
+    test_ring_slot_buf_offset();
+    test_ring_header_size();
 
     printf("\n--- Routing Word ---\n");
     test_route_pack_unpack();
@@ -496,6 +568,9 @@ int main(void) {
     test_create_reject_non_power2();
     test_create_reject_too_small();
     test_destroy_null_safe();
+    test_create_mirrored_path();
+    test_create_heap_fallback();
+    test_mirrored_wraparound();
 
     printf("\n--- Single Enqueue/Dequeue ---\n");
     test_single_enqueue_dequeue();

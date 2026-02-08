@@ -845,6 +845,7 @@ add_test(NAME mirrored_buffer_tests COMMAND test_mirrored_buffer)
 add_executable(test_spmc_ring EXCLUDE_FROM_ALL
     tests/test_spmc_ring.c
     src/ring/spmc_ring.c
+    src/memory/mirrored_buffer.c
 )
 target_include_directories(test_spmc_ring PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_spmc_ring PRIVATE
@@ -870,6 +871,7 @@ add_executable(test_concurrent EXCLUDE_FROM_ALL
     tests/test_concurrent.c
     src/ring/spmc_ring.c
     src/ring/affinity.c
+    src/memory/mirrored_buffer.c
 )
 target_include_directories(test_concurrent PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 target_link_libraries(test_concurrent PRIVATE

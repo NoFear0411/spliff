@@ -31,6 +31,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 /*============================================================================
  * Lifecycle
@@ -43,28 +44,71 @@ spmc_ring_create(uint32_t capacity)
     if (capacity < 4 || !IS_POWER_OF_TWO(capacity))
         return NULL;
 
-    /* Single contiguous allocation: header + slots */
-    size_t total = sizeof(spmc_ring_t)
-                 + (size_t)capacity * sizeof(spmc_slot_t);
+    /*
+     * Allocate ring header (3 × 128-byte cache lines = 384 bytes).
+     * Separate from slot storage so slots can use mirrored buffer.
+     */
+    size_t hdr_size = sizeof(spmc_ring_t);
+    hdr_size = (hdr_size + CACHELINE_SIZE - 1) & ~((size_t)CACHELINE_SIZE - 1);
 
-    /* Round up to cache-line boundary for aligned_alloc requirement */
-    total = (total + CACHELINE_SIZE - 1) & ~((size_t)CACHELINE_SIZE - 1);
-
-    spmc_ring_t *ring = aligned_alloc(CACHELINE_SIZE, total);
+    spmc_ring_t *ring = aligned_alloc(CACHELINE_SIZE, hdr_size);
     if (!ring)
         return NULL;
 
-    memset(ring, 0, total);
+    memset(ring, 0, hdr_size);
 
     /* Config (read-only after init) */
     ring->capacity  = capacity;
     ring->head_mask = capacity - 1;
     ring->tail_mask = capacity - 1;
 
+    /*
+     * Allocate slot storage.
+     *
+     * Mirrored buffer path: capacity × 64 bytes must fall within
+     * [MIN_BUFFER_SIZE, MAX_BUFFER_SIZE] (64KB..512KB, i.e. 1024..8192 slots).
+     * Mirrored virtual memory makes wrap-around transparent for batch ops.
+     *
+     * Heap fallback: for small test rings (< 1024 slots) or very large
+     * capacities (> 8192 slots) where mirrored buffer constraints don't fit.
+     * Also used if mirrored buffer creation fails (e.g., memfd unavailable).
+     */
+    size_t slot_bytes = (size_t)capacity * sizeof(spmc_slot_t);
+
+    if (slot_bytes >= MIN_BUFFER_SIZE && slot_bytes <= MAX_BUFFER_SIZE) {
+        ring->slot_buf = mirrored_buffer_create(slot_bytes);
+        if (ring->slot_buf) {
+            ring->slots = (spmc_slot_t *)ring->slot_buf->base;
+        }
+    }
+
+    if (!ring->slots) {
+        /* Heap fallback: aligned allocation for cache-friendly slot access */
+        ring->slot_buf = NULL;
+        size_t aligned_bytes = (slot_bytes + CACHELINE_SIZE - 1)
+                             & ~((size_t)CACHELINE_SIZE - 1);
+        ring->slots = aligned_alloc(CACHELINE_SIZE, aligned_bytes);
+        if (!ring->slots) {
+            free(ring);
+            return NULL;
+        }
+        memset(ring->slots, 0, aligned_bytes);
+    }
+
     /* Initialize Vyukov sequences: slot[i].seq = i (empty, ready for producer) */
     for (uint32_t i = 0; i < capacity; i++) {
         ring->slots[i].seq = i;
     }
+
+    /*
+     * Lock slot pages against swapping. For an EDR agent, ring memory
+     * must never page-fault during the hot path. The seq init loop above
+     * already pre-faulted every page; mlock prevents later eviction.
+     *
+     * Best-effort: fails without CAP_IPC_LOCK or when RLIMIT_MEMLOCK
+     * is exceeded. Non-fatal — accept swap risk in unprivileged mode.
+     */
+    (void)mlock(ring->slots, slot_bytes);
 
     return ring;
 }
@@ -72,7 +116,20 @@ spmc_ring_create(uint32_t capacity)
 void
 spmc_ring_destroy(spmc_ring_t *ring)
 {
-    /* Single allocation (FAM), single free */
+    if (!ring)
+        return;
+
+    if (ring->slot_buf) {
+        /* Mirrored buffer: unmaps double-mapped pages and closes memfd */
+        mirrored_buffer_destroy(ring->slot_buf);
+    } else if (ring->slots) {
+        /* Heap-allocated slots */
+        free(ring->slots);
+    }
+
+    ring->slots    = NULL;
+    ring->slot_buf = NULL;
+
     free(ring);
 }
 

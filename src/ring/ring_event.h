@@ -84,6 +84,19 @@
 #define EVENT_FLAG_XDP          (1U << 3)
 
 /**
+ * @brief Event has been routed through an overflow queue (hop-limit guard)
+ *
+ * Set by workers when pushing to another worker's MPSC overflow queue.
+ * When a worker dequeues an event with this flag, it MUST process locally
+ * regardless of affinity — prevents ping-pong oscillation under load.
+ *
+ * @par Anti-Oscillation
+ * Without this: Worker A defers to B → B's overflow full → B defers to A → loop.
+ * With this: Worker A sets ROUTED → B sees ROUTED → B processes locally.
+ */
+#define EVENT_FLAG_ROUTED       (1U << 5)
+
+/**
  * @brief Last 8 bytes carry extended metadata, not flow_key_hash
  *
  * When set, the event's last field is interpreted as ext (offset + size
@@ -366,6 +379,17 @@ typedef struct ring_event {
 _Static_assert(sizeof(ring_event_t) == 56,
                "ring_event_t must be exactly 56 bytes (7 x uint64_t)");
 
+/*
+ * Field offset asserts: workers depend on exact layout for hot-path
+ * register loads. Reordering fields silently breaks routing decisions.
+ */
+_Static_assert(offsetof(ring_event_t, socket_cookie) == 0,
+               "socket_cookie must be first (identity check on dequeue)");
+_Static_assert(offsetof(ring_event_t, routing) == 32,
+               "routing word must be at offset 32 (single register load)");
+_Static_assert(offsetof(ring_event_t, enqueue_ns) == 40,
+               "enqueue_ns must be at offset 40 (latency tracking)");
+
 /*============================================================================
  * Inline Accessors
  *============================================================================*/
@@ -406,6 +430,21 @@ static inline bool ring_event_is_first_data(const ring_event_t *ev) {
 /** Check if this is an XDP metadata event */
 static inline bool ring_event_is_xdp(const ring_event_t *ev) {
     return ev && (route_flags(ev->routing) & EVENT_FLAG_XDP);
+}
+
+/** Check if event has already been routed through an overflow queue */
+static inline bool ring_event_is_routed(const ring_event_t *ev) {
+    return ev && (route_flags(ev->routing) & EVENT_FLAG_ROUTED);
+}
+
+/**
+ * @brief Mark event as routed (set hop-limit flag)
+ *
+ * Must be called before pushing to another worker's overflow queue.
+ * Once set, the receiving worker will process locally — no further routing.
+ */
+static inline void ring_event_mark_routed(ring_event_t *ev) {
+    if (ev) ev->routing |= EVENT_FLAG_ROUTED;
 }
 
 /** Check if event carries extended metadata (ext union) */
