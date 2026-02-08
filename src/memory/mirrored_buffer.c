@@ -245,13 +245,14 @@ mirrored_buffer_t *mirrored_buffer_create_ex(size_t size, bool prefer_hugepages)
      * which would invalidate our carefully constructed virtual mappings.
      */
     if (seal_memfd(buf->memfd) < 0) {
-        /* Sealing failed - continue anyway for older kernels,
-         * but log in debug builds */
-#ifdef DEBUG
-        /* Note: Using stderr directly to avoid circular dependency with logging */
-        fprintf(stderr, "[WARN] memfd sealing failed (errno=%d), "
-                        "EDR multi-process safety reduced\n", errno);
-#endif
+        /*
+         * Sealing failed — continue for older kernels (< 3.17) that
+         * lack F_ADD_SEALS support. For EDR use, this means another
+         * thread or process could ftruncate the memfd and corrupt
+         * our mappings. Always warn, not just in debug builds.
+         */
+        fprintf(stderr, "[WARN] memfd sealing failed (errno=%d): "
+                        "ring memory not protected against resize\n", errno);
     }
 
     /*
