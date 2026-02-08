@@ -339,6 +339,34 @@ mirrored_buffer_t *mirrored_buffer_create_ex(size_t size, bool prefer_hugepages)
     return buf;
 }
 
+bool mirrored_buffer_prefault(mirrored_buffer_t *buf, bool lock) {
+    if (!buf || !buf->base || buf->size == 0)
+        return false;
+
+    size_t page_size = get_page_size();
+    volatile char *p = (volatile char *)buf->base;
+
+    /*
+     * Touch one byte per page to trigger minor faults now rather than
+     * on the hot path. Reading (not writing) is sufficient to allocate
+     * the physical page via the existing MAP_SHARED mapping.
+     */
+    for (size_t off = 0; off < buf->size; off += page_size) {
+        (void)p[off];
+    }
+
+    if (lock) {
+        /*
+         * Best-effort: mlock only the first mapping (buf->size bytes).
+         * The mirror mapping shares the same physical pages, so locking
+         * the first half locks all underlying pages.
+         */
+        (void)mlock(buf->base, buf->size);
+    }
+
+    return true;
+}
+
 void mirrored_buffer_destroy(mirrored_buffer_t *buf) {
     if (!buf) {
         return;

@@ -365,6 +365,29 @@ static inline void mirrored_buffer_get_write_info(const mirrored_buffer_t *buf,
 }
 
 /**
+ * @brief Pre-fault all pages and optionally lock against swapping
+ *
+ * Touches every page in the buffer to force the kernel to allocate
+ * physical pages immediately. When @p lock is true, also calls mlock()
+ * to prevent the kernel from evicting these pages under memory pressure.
+ *
+ * @par Why Pre-Fault?
+ * After mmap(), pages are demand-allocated on first access. A page fault
+ * during the hot path adds ~2-4us latency (minor fault) or worse if the
+ * page must be read from disk. Pre-faulting moves this cost to init time.
+ *
+ * @par SPMC Ring Note
+ * spmc_ring_create() already pre-faults slot pages via the Vyukov sequence
+ * init loop (writing seq=i to every slot). This function is for standalone
+ * mirrored buffer users (e.g., future metadata slabs, payload staging).
+ *
+ * @param buf   Mirrored buffer to pre-fault (must not be NULL)
+ * @param lock  If true, also mlock() pages against swapping (best-effort)
+ * @return true on success, false if buf is NULL or has no base mapping
+ */
+bool mirrored_buffer_prefault(mirrored_buffer_t *buf, bool lock);
+
+/**
  * @brief Check if buffer was allocated with hugepages
  *
  * @param buf Pointer to mirrored buffer
