@@ -7,7 +7,7 @@ research/Final.txt, research/LEGAL.txt
 **Target:** 1.0.0 (production-ready, stable API)
 **Versioning:** Semantic versioning (0.9.x → 0.10.0 → ... → 1.0.0)
 **Estimated Duration:** 8-12 weeks across multiple sessions
-**Last Updated:** 2026-02-08 (research integration pass)
+**Last Updated:** 2026-02-08 (Phase 2 complete)
 
 ---
 
@@ -19,8 +19,8 @@ This plan merges the Omni-Ring architectural improvements with the feature roadm
 v0.9.11 (Current)
     │
     ├─► v0.10.0 - FOUNDATION ──────────────────────────────────────────────┐
-    │   ├── Phase 1: Memory Infrastructure (mirrored buffers, alignment)   │
-    │   ├── Phase 2: Ring Buffer Redesign (SPMC workers)                   │
+    │   ├── Phase 1: Memory Infrastructure ✅ COMPLETE (b037f88)           │
+    │   ├── Phase 2: Ring Buffer Redesign  ✅ COMPLETE (5b48e76..4189fdf)  │
     │   └── Phase 3: Flow Context Redesign (refcount, per-flow state)      │
     │       └── Includes: ZSTD streaming, plain HTTP flow support          │
     │                                                                      │
@@ -48,7 +48,7 @@ v0.9.11 (Current)
 
 | Version | Theme | Key Deliverables |
 |---------|-------|------------------|
-| **v0.10.0** | Foundation | Mirrored buffers, SPMC rings, refcounted flows, ZSTD streaming |
+| **v0.10.0** | Foundation | ~~Mirrored buffers~~ ✅, ~~SPMC rings~~ ✅, refcounted flows, ZSTD streaming |
 | **v0.11.0** | Protocols | Plain HTTP, WebSocket, gRPC detection, HTTP/3 + QUIC |
 | **v0.12.0** | Operations | Enhanced dispatcher, comprehensive metrics, alerting |
 | **v0.13.0+** | Hardening | Security mitigations, performance tuning, stress testing |
@@ -105,99 +105,67 @@ This plan transforms spliff from its current architecture to the Omni-Ring desig
 
 ---
 
-## Phase 1: Foundation & Memory Infrastructure
-**Priority:** Critical (blocks all other work)
-**Estimated Sessions:** 2-3
+## Phase 1: Foundation & Memory Infrastructure ✅ COMPLETE
+**Status:** All tasks complete. Committed in `b037f88`.
+**Sessions:** 1
 
-### 1.1 Mirrored Virtual Memory Module
-**File:** `src/memory/mirrored_buffer.c` (NEW)
+### Delivered Files
+| File | Description |
+|------|-------------|
+| `src/memory/alignment.h` | 128-byte cache-line macros (`CACHE_ALIGNED`, `IS_POWER_OF_TWO`, buffer size limits) |
+| `src/memory/mirrored_buffer.h` | Mirrored buffer API with state machine for data race protection |
+| `src/memory/mirrored_buffer.c` | memfd_create() + dual mmap(), hugepage fallback, memfd sealing, pre-fault helper |
+| `src/memory/hugepage.h/c` | Hugepage availability check via `/proc/meminfo`, `MAP_HUGETLB` allocation |
+| `src/memory/numa_alloc.h/c` | NUMA stubs + NIC node detection (full NUMA deferred to post-1.0) |
+| `tests/test_mirrored_buffer.c` | 33 tests covering wrap-around, state machine, hugepage detection |
 
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 1.1.1 | Create `mirrored_buffer_t` structure with memfd backing | Medium |
-| 1.1.2 | Implement `mirrored_buffer_create(size_t size)` using `memfd_create()` + dual `mmap()` | High |
-| 1.1.3 | Implement `mirrored_buffer_destroy()` with proper unmapping | Low |
-| 1.1.4 | Add power-of-2 size enforcement with `static_assert` | Low |
-| 1.1.5 | Unit tests for wrap-around reads/writes | Medium |
-
-**Current Gap:** spliff uses linear buffers requiring split memcpy on wrap-around.
-
-### 1.2 NUMA-Aware Allocation (Stubs + Detection)
-**File:** `src/memory/numa_alloc.c` (NEW)
-**Status:** Stubs only; full implementation deferred to post-1.0 optimization
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 1.2.1 | Add optional libnuma dependency to CMakeLists.txt (compile-time flag) | Low |
-| 1.2.2 | Implement `numa_detect_nic_node()` via `/sys/class/net/*/device/numa_node` | Medium |
-| 1.2.3 | Implement `numa_alloc_buffer(size, node)` - stub that falls back to regular alloc | Low |
-| 1.2.4 | Add `numa_pin_thread_to_node(thread, node)` - stub with TODO comment | Low |
-| 1.2.5 | Log detected NUMA topology at startup (informational) | Low |
-
-**Current Gap:** No NUMA awareness; deferred to post-1.0 optimization phase.
-
-### 1.3 Hugepage Support
-**File:** `src/memory/hugepage.c` (NEW)
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 1.3.1 | Implement `hugepage_available()` check via `/proc/meminfo` | Low |
-| 1.3.2 | Implement `hugepage_alloc(size)` with `MAP_HUGETLB` + fallback | Medium |
-| 1.3.3 | Add runtime detection and logging of page size used | Low |
-
-**Current Gap:** No hugepage support; TLB pressure on large buffers.
-
-### 1.4 Cache-Line Alignment Infrastructure
-**File:** `src/memory/alignment.h` (NEW)
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 1.4.1 | Define `CACHELINE_SIZE` (128 bytes for modern CPUs) | Low |
-| 1.4.2 | Create `CACHE_ALIGNED` macro using `alignas(128)` | Low |
-| 1.4.3 | Audit existing structs for false sharing (flow_context_t, ring indices) | Medium |
-
-**Current Gap:** Some alignment exists but not systematic 128-byte spacing.
+### Post-Completion Hardening (applied in later commits)
+- `dfeb4cd`: Promoted memfd sealing warning from debug-only to all builds
+- `4189fdf`: Added `mirrored_buffer_prefault()` for standalone pre-faulting + mlock
 
 ---
 
-## Phase 2: Ring Buffer Redesign
-**Priority:** Critical
-**Estimated Sessions:** 2-3
+## Phase 2: Ring Buffer Redesign ✅ COMPLETE
+**Status:** All tasks complete. Commits `5b48e76`..`4189fdf` (6 commits).
+**Sessions:** 3
 
-### 2.1 MPSC Ring Buffer (eBPF → Dispatcher)
-**Note:** libbpf's BPF_MAP_TYPE_RINGBUF already handles this; verify implementation.
+### 2.1 MPSC Ring Buffer (eBPF → Dispatcher) — Audit Only
+Verified that libbpf's `BPF_MAP_TYPE_RINGBUF` handles MPSC correctly.
+Ghost gap handling confirmed via `bpf_ringbuf_reserve()`/`bpf_ringbuf_submit()`.
+Sharded ring buffers deferred to Phase 5+ (single ring sufficient at current scale).
 
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 2.1.1 | Audit current `probe_handler.c` for proper ring buffer consumption | Medium |
-| 2.1.2 | Add commit flag checking for ghost gap handling (if not present) | High |
-| 2.1.3 | Implement sharded ring buffers (Map-in-Map) for multi-core | High |
-| 2.1.4 | Add per-shard flow affinity via `socket_cookie % num_shards` | Medium |
+### 2.2 SPMC Ring Buffer (Dispatcher → Workers) — Delivered
+| File | Description |
+|------|-------------|
+| `src/ring/ring_event.h` | 56-byte event header with 64-bit routing word, 7 probe sources, 8-bit type namespace, `EVENT_FLAG_ROUTED` hop-limit |
+| `src/ring/spmc_ring.h` | Ring struct: 3×128B cache lines (producer/tail/config), pointer-based slots, mirrored buffer handle |
+| `src/ring/spmc_ring.c` | Vyukov enqueue/dequeue (single + batch), three-stage pipeline, CAS backoff, mlock for slot pages |
+| `src/ring/affinity.h` | Inline affinity check + per-worker MPSC overflow queue (64 slots, Vyukov sequences) |
+| `src/ring/affinity.c` | TTAS-CAS push, zero-CAS drain, acquire fence for ARM correctness |
+| `src/ring/backpressure.h` | Four-level state machine (NORMAL/ELEVATED/HIGH/CRITICAL) with hysteresis deadbands, hot/cold cache-line split |
+| `src/ring/backpressure.c` | Threshold precomputation, transition recorder with matrix and time-in-level tracking |
 
-**Current Gap:** Single ring buffer may be bottleneck on high-core systems.
+### 2.3 Worker Consumption — Delivered
+| File | Description |
+|------|-------------|
+| `src/ring/worker_dequeue.h` | Three-phase poll API: overflow drain → SPMC batch → affinity route, per-worker stats |
+| `src/ring/worker_dequeue.c` | BP_CRITICAL fast path, hop-limit guard, OOB worker bounds check, stack-local scratch buffer |
+| `src/ring/adaptive_poll.h` | Header-only polling state machine: IDLE/LIGHT/MEDIUM/BUSY with BP override and full-batch inversion |
 
-### 2.2 SPMC Ring Buffer (Dispatcher → Workers)
-**File:** `src/ring/spmc_ring.c` (NEW or refactor `src/threading/pool.c`)
+### Test Suites (Phase 2)
+| File | Tests | Coverage |
+|------|-------|---------|
+| `tests/test_spmc_ring.c` | 35 | Layout, routing, lifecycle, enqueue/dequeue, batch, wrap-around, diagnostics |
+| `tests/test_affinity.c` | 12 | MPSC push/drain, overflow, concurrency |
+| `tests/test_concurrent.c` | 22 | Multi-thread SPMC stress, CAS contention |
+| `tests/test_backpressure.c` | 27 | Hysteresis, transitions, clamping, matrix |
+| `tests/test_worker_dequeue.c` | 35 | Three-phase poll, BP_CRITICAL, hop-limit, adaptive poll, mixed scenarios |
 
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 2.2.1 | Design `spmc_ring_t` with 128-byte aligned head/tail | Medium |
-| 2.2.2 | Implement `spmc_enqueue()` (single producer) with release semantics | High |
-| 2.2.3 | Implement `spmc_dequeue()` with CAS-based tail claiming | High |
-| 2.2.4 | Implement `spmc_dequeue_batch(max)` for 8-16 flow batching | High |
-| 2.2.5 | Add backpressure detection (ring 90% full → signal eBPF) | Medium |
-| 2.2.6 | Integrate mirrored buffer for pointer storage | Medium |
-
-**Current Gap:** Current SPSC queues per-worker; research proposes single SPMC with worker competition.
-
-### 2.3 Worker Batch Processing
-**File:** `src/threading/worker.c`
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 2.3.1 | Refactor `worker_main_loop()` to use batch dequeue | Medium |
-| 2.3.2 | Process batch locally before releasing | Low |
-| 2.3.3 | Add adaptive polling (busy-spin vs sleep based on load) | Medium |
+### Architecture Decisions
+- **ADR-001**: Vyukov SPMC with mirrored buffer slots (docs/ARCHITECTURE-DECISIONS.md)
+- **ADR-002**: Three-layer extensibility, two-stage pipeline
+- **ADR-003**: Session registry design (Phase 3, design only)
+- **CAS scaling**: Documented 4-worker sweet spot, 8+ degradation in spmc_ring.h
 
 ---
 
@@ -610,13 +578,12 @@ Phase 5 (Dispatcher) ─────┼─────────────�
 
 ### Incremental Refactoring (Recommended)
 
-1. **Week 1-2:** Complete Phase 1 (Memory Infrastructure)
-   - Can be done in isolation
-   - Provides foundation for all other work
+1. ~~**Week 1-2:** Complete Phase 1 (Memory Infrastructure)~~ ✅ DONE
+   - Mirrored buffers, hugepage stubs, NUMA stubs, alignment macros
 
-2. **Week 2-3:** Complete Phases 2-3 (Ring Buffers + Flow Context)
-   - Most disruptive changes
-   - Requires careful testing
+2. **Week 2-3:** ~~Complete Phases 2~~-3 (~~Ring Buffers~~ ✅ + Flow Context)
+   - Phase 2 complete: SPMC ring, affinity, backpressure, worker dequeue, adaptive poll
+   - Phase 3 remaining: Session registry, refcounted flows, ZSTD streaming
 
 3. **Week 3-4:** Complete Phases 4-5 (Protocol + Dispatcher)
    - Builds on new flow context
@@ -644,31 +611,32 @@ Consider adding compile-time flags to enable/disable new code paths:
 
 ## Files to Create
 
-| File | Purpose | Phase |
-|------|---------|-------|
-| `src/memory/mirrored_buffer.c` | Mirrored VM buffer implementation | 1 |
-| `src/memory/mirrored_buffer.h` | Mirrored buffer API | 1 |
-| `src/memory/numa_alloc.c` | NUMA-aware allocation (stubs) | 1 |
-| `src/memory/numa_alloc.h` | NUMA allocation API | 1 |
-| `src/memory/hugepage.c` | Hugepage allocation | 1 |
-| `src/memory/hugepage.h` | Hugepage API | 1 |
-| `src/memory/alignment.h` | Cache-line alignment macros | 1 |
-| `src/ring/spmc_ring.c` | SPMC ring buffer | 2 |
-| `src/ring/spmc_ring.h` | SPMC ring API | 2 |
-| `src/protocol/alpn_router.c` | ALPN → parser routing | 4 |
-| `src/protocol/alpn_router.h` | ALPN router API | 4 |
-| `src/protocol/registry.c` | Protocol parser registry | 4 |
-| `src/protocol/registry.h` | Parser registry API | 4 |
-| `src/protocol/http3.c` | HTTP/3 parser (nghttp3 wrapper) | 4 |
-| `src/protocol/http3.h` | HTTP/3 API | 4 |
-| `src/protocol/quic.c` | QUIC flow tracking | 4 |
-| `src/protocol/quic.h` | QUIC API | 4 |
-| `src/metrics/metrics.c` | Metrics collection | 6 |
-| `src/metrics/metrics.h` | Metrics structure | 6 |
-| `src/metrics/prometheus.c` | Prometheus export (optional) | 6 |
-| `src/util/cpu_features.c` | CPU feature detection | 8 |
-| `src/util/cpu_features.h` | CPU features API | 8 |
-| `docs/TUNING.md` | Performance tuning guide | 8 |
+| File | Purpose | Phase | Status |
+|------|---------|-------|--------|
+| `src/memory/mirrored_buffer.h/c` | Mirrored VM buffer with memfd + pre-fault | 1 | ✅ |
+| `src/memory/numa_alloc.h/c` | NUMA stubs + NIC node detection | 1 | ✅ |
+| `src/memory/hugepage.h/c` | Hugepage availability + allocation | 1 | ✅ |
+| `src/memory/alignment.h` | 128-byte cache-line macros | 1 | ✅ |
+| `src/ring/ring_event.h` | 56-byte event with routing word | 2 | ✅ |
+| `src/ring/spmc_ring.h/c` | Vyukov SPMC with mirrored slots | 2 | ✅ |
+| `src/ring/affinity.h/c` | Affinity check + MPSC overflow | 2 | ✅ |
+| `src/ring/backpressure.h/c` | Four-level state machine with hysteresis | 2 | ✅ |
+| `src/ring/worker_dequeue.h/c` | Three-phase worker consumption | 2 | ✅ |
+| `src/ring/adaptive_poll.h` | Polling timeout state machine | 2 | ✅ |
+| `src/protocol/alpn_router.c` | ALPN → parser routing | 4 | |
+| `src/protocol/alpn_router.h` | ALPN router API | 4 | |
+| `src/protocol/registry.c` | Protocol parser registry | 4 | |
+| `src/protocol/registry.h` | Parser registry API | 4 | |
+| `src/protocol/http3.c` | HTTP/3 parser (nghttp3 wrapper) | 4 | |
+| `src/protocol/http3.h` | HTTP/3 API | 4 | |
+| `src/protocol/quic.c` | QUIC flow tracking | 4 | |
+| `src/protocol/quic.h` | QUIC API | 4 | |
+| `src/metrics/metrics.c` | Metrics collection | 6 | |
+| `src/metrics/metrics.h` | Metrics structure | 6 | |
+| `src/metrics/prometheus.c` | Prometheus export (optional) | 6 | |
+| `src/util/cpu_features.c` | CPU feature detection | 8 | |
+| `src/util/cpu_features.h` | CPU features API | 8 | |
+| `docs/TUNING.md` | Performance tuning guide | 8 | |
 
 ## Files to Modify (Major)
 
