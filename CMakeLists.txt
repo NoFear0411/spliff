@@ -573,6 +573,8 @@ set(SPLIFF_SOURCES
     # Ring buffer infrastructure (Phase 2 - SPMC transport)
     src/ring/spmc_ring.c
     src/ring/affinity.c
+    src/ring/backpressure.c
+    src/ring/worker_dequeue.c
 )
 
 # ============================================================================
@@ -888,6 +890,22 @@ add_executable(test_backpressure EXCLUDE_FROM_ALL
 target_include_directories(test_backpressure PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
 add_test(NAME backpressure_tests COMMAND test_backpressure)
 
+# Worker dequeue + adaptive poll tests (Phase 2 - worker consumption)
+add_executable(test_worker_dequeue EXCLUDE_FROM_ALL
+    tests/test_worker_dequeue.c
+    src/ring/worker_dequeue.c
+    src/ring/spmc_ring.c
+    src/ring/affinity.c
+    src/ring/backpressure.c
+    src/memory/mirrored_buffer.c
+)
+target_include_directories(test_worker_dequeue PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_worker_dequeue PRIVATE
+    PkgConfig::CK
+    pthread
+)
+add_test(NAME worker_dequeue_tests COMMAND test_worker_dequeue)
+
 # Flow context tests (P0 - core state management)
 add_executable(test_flow_context EXCLUDE_FROM_ALL
     tests/test_flow_context.c
@@ -997,7 +1015,7 @@ add_test(NAME display_tests COMMAND test_display)
 # Custom target to build all tests
 # Note: test_http1 and test_http2 need API updates for current codebase
 add_custom_target(build_tests
-    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_mirrored_buffer test_spmc_ring test_affinity test_concurrent test_backpressure test_decompressor test_detector test_websocket test_display
+    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_mirrored_buffer test_spmc_ring test_affinity test_concurrent test_backpressure test_worker_dequeue test_decompressor test_detector test_websocket test_display
     # Note: test_flow_context excluded until API updated for CK hash tables (v0.9.9)
     COMMENT "Building all test executables..."
 )
