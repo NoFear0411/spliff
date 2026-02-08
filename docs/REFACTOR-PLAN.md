@@ -1,10 +1,13 @@
 # spliff Omni-Ring Architecture Refactor Plan
 
-**Based on:** research/omni-ring-complete-reference.md
+**Based on:** research/omni-ring-complete-reference.md, research/vyukov_spmc_mpsc.txt,
+research/Final.txt, research/LEGAL.txt
+**Cross-Reference:** docs/RESEARCH-ANALYSIS.md (comprehensive research paper)
 **Current Version:** 0.9.11
 **Target:** 1.0.0 (production-ready, stable API)
 **Versioning:** Semantic versioning (0.9.x → 0.10.0 → ... → 1.0.0)
 **Estimated Duration:** 8-12 weeks across multiple sessions
+**Last Updated:** 2026-02-08 (research integration pass)
 
 ---
 
@@ -50,6 +53,42 @@ v0.9.11 (Current)
 | **v0.12.0** | Operations | Enhanced dispatcher, comprehensive metrics, alerting |
 | **v0.13.0+** | Hardening | Security mitigations, performance tuning, stress testing |
 | **v1.0.0** | Release | Production-ready, stable API, documentation complete |
+
+---
+
+## Research Validation Summary
+
+> Cross-referenced against `vyukov_spmc_mpsc.txt`, `Final.txt`, `LEGAL.txt`.
+> Full analysis: `docs/RESEARCH-ANALYSIS.md`
+
+**Research validates existing design (no changes needed):**
+- Two-stage pipeline (BPF MPSC → Vyukov SPMC) — matches ADR-001/ADR-002
+- 64-byte slots (8B seq + 56B event) — NOT the 128B variant in some research diagrams
+- 128-byte header isolation (head/tail/config on separate super-lines)
+- Three-stage batch enqueue with single fence
+- CAS backoff with `ck_pr_stall()` prevents coherency storms
+- socket_cookie as universal session correlator
+- Four-level backpressure with hysteresis deadbands
+
+**Research adds value (incorporated into plan):**
+- Per-worker jemalloc arenas for heap isolation (deferred to Phase 5+)
+- WASM detection modules for sandboxed rule execution (deferred to Phase 7+)
+- NATS JetStream + Protobuf export pipeline (Phase 5)
+- Multi-channel BPF ringbufs with priority drain (Phase 4)
+- io_uring async logging in Logger thread (Phase 5, with caution per ADR-002)
+- Cross-platform sensor abstraction: macOS ESF, BSD DTrace (Phase 8+)
+- Business model: AGPL-v3 + Commercial dual-license (non-engineering decision)
+
+**Research conflicts with existing design (rejected):**
+- 128B slots with anti-prefetch padding — wastes half ring capacity, 64B is correct
+- Mixed C11 `_Atomic`/stdatomic with CK primitives — CK exclusively is correct
+- Per-event-type SPMC rings — single ring with type dispatch is simpler/faster
+
+**Where spliff is ahead of the research:**
+- Affinity routing with MPSC overflow + hop-limit guard (not covered in research)
+- Backpressure with hysteresis deadbands and transition matrix (research has simple "drop")
+- io_uring evasion detection three-layer strategy (ADR-002, absent from research)
+- Three-layer frozen L1 with extension union (more disciplined than research's design)
 
 ---
 
