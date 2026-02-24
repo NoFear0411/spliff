@@ -541,6 +541,7 @@ set(SPLIFF_SOURCES
     src/util/process.c
     src/content/signatures.c
     src/content/decompressor.c
+    src/content/stream_decompressor.c
     # Protocol parsing and detection
     src/protocol/http1.c
     src/protocol/http2.c
@@ -755,6 +756,7 @@ add_executable(test_http1 EXCLUDE_FROM_ALL
     src/output/display.c
     src/output/logger.c
     src/content/decompressor.c
+    src/content/stream_decompressor.c
     src/content/signatures.c
     src/correlation/flow_context.c
     src/correlation/ck_cookie_index.c
@@ -787,6 +789,7 @@ add_executable(test_http2 EXCLUDE_FROM_ALL
     src/output/display.c
     src/output/logger.c
     src/content/decompressor.c
+    src/content/stream_decompressor.c
     src/content/signatures.c
     src/correlation/flow_context.c
     src/correlation/ck_cookie_index.c
@@ -919,6 +922,7 @@ add_executable(test_flow_context EXCLUDE_FROM_ALL
     src/output/display.c
     src/output/logger.c
     src/content/decompressor.c
+    src/content/stream_decompressor.c
     src/content/signatures.c
     src/threading/state.c
     src/threading/deferred.c
@@ -952,6 +956,7 @@ add_executable(test_flow_refcount EXCLUDE_FROM_ALL
     src/output/display.c
     src/output/logger.c
     src/content/decompressor.c
+    src/content/stream_decompressor.c
     src/content/signatures.c
     src/threading/state.c
     src/threading/deferred.c
@@ -985,6 +990,20 @@ target_link_libraries(test_decompressor PRIVATE
 )
 add_test(NAME decompressor_tests COMMAND test_decompressor)
 
+# Streaming decompressor tests (P3 - per-flow streaming)
+add_executable(test_stream_decompressor EXCLUDE_FROM_ALL
+    tests/test_stream_decompressor.c
+    src/content/stream_decompressor.c
+    src/content/decompressor.c
+)
+target_include_directories(test_stream_decompressor PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_stream_decompressor PRIVATE
+    ${ZLIB_TARGET}
+    PkgConfig::ZSTD
+    PkgConfig::BROTLI
+)
+add_test(NAME stream_decompressor_tests COMMAND test_stream_decompressor)
+
 # Protocol detector tests (P1 - vectorscan patterns)
 add_executable(test_detector EXCLUDE_FROM_ALL
     tests/test_detector.c
@@ -997,6 +1016,7 @@ add_executable(test_detector EXCLUDE_FROM_ALL
     src/output/display.c
     src/output/logger.c
     src/content/decompressor.c
+    src/content/stream_decompressor.c
     src/content/signatures.c
     src/correlation/flow_context.c
     src/correlation/ck_cookie_index.c
@@ -1048,7 +1068,7 @@ add_test(NAME display_tests COMMAND test_display)
 # Custom target to build all tests
 # Note: test_http1 and test_http2 need API updates for current codebase
 add_custom_target(build_tests
-    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_mirrored_buffer test_spmc_ring test_affinity test_concurrent test_backpressure test_worker_dequeue test_flow_refcount test_decompressor test_detector test_websocket test_display
+    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_mirrored_buffer test_spmc_ring test_affinity test_concurrent test_backpressure test_worker_dequeue test_flow_refcount test_decompressor test_stream_decompressor test_detector test_websocket test_display
     # Note: test_flow_context excluded until API updated for CK hash tables (v0.9.9)
     COMMENT "Building all test executables..."
 )

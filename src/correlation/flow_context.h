@@ -28,6 +28,7 @@
 #include <llhttp.h>
 #include <nghttp2/nghttp2.h>
 #include "../include/spliff.h"
+#include "../content/stream_decompressor.h"
 
 /*============================================================================
  * Constants and Configuration
@@ -297,6 +298,7 @@ typedef struct {
     char encoding[32];              /**< Content-Encoding */
     bool needs_decompress;          /**< Requires decompression */
     bool header_printed;            /**< Headers already output */
+    stream_decomp_t stream_decomp;  /**< Per-flow streaming decompression state */
 } body_ctx_t;
 
 /** @} */

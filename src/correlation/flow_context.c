@@ -966,6 +966,9 @@ void flow_free_resources(flow_context_t *ctx) {
     }
     /* FLOW_PROTO_UNKNOWN and FLOW_PROTO_OTHER have no allocated resources */
 
+    /* Free streaming decompressor if initialized */
+    stream_decomp_cleanup(&ctx->body.stream_decomp);
+
     if (ctx->body.buffer) {
         free(ctx->body.buffer);
         ctx->body.buffer = NULL;
