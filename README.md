@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.9.11-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.10.0-blue.svg)](CHANGELOG.md)
 [![Release](https://github.com/NoFear0411/spliff/actions/workflows/release.yml/badge.svg)](https://github.com/NoFear0411/spliff/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
@@ -364,8 +364,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and data 
 | Version | Theme | Key Deliverables | Status |
 |---------|-------|------------------|--------|
 | v0.1-0.8 | Core | Interception, XDP tracking, multi-threading | ✅ Complete |
-| **v0.9.11** | Stability | Lock-free architecture, thread safety, IPv6 | ✅ **Current** |
-| v0.10.0 | Foundation | Omni-Ring memory, SPMC rings, refcounted flows, ZSTD streaming | 🔄 Next |
+| v0.9.11 | Stability | Lock-free architecture, thread safety, IPv6 | ✅ Complete |
+| **v0.10.0** | Foundation | Omni-Ring memory, SPMC rings, refcounted flows, ZSTD streaming | ✅ **Current** |
 | v0.11.0 | Protocols | Plain HTTP, WebSocket, gRPC, HTTP/3 + QUIC | Planned |
 | v0.12.0 | Operations | Enhanced dispatcher, comprehensive metrics | Planned |
 | v0.13.0+ | Hardening | Security mitigations, performance tuning | Planned |

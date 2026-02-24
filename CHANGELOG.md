@@ -2,6 +2,134 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.10.0] - 2026-02-24
+
+### Omni-Ring Foundation Release
+
+Major architectural release implementing the Omni-Ring memory and transport
+infrastructure. Introduces zero-copy mirrored buffers, lock-free SPMC ring
+transport, formal reference counting for flow lifecycle management, per-flow
+streaming decompression with bomb protection, and a modernized CMake build
+system. This release lays the foundation for v0.11.0 protocol expansion.
+
+**15 commits, 46 files changed, +14,146 / -867 lines**
+**19 new source files, 8 new test files, 2 new CMake files**
+
+### Added
+
+#### Phase 1: Memory Infrastructure (`src/memory/`)
+- **mirrored_buffer.h/c**: Zero-copy ring buffers using virtual memory mirroring
+  (`memfd_create` + dual `mmap`). Eliminates wrap-around branching for contiguous
+  reads across buffer boundaries. Includes `mirrored_buffer_prefault()` for
+  page-fault-free hot paths.
+- **hugepage.h/c**: Transparent hugepage integration with `madvise(MADV_HUGEPAGE)`
+  for reduced TLB pressure on large allocations.
+- **numa_alloc.h/c**: NUMA-aware allocation stubs (API surface for future
+  `mbind()`/`set_mempolicy()` integration).
+- **alignment.h**: Cache-line alignment macros and power-of-2 validation for
+  buffer sizing.
+- **Tests**: `test_mirrored_buffer.c` — 33 tests covering creation, wraparound
+  reads, prefault, edge cases.
+
+#### Phase 2: Ring Buffer Redesign (`src/ring/`) — L1 Transport, FROZEN
+- **ring_event.h**: 56-byte event structure with 64-bit routing word and
+  `EVENT_FLAG_ROUTED` for affinity-based worker dispatch.
+- **spmc_ring.h/c**: Vyukov-style single-producer multi-consumer ring with
+  mirrored slot storage, CAS backoff, and `mlock` to prevent slot swapping.
+  Optimal at 4 workers; 8+ shows CAS contention (documented).
+- **affinity.h/c**: Inline affinity check with MPSC overflow queue using
+  TTAS-CAS (test-and-test-and-set with compare-and-swap).
+- **backpressure.h/c**: Four-level hysteresis state machine (NORMAL → WARN →
+  CRITICAL → DROP) for flow-control signaling.
+- **worker_dequeue.h/c**: Three-phase worker consumption pattern:
+  overflow drain → SPMC dequeue → routed dispatch.
+- **adaptive_poll.h**: Header-only polling state machine for dynamic
+  sleep/spin tuning based on queue depth.
+- **Tests**: 5 suites, 131 tests — `test_spmc_ring.c`, `test_affinity.c`,
+  `test_concurrent.c`, `test_backpressure.c`, `test_worker_dequeue.c`.
+- **Docs**: ADR-001 (SPMC ring), ADR-002 (three-layer transport), ADR-003
+  (session registry design).
+
+#### Phase 3: Flow Context Redesign
+- **Reference counting** (`flow_context.h/c`): `_Atomic uint32_t ref_count`
+  replaces `inflight_events` counter. Inline API: `flow_ref_acquire()` (relaxed),
+  `flow_ref_release()` (release + acquire fence), `flow_ref_count()` (acquire).
+  Creator holds ref=1 at allocation, released in `flow_terminate()`.
+- **Plaintext flow support**: `FLOW_FLAG_PLAINTEXT = (1 << 5)` with automatic
+  detection when `ssl_ctx == 0`. Plaintext flows transition to ACTIVE with XDP
+  data only (no SSL handshake required).
+- **Streaming decompression** (`stream_decompressor.h/c`): Per-flow streaming
+  decompression for gzip/deflate (zlib-ng), zstd (`ZSTD_DStream`, windowLogMax=23),
+  and brotli. Bomb protection: >1000:1 compression ratio or >100MB output triggers
+  permanent reject per flow.
+- **Mirrored body buffers**: `flow_transaction_t` uses `mirrored_buffer_t` instead
+  of heap-allocated body buffers, enabling zero-copy wrapping for contiguous body
+  access. `stream_decomp_t` embedded per-transaction for per-stream decompression.
+- **Encoding detection**: `detect_encoding_type()` maps Content-Encoding headers
+  to `compress_type_t` for streaming decompressor initialization.
+- **Tests**: `test_flow_refcount.c` (11 tests), `test_stream_decompressor.c`
+  (13 tests).
+
+#### Build System Modernization
+- **OBJECT libraries**: 3 compile-once-link-many libraries eliminate 96 redundant
+  compilations across test targets:
+  - `spliff_memory` (1 file) — shared by core and ring consumers
+  - `spliff_core` (15 files) — correlation, protocol, content, threading, util
+  - `spliff_ring` (4 files) — L1 transport layer
+- **INTERFACE library**: `spliff_common_deps` wraps 9 shared link dependencies
+  using `${ALLOCATOR_TARGET}` (not hardcoded jemalloc).
+- **Subdirectory split**: `CMakeLists.txt` split into 3 files via
+  `add_subdirectory(src)` and `add_subdirectory(tests)`.
+- **CTest labels**: Module-level test grouping (ring, protocol, flow, content,
+  memory, util) for targeted test runs.
+- **Ninja auto-detection**: Makefile uses `-G Ninja` when available for 2-5x
+  faster incremental builds.
+- **Module test targets**: `make test-ring`, `make test-protocol`,
+  `make test-flow`, `make test-content`, `make test-memory`, `make test-util`.
+- **Parallel ctest**: `ctest --parallel $(nproc)` for concurrent test execution.
+
+### Fixed
+- **Hardcoded jemalloc in tests**: 5 test targets used `PkgConfig::JEMALLOC`
+  instead of `${ALLOCATOR_TARGET}`, breaking `cmake -DUSE_MIMALLOC=ON` builds.
+- **bpftool not validated**: Now uses `find_program(BPFTOOL bpftool REQUIRED)`
+  with `${BPFTOOL}` variable in BPF skeleton generation.
+- **CMAKE_EXE_LINKER_FLAGS string append**: Replaced with modern
+  `target_link_options(spliff PRIVATE -static-libgcc)`.
+- **Dead TEST_COMMON_SOURCES variable**: Removed unreferenced variable (lines
+  739-746 of old CMakeLists.txt).
+- **memfd sealing warning**: Promoted from debug-only to all builds so production
+  users see when kernel sealing fails.
+
+### Changed
+- `inflight_events` field renamed to `ref_count` with formal reference counting
+  semantics across dispatcher (acquire) and worker (release) paths.
+- `flow_free_resources()` cleanup order updated: streaming decompressor cleanup
+  moved into `flow_txn_free_body()` per-transaction, not per-flow.
+- Body buffer allocation uses fixed 256KB mirrored buffers instead of growing
+  heap allocations with realloc.
+- CMakeLists.txt reduced from 1291 to 802 lines; test target maintenance now
+  requires editing one file instead of six.
+
+### Technical Details
+- **New source files**: 19 (memory: 6, ring: 10, content: 2, CMake: 2)
+- **New test files**: 8 test suites added (total: 17 suites)
+- **Total test count**: ~220 tests across 17 suites
+- **Architecture docs**: 3 ADRs, 1 research analysis paper
+- **Build**: Ninja auto-detected, parallel ctest, module-level test targets
+
+### Migration Notes
+- The `inflight_events` field in `flow_context_t` is now `ref_count`. Any code
+  directly accessing this field must use the `flow_ref_acquire()`/`flow_ref_release()`
+  API instead.
+- Transaction body buffers (`flow_transaction_t`) now use `body_mirror`
+  (`mirrored_buffer_t *`) instead of `body_buf` (`uint8_t *`). The `body_capacity`
+  field is removed; buffer size is fixed at 256KB.
+- Test targets now live in `tests/CMakeLists.txt`. Adding new test targets should
+  follow the patterns there (use `spliff_core`/`spliff_ring`/`spliff_memory` object
+  libraries where applicable).
+- Adding a new dependency to `flow_context.c` now only requires updating
+  `spliff_core`'s `target_link_libraries` in `src/CMakeLists.txt`.
+
 ## [0.9.11] - 2026-02-04
 
 ### Architecture Simplification Release

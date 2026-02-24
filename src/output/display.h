@@ -320,7 +320,7 @@ void display_hpack_error(int32_t stream_id, const char *host, const char *path,
  *
  * Shows the spliff banner art and version string at startup.
  *
- * @param[in] version Version string (e.g., "0.9.11")
+ * @param[in] version Version string (e.g., "0.10.0")
  */
 void display_banner(const char *version);
 

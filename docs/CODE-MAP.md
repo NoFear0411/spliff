@@ -1,4 +1,4 @@
-# CODE-MAP.md - spliff v0.9.11 Comprehensive Code Map
+# CODE-MAP.md - spliff v0.10.0 Comprehensive Code Map
 
 > **Purpose:** AI-friendly and human-readable architecture reference for understanding, maintaining, and extending the spliff codebase.
 
@@ -16,7 +16,7 @@
 
 ## Project Overview
 
-**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.9.11 features:
+**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.10.0 features:
 
 - **Dynamic Flow Pool**: On-demand allocation via jemalloc with incremental hash table resizing
 - **Per-Flow HTTP/2 Sessions**: Sessions managed in `flow_ctx->parser.h2`, not per-worker pools (v0.9.11)
@@ -166,7 +166,7 @@ spliff/
 | `MAX_HEADERS` | 128 |
 | `MAX_BODY_BUFFER` | 1 MB |
 | `XDP_PAYLOAD_MAX` | 128 bytes |
-| `SPLIFF_VERSION` | "0.9.11" |
+| `SPLIFF_VERSION` | "0.10.0" |
 
 ---
 
@@ -787,4 +787,4 @@ See [../ISSUES.md](../ISSUES.md) for the full list of open issues, known limitat
 
 ---
 
-*Last updated: v0.9.11 (February 2026)*
+*Last updated: v0.10.0 (February 2026)*

@@ -3,11 +3,11 @@
 **Based on:** research/omni-ring-complete-reference.md, research/vyukov_spmc_mpsc.txt,
 research/Final.txt, research/LEGAL.txt
 **Cross-Reference:** docs/RESEARCH-ANALYSIS.md (comprehensive research paper)
-**Current Version:** 0.9.11
+**Current Version:** 0.10.0
 **Target:** 1.0.0 (production-ready, stable API)
-**Versioning:** Semantic versioning (0.9.x → 0.10.0 → ... → 1.0.0)
+**Versioning:** Semantic versioning (0.10.x → 0.11.0 → ... → 1.0.0)
 **Estimated Duration:** 8-12 weeks across multiple sessions
-**Last Updated:** 2026-02-24 (Phase 3 complete)
+**Last Updated:** 2026-02-24 (v0.10.0 released — Phases 1-3 complete)
 
 ---
 
@@ -16,13 +16,14 @@ research/Final.txt, research/LEGAL.txt
 This plan merges the Omni-Ring architectural improvements with the feature roadmap.
 
 ```
-v0.9.11 (Current)
+v0.10.0 (Current) - FOUNDATION ✅ RELEASED
+    │   ├── Phase 1: Memory Infrastructure ✅ COMPLETE (b037f88)
+    │   ├── Phase 2: Ring Buffer Redesign  ✅ COMPLETE (5b48e76..4189fdf)
+    │   ├── Phase 3: Flow Context Redesign ✅ COMPLETE (6aaa96f..b3086a9)
+    │   │   └── Refcount, ZSTD streaming, plaintext flows, bomb protection
+    │   └── Build System Modernization     ✅ COMPLETE (46ed4d8)
+    │       └── OBJECT libraries, subdirectory split, Ninja, module tests
     │
-    ├─► v0.10.0 - FOUNDATION ──────────────────────────────────────────────┐
-    │   ├── Phase 1: Memory Infrastructure ✅ COMPLETE (b037f88)           │
-    │   ├── Phase 2: Ring Buffer Redesign  ✅ COMPLETE (5b48e76..4189fdf)  │
-    │   └── Phase 3: Flow Context Redesign ✅ COMPLETE (6aaa96f..e641dd5)  │
-    │       └── Refcount, ZSTD streaming, plaintext flows, bomb protection │
     │                                                                      │
     ├─► v0.11.0 - PROTOCOL EXPANSION ──────────────────────────────────────┤
     │   └── Phase 4: Protocol Detection/Routing/Parsing                    │
