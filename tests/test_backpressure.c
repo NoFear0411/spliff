@@ -14,7 +14,7 @@
  * - Two-phase evaluation pattern (stale tail mitigation)
  * - Diagnostic accessors and level names
  *
- * SPDX-License-Identifier: LGPL-3.0-only
+ * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 #include <stdio.h>

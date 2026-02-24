@@ -3,7 +3,7 @@
  * @brief Vectorscan-powered protocol detection implementation
  *
  * @copyright Copyright (C) 2025-2026 spliff authors
- * SPDX-License-Identifier: LGPL-3.0-only
+ * SPDX-License-Identifier: AGPL-3.0-only
  *
  * This module implements O(n) linear-time protocol detection using vectorscan's
  * NFA-based pattern matching. All patterns are compiled into a single database

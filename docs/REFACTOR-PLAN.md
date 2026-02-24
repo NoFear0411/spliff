@@ -78,7 +78,7 @@ v0.10.0 (Current) - FOUNDATION ✅ RELEASED
 - Multi-channel BPF ringbufs with priority drain (Phase 4)
 - io_uring async logging in Logger thread (Phase 5, with caution per ADR-002)
 - Cross-platform sensor abstraction: macOS ESF, BSD DTrace (Phase 8+)
-- Business model: AGPL-v3 + Commercial dual-license (non-engineering decision)
+- Business model: AGPL-3.0 open-source with potential commercial extensions (non-engineering decision)
 
 **Research conflicts with existing design (rejected):**
 - 128B slots with anti-prefetch padding — wastes half ring capacity, 64B is correct
@@ -170,12 +170,9 @@ Sharded ring buffers deferred to Phase 5+ (single ring sufficient at current sca
 
 ---
 
-## Phase 3: Flow Context Redesign
-**Priority:** High
-**Estimated Sessions:** 3-4
-**Target Version:** v0.10.0
-
-This phase includes ZSTD streaming decompression and flow context support for plaintext (non-TLS) flows.
+## Phase 3: Flow Context Redesign ✅ COMPLETE
+**Status:** All tasks complete. Commits `6aaa96f` (refcount + plaintext), `e641dd5` (streaming decompressor), `b3086a9` (HTTP parser wiring).
+**Sessions:** 2
 
 ### 3.1 Reference Counting Model ✅ COMPLETE (6aaa96f)
 **File:** `src/correlation/flow_context.h`, `src/correlation/flow_context.c`
@@ -424,15 +421,15 @@ This phase consolidates all protocol work: detection infrastructure, plain HTTP,
 **Priority:** Medium
 **Estimated Sessions:** 1-2
 
-### 7.1 Decompression Bomb Protection
-**File:** `src/content/decompressor.c`
+### 7.1 Decompression Bomb Protection ✅ COMPLETE (Phase 3.5)
+**File:** `src/content/stream_decompressor.c` (delivered in Phase 3)
 
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 7.1.1 | Add MAX_DECOMPRESSED_RATIO (1000:1) check | Low |
-| 7.1.2 | Add MAX_DECOMPRESSED_SIZE (100MB) check | Low |
-| 7.1.3 | Increment metrics on detection | Low |
-| 7.1.4 | Drop flow on bomb detection | Low |
+| Task | Description | Status |
+|------|-------------|--------|
+| 7.1.1 | MAX_DECOMPRESSED_RATIO (1000:1) check | ✅ `STREAM_DECOMP_MAX_RATIO` |
+| 7.1.2 | MAX_DECOMPRESSED_SIZE (100MB) check | ✅ `STREAM_DECOMP_MAX_OUTPUT` |
+| 7.1.3 | Permanent reject on detection | ✅ `DECOMP_STATE_REJECTED` |
+| 7.1.4 | Per-flow bomb protection state | ✅ Embedded in `body_ctx_t` |
 
 ### 7.2 Vectorscan Timeout (ReDoS Protection)
 **File:** `src/protocol/detector.c`
@@ -499,13 +496,13 @@ This phase consolidates all protocol work: detection infrastructure, plain HTTP,
 **Priority:** Critical (runs parallel to other phases)
 **Estimated Sessions:** Ongoing
 
-### 9.1 Unit Tests
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 9.1.1 | Mirrored buffer wrap-around tests | Medium |
-| 9.1.2 | SPMC ring concurrent access tests | High |
-| 9.1.3 | Reference counting lifecycle tests | Medium |
-| 9.1.4 | Decompression bomb detection tests | Low |
+### 9.1 Unit Tests ✅ COMPLETE (Phases 1-3)
+| Task | Description | Status |
+|------|-------------|--------|
+| 9.1.1 | Mirrored buffer wrap-around tests | ✅ 33 tests in `test_mirrored_buffer.c` |
+| 9.1.2 | SPMC ring concurrent access tests | ✅ 22 tests in `test_concurrent.c` |
+| 9.1.3 | Reference counting lifecycle tests | ✅ 11 tests in `test_flow_refcount.c` |
+| 9.1.4 | Decompression bomb detection tests | ✅ 13 tests in `test_stream_decompressor.c` |
 
 ### 9.2 Integration Tests
 | Task | Description | Complexity |
@@ -572,13 +569,8 @@ Phase 5 (Dispatcher) ─────┼─────────────�
 
 ### Feature Flags
 
-Consider adding compile-time flags to enable/disable new code paths:
-
-```c
-#define OMNI_RING_MIRRORED_BUFFERS 1
-#define OMNI_RING_SPMC_WORKERS 1
-#define OMNI_RING_REFCOUNT_FLOWS 1
-```
+Not used — Phases 1-3 are permanent architectural changes, not toggled code paths.
+Old code was removed after each phase stabilized.
 
 ---
 
@@ -597,6 +589,8 @@ Consider adding compile-time flags to enable/disable new code paths:
 | `src/ring/worker_dequeue.h/c` | Three-phase worker consumption | 2 | ✅ |
 | `src/ring/adaptive_poll.h` | Polling timeout state machine | 2 | ✅ |
 | `src/content/stream_decompressor.h/c` | Per-flow streaming decompression | 3 | ✅ |
+| `src/CMakeLists.txt` | 3 OBJECT libraries + main executable | BSM | ✅ |
+| `tests/CMakeLists.txt` | INTERFACE library + 17 test targets + CTest labels | BSM | ✅ |
 | `src/protocol/alpn_router.c` | ALPN → parser routing | 4 | |
 | `src/protocol/alpn_router.h` | ALPN router API | 4 | |
 | `src/protocol/registry.c` | Protocol parser registry | 4 | |
@@ -726,5 +720,3 @@ After phase stabilizes (tests green, no regressions):
 3. Update CODE-MAP.md to reflect removal
 
 ---
-
-Ready to begin when you are.

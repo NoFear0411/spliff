@@ -31,9 +31,9 @@
  *
  * @author spliff authors
  * @copyright 2025-2026 spliff authors
- * @license LGPL-3.0-only
+ * @license AGPL-3.0-only
  *
- * SPDX-License-Identifier: LGPL-3.0-only
+ * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 /* _GNU_SOURCE defined via CMake for memfd_create, MAP_FIXED, fcntl seals */

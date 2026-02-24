@@ -16,17 +16,20 @@
 
 ## Project Overview
 
-**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.10.0 features:
+**spliff** is a production-grade eBPF-based SSL/TLS traffic sniffer that captures decrypted HTTPS traffic without MITM proxies. Version 0.10.0 (Omni-Ring Foundation) features:
 
+- **SPMC Ring Transport** (v0.10.0): Vyukov bounded queue with mirrored virtual memory slots, 4096 capacity
+- **Connection Affinity** (v0.10.0): MPSC overflow queues for misrouted stateful events (TTAS-CAS)
+- **Reference Counting** (v0.10.0): `_Atomic uint32_t ref_count` with formal acquire/release lifecycle
+- **Streaming Decompression** (v0.10.0): Per-flow gzip/zstd/brotli with bomb protection
+- **Plaintext Flow Support** (v0.10.0): `FLOW_FLAG_PLAINTEXT` for non-TLS flows
+- **Backpressure Control** (v0.10.0): Four-level hysteresis state machine (NORMAL→WARN→CRITICAL→SHED)
 - **Dynamic Flow Pool**: On-demand allocation via jemalloc with incremental hash table resizing
-- **Per-Flow HTTP/2 Sessions**: Sessions managed in `flow_ctx->parser.h2`, not per-worker pools (v0.9.11)
-- **Embedded BPF Skeleton**: CO-RE BTF bytecode embedded in binary, strip-safe
 - **XDP-SSL Correlation**: Socket cookie "Golden Thread" links packets, sockets, and TLS data
-- **Modular Protocol Architecture**: Clean plugin-style routing for HTTP/1, HTTP/2, detection
-- **Multi-threaded Processing**: Lock-free worker threads with connection affinity
-- **Centralized Display API**: Startup/diagnostic output via display.c module (v0.9.11)
+- **Three-File CMake** (v0.10.0): OBJECT libraries solve transitive dependency propagation
+- **Embedded BPF Skeleton**: CO-RE BTF bytecode embedded in binary, strip-safe
 - **RCU-Safe Memory Reclamation**: liburcu integration for safe deferred memory frees
-- **Thread Safety**: Atomic counters, correct ring buffer semantics, single-writer guarantees
+- **Thread Safety**: Atomic counters, single-writer guarantees, correct ring semantics
 
 ---
 
@@ -40,7 +43,7 @@ spliff/
 ├── README.md                       # User documentation, examples, features
 ├── CHANGELOG.md                    # Version history and migration notes
 ├── ISSUES.md                       # Known issues, limitations, resolved bugs
-├── LICENSE                         # LGPL-3.0 for userspace, GPL-2.0 for BPF
+├── LICENSE                         # AGPL-3.0 for userspace, GPL-2.0 for BPF
 ├── src/
 │   ├── main.c                      # Entry point, CLI parsing, orchestration
 │   ├── include/
@@ -97,11 +100,11 @@ spliff/
 │   │   ├── deferred.h              # Deferred queue API
 │   │   ├── xdp_ring.c              # Per-worker XDP SPSC ring
 │   │   └── xdp_ring.h              # XDP ring API
-│   └── util/                       # Utility functions
-│       ├── safe_str.c              # Safe string operations
-│       ├── safe_str.h              # String API
-│       ├── process.c               # Process info utilities (v0.9.11)
-│       └── process.h               # Process API
+│   ├── util/                       # Utility functions
+│   │   ├── safe_str.c              # Safe string operations
+│   │   ├── safe_str.h              # String API
+│   │   ├── process.c               # Process info utilities (v0.9.11)
+│   │   └── process.h               # Process API
 │   ├── ring/                       # L1 ring transport (FROZEN, v0.10.0)
 │   │   ├── ring_event.h            # 56-byte event, 64-bit routing word
 │   │   ├── spmc_ring.h             # Vyukov SPMC ring with mirrored slots

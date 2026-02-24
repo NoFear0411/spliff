@@ -2,7 +2,7 @@
  * @file process.c
  * @brief Process information utilities implementation
  *
- * SPDX-License-Identifier: LGPL-3.0-only
+ * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 #include "process.h"

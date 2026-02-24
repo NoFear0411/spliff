@@ -1,5 +1,5 @@
 /*
- * SPDX-License-Identifier: LGPL-3.0-only
+ * SPDX-License-Identifier: AGPL-3.0-only
  *
  * spliff - eBPF-based SSL/TLS traffic sniffer
  * Copyright (C) 2025-2026 spliff authors

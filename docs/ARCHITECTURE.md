@@ -15,7 +15,7 @@
 │  │   └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘                 │    │
 │  │        │            │            │            │            │                      │    │
 │  │   ┌────▼────┐  ┌────▼────┐  ┌────▼────────────▼────┐  ┌────▼────┐                 │    │
-│  │   │ OpenSSL │  │   NSS   │  │     BoringSSL ⚠️     │  │ GnuTLS  │  SSL Libraries  │    │
+│  │   │ OpenSSL │  │   NSS   │  │     BoringSSL ⚠️      │  │ GnuTLS  │  SSL Libraries  │    │
 │  │   └────┬────┘  └────┬────┘  └──────────┬───────────┘  └────┬────┘                 │    │
 │  │        │            │                  │                   │                      │    │
 │  │        └────────────┴────────┬─────────┴───────────────────┘                      │    │
@@ -51,18 +51,24 @@
 │  │  │   • Connection affinity: hash(pid, ssl_ctx) routes to consistent worker   │    │    │
 │  │  └───────────┬───────────────────────────────────────────────────────────────┘    │    │
 │  │              │ event + flow_context_t*                                            │    │
-│  │      ┌───────┼───────┬───────────────┐                                            │    │
-│  │      ▼       ▼       ▼               ▼                                            │    │
-│  │  ┌───────┐┌───────┐┌───────┐    ┌───────┐   Lock-free SPSC queues                 │    │
-│  │  │Worker0││Worker1││Worker2│... │WorkerN│   (Concurrency Kit)                     │    │
-│  │  ├───────┤├───────┤├───────┤    ├───────┤                                         │    │
-│  │  │ Claim ││ Claim ││ Claim │    │ Claim │   Worker claims flow via atomic CAS     │    │
-│  │  │ flow  ││ flow  ││ flow  │    │ flow  │   on home_worker_id (single-writer)     │    │
-│  │  └───┬───┘└───┬───┘└───┬───┘    └───┬───┘                                         │    │
-│  │      │        │        │            │                                             │    │
-│  │      └────────┴────────┴─────┬──────┘                                             │    │
-│  │                              │                                                    │    │
-│  │                              ▼                                                    │    │
+│  │              │ ring_event_t (56B, routing word)                                   │    │
+│  │              ▼                                                                    │    │
+│  │  ┌──────────────────────────────────────────────────────────────────────────┐     │    │
+│  │  │   SPMC Ring (4096 mirrored slots, Vyukov bounded queue) v0.10.0          │     │    │
+│  │  │   Producer: dispatcher (plain head advance, single-writer)               │     │    │
+│  │  │   Consumers: workers (CAS tail advance, 4 optimal, 8+ degrades)          │     │    │
+│  │  └───────┬───────┬───────┬───────────┬──────────────────────────────────────┘     │    │
+│  │          ▼       ▼       ▼           ▼                                            │    │
+│  │  ┌───────────┐┌───────────┐┌───────────┐  ┌───────────┐                           │    │
+│  │  │ Worker 0  ││ Worker 1  ││ Worker 2  │..│ Worker N  │  Three-phase poll:        │    │
+│  │  ├───────────┤├───────────┤├───────────┤  ├───────────┤  1. Drain MPSC overflow   │    │
+│  │  │ Overflow  ││ Overflow  ││ Overflow  │  │ Overflow  │  2. Dequeue SPMC ring     │    │
+│  │  │ inbox(64) ││ inbox(64) ││ inbox(64) │  │ inbox(64) │  3. Affinity check+route  │    │
+│  │  └─────┬─────┘└─────┬─────┘└─────┬─────┘  └─────┬─────┘                           │    │
+│  │        │            │            │              │                                 │    │
+│  │        └────────────┴──────┬─────┴──────────────┘                                 │    │
+│  │                            │                                                      │    │
+│  │                            ▼                                                      │    │
 │  │  ┌───────────────────────────────────────────────────────────────────────────┐    │    │
 │  │  │   Protocol Detection & Routing (v0.9.5+)                                  │    │    │
 │  │  │                                                                           │    │    │
@@ -79,17 +85,19 @@
 │  │  │   └────────────────────────────────────────────────────────────────┘      │    │    │
 │  │  │                                                                           │    │    │
 │  │  │   Per-FLOW state (flow_context_t):                                        │    │    │
-│  │  │   • flags: HAS_XDP, HAS_SSL, IN_COOKIE, IN_SHADOW                         │    │    │
+│  │  │   • flags: HAS_XDP, HAS_SSL, IN_COOKIE, IN_SHADOW, PLAINTEXT (v0.10.0)    │    │    │
+│  │  │   • ref_count: atomic reference counting (v0.10.0)                        │    │    │
 │  │  │   • nghttp2 session + HPACK inflater + streams[64]                        │    │    │
 │  │  │   • llhttp parser + current transaction                                   │    │    │
-│  │  │   • ALPN, body buffers, hpack_corrupted                                   │    │    │
+│  │  │   • body_ctx: streaming decompression with bomb protection (v0.10.0)      │    │    │
+│  │  │   • ALPN, hpack_corrupted                                                 │    │    │
 │  │  └───────────────────────────────────────────────────────────────────────────┘    │    │
 │  │                              │                                                    │    │
 │  │                              ▼                                                    │    │
 │  │              ┌───────────────────────────┐                                        │    │
 │  │              │      Output Thread        │  Serialized stdout/file                │    │
-│  │              │  • Body decompression     │  (no interleaving)                     │    │
-│  │              │  • File signature detect  │                                        │    │
+│  │              │  • File signature detect  │  (no interleaving)                     │    │
+│  │              │  • Formatted display      │                                        │    │
 │  │              └───────────────────────────┘                                        │    │
 │  └───────────────────────────────────────────────────────────────────────────────────┘    │
 │                                                                                           │
@@ -208,7 +216,7 @@
            │  │  │           flow_context_t               │  │  │
            │  │  │  • socket_cookie, pid, ssl_ctx         │  │  │
            │  │  │  • generation (stale pointer detect)   │  │  │
-           │  │  │  • ref_count (ref counting)      │  │  │
+           │  │  │  • ref_count (ref counting)            │  │  │
            │  │  │  • flags: HAS_XDP | HAS_SSL | IN_*     │  │  │
            │  │  │  • home_worker_id (atomic ownership)   │  │  │
            │  │  │  • parser.h2 (nghttp2 + streams[64])   │  │  │
@@ -248,7 +256,7 @@ connection from which process.
 │  ┌────────────────────────────────────────────────────────────────┐  │
 │  │           flow_pool (on-demand via jemalloc)                   │  │
 │  │                                                                │  │
-│  │  active_head → [ctx_A] ⇄ [ctx_B] ⇄ [ctx_D] → NULL             │  │
+│  │  active_head → [ctx_A] ⇄ [ctx_B] ⇄ [ctx_D] → NULL              │  │
 │  │                 gen=5     gen=12     gen=8                     │  │
 │  │                 pid=100   pid=200    pid=300                   │  │
 │  │                 wkr=2     wkr=0      wkr=1                     │  │
@@ -281,10 +289,13 @@ connection from which process.
 │  │ • flow_key, ifindex, first_seen, last_seen, atomic counters    │  │
 │  │                                                                │  │
 │  │ Cache line 2+ (protocol state):                                │  │
-│  │ • flags, home_worker_id, ref_count (atomic)              │  │
+│  │ • flags: HAS_XDP, HAS_SSL, IN_COOKIE, IN_SHADOW, PLAINTEXT     │  │
+│  │ • ref_count (_Atomic uint32_t, v0.10.0)                        │  │
+│  │ • home_worker_id (atomic ownership)                            │  │
 │  │ • parser.h2 (nghttp2 + streams[64] + hpack_corrupted)          │  │
 │  │ • parser.h1 (llhttp + current_txn)                             │  │
-│  │ • alpn, body buffers, proto                                    │  │
+│  │ • body_ctx: stream_decomp_t with bomb protection (v0.10.0)     │  │
+│  │ • alpn, proto                                                  │  │
 │  └────────────────────────────────────────────────────────────────┘  │
 │                                                                      │
 │  flow_transaction_t (per HTTP/2 stream):                             │
@@ -301,8 +312,10 @@ connection from which process.
 - **Pointer-based indexes**: `flow_context_t*` directly, no indirection
 - **Incremental resize**: Hash tables grow without latency spikes (8 entries/op)
 - **Generation safety**: Stale pointer detection across worker threads
-- **Inflight counting**: Reference-counted deferred free prevents use-after-free
+- **Reference counting**: `_Atomic uint32_t ref_count` prevents use-after-free (v0.10.0)
 - **Single-writer guarantee**: Atomic CAS on `home_worker_id` prevents races
+- **Streaming decompression**: Per-flow `body_ctx_t` with bomb protection (v0.10.0)
+- **Plaintext flow support**: `FLOW_FLAG_PLAINTEXT` for non-TLS flows (v0.10.0)
 - **RCU-safe reclamation**: liburcu `call_rcu()` for safe deferred memory frees (v0.9.10)
 - **Atomic counters**: Per-flow counters use `_Atomic` with relaxed ordering (v0.9.10)
 - **O(1) stream allocation**: Free-list based pool for HTTP/2 streams
@@ -369,7 +382,7 @@ connection from which process.
 │    ┌─────────────────────┐            ┌─────────────────────┐          │
 │    │  DISPLAY IMMEDIATELY│            │   ENQUEUE DEFERRED  │          │
 │    │  [XDP:TLS][App:H2]  │            │   (wait for XDP)    │          │
-│    │      ✓✓            │            │                     │          │
+│    │      ✓✓             │            │                     │          │
 │    └─────────────────────┘            └──────────┬──────────┘          │
 │                                                  │                     │
 │                                                  ▼                     │
@@ -442,26 +455,35 @@ connection from which process.
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                        │
 │  ┌─────────────────────────────────────────────────────────────────┐   │
-│  │                    ATOMIC COUNTERS (v0.9.10)                    │   │
+│  │                 ATOMICS & RING SEMANTICS (v0.10.0)              │   │
 │  │                                                                 │   │
-│  │  Per-flow counters use _Atomic with relaxed ordering:           │   │
-│  │  • pkts_in, pkts_out    - atomic_fetch_add (relaxed)            │   │
-│  │  • bytes_in, bytes_out  - atomic_fetch_add (relaxed)            │   │
+│  │  Reference counting (v0.10.0):                                  │   │
+│  │  • ref_count: _Atomic uint32_t per flow_context_t               │   │
+│  │  • flow_ref_acquire() — relaxed (fast path)                     │   │
+│  │  • flow_ref_release() — release ordering                        │   │
+│  │  • Creator ref=1 at alloc, released in flow_terminate()         │   │
 │  │                                                                 │   │
-│  │  Logger ring uses SPMC operations:                              │   │
-│  │  • Workers: ck_ring_dequeue_spmc() from free_ring               │   │
-│  │  • Logger:  ck_ring_enqueue_spsc() to free_ring                 │   │
+│  │  Per-flow counters (_Atomic, relaxed ordering):                 │   │
+│  │  • pkts_in, pkts_out, bytes_in, bytes_out                       │   │
+│  │                                                                 │   │
+│  │  Ring buffer semantics:                                         │   │
+│  │  • SPMC event ring: dispatcher→workers (Vyukov, CAS tail)       │   │
+│  │  • MPSC overflow: workers→home worker (TTAS-CAS head, 64 slots) │   │
+│  │  • Logger free_ring: SPMC, Logger log_ring: MPSC                │   │
+│  │  • XDP rings: SPSC (dispatcher to worker)                       │   │
 │  │                                                                 │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Key v0.9.10 Thread Safety Improvements:**
-- **Single-writer guarantee**: `flow_merge_ssl_info()` isolates all write operations to dispatcher thread
-- **RCU-safe memory reclamation**: liburcu `call_rcu()` ensures readers never see freed memory
-- **Atomic counters**: Per-flow packet/byte counters are now `_Atomic` to prevent lost updates
-- **Correct ring semantics**: Logger free_ring uses SPMC (multiple workers dequeue, single logger enqueues)
+**Key Thread Safety Improvements:**
+- **Single-writer guarantee** (v0.9.10): `flow_merge_ssl_info()` isolates all write operations to dispatcher thread
+- **RCU-safe memory reclamation** (v0.9.10): liburcu `call_rcu()` ensures readers never see freed memory
+- **Atomic counters** (v0.9.10): Per-flow packet/byte counters use `_Atomic` to prevent lost updates
+- **Reference counting** (v0.10.0): `ref_count` replaces ad-hoc `inflight_events` with formal acquire/release semantics
+- **SPMC event ring** (v0.10.0): Vyukov bounded queue with mirrored slots, CAS tail advance for worker dequeue
+- **MPSC overflow** (v0.10.0): Per-worker inbox for misrouted stateful events (TTAS-CAS, zero-CAS drain)
 
 ## Data Flow
 
@@ -469,11 +491,16 @@ connection from which process.
 2. **Packet arrives** → XDP classifies protocol (TLS/HTTP2/HTTP1), tracks flow state, emits metadata
 3. **TCP established** → sock_ops caches socket cookie in `flow_cookie_map` (5-tuple → cookie)
 4. **SSL call** → Uprobe captures decrypted data, links SSL* → fd → socket cookie
-5. **Flow lookup** → Dual-index lookup: cookie_index (fast) or shadow_index (pid, ssl_ctx) → `flow_context_t*`
-6. **Worker claim** → Atomic CAS on `home_worker_id` ensures single-writer per flow; generation check detects stale pointers
-7. **Protocol routing** (v0.9.5+) → `http1_try_process_event()` → `http2_try_process_event()` → fallback
-8. **HTTP/2 streams** → O(1) allocation from free-list, per-stream body buffers, ghost stream timeout
-9. **Output** → Serialized display with request/response correlation, ALPN indicator
-10. **Cleanup** → Process exit triggers flow eviction, deferred free (2s grace + inflight drain), stream body buffer free
+5. **Dispatcher** → Polls BPF ring buffers, performs dual-index flow lookup (cookie_index or shadow_index), acquires ref_count, packs `ring_event_t` (56B), enqueues to SPMC ring (v0.10.0)
+6. **Worker dequeue** (v0.10.0) → Three-phase poll: drain MPSC overflow inbox → dequeue from shared SPMC ring → affinity check (local or defer to target worker's overflow queue)
+7. **Protocol routing** → `http1_try_process_event()` → `http2_try_process_event()` → fallback signature detection
+8. **Streaming decompression** (v0.10.0) → Per-flow `body_ctx_t` with gzip/zstd/brotli, bomb protection (>1000:1 ratio or >100MB → permanent reject)
+9. **HTTP/2 streams** → O(1) allocation from free-list, per-stream body buffers, ghost stream timeout (10s)
+10. **Output** → Serialized display with request/response correlation, deferred display queue for XDP timing
+11. **Cleanup** → Process exit triggers flow eviction, ref_count must reach 0, deferred free (2s grace), `stream_decomp_cleanup()` frees library contexts
 
 See [CODE-MAP.md](CODE-MAP.md) for complete project structure and source file reference.
+
+---
+
+*Last updated: v0.10.0 (February 2026)*

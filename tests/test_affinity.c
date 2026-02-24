@@ -13,7 +13,7 @@
  *
  * Concurrent MPSC tests (multi-producer stress) are in Task #16.
  *
- * SPDX-License-Identifier: LGPL-3.0-only
+ * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 #include <stdio.h>

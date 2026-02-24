@@ -25,7 +25,7 @@
  * single-core machines, tests still pass but may not exercise all
  * concurrency paths. The CAS retries check may fail on single-core.
  *
- * SPDX-License-Identifier: LGPL-3.0-only
+ * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 #include <stdio.h>

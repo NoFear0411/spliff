@@ -4,7 +4,7 @@
 
 [![Version](https://img.shields.io/badge/version-0.10.0-blue.svg)](CHANGELOG.md)
 [![Release](https://github.com/NoFear0411/spliff/actions/workflows/release.yml/badge.svg)](https://github.com/NoFear0411/spliff/actions/workflows/release.yml)
-[![License](https://img.shields.io/badge/license-LGPL--3.0-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
 Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. spliff uses eBPF uprobes to hook SSL/TLS library functions, intercepting data after decryption but before it reaches the application.
@@ -424,7 +424,7 @@ The codebase follows C23 standards with strict compiler warnings (`-Wall -Wextra
 
 ## License
 
-LGPL-3.0-only - See [LICENSE](LICENSE) for details.
+AGPL-3.0-only - See [LICENSE](LICENSE) for details.
 
 BPF code (`src/bpf/spliff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel requirement).
 
