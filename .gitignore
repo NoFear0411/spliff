@@ -1,26 +1,21 @@
-# Build outputs
+# ── Build outputs ────────────────────────────────────────
 build/
-build-release/
+build-*/
 obj/
 *.o
 *.a
 *.so
+*.so.*
+*.dylib
 *.bpf.o
 
-# Executables
-sslsniff
+# ── Binaries & symlinks ─────────────────────────────────
 spliff
-test_http1
-test_http2
-test_safe_str
-test_flow_context
-test_decompressor
-test_detector
-test_websocket
-test_display
-test_xdp
+sslsniff
+test_*
+!tests/test_*.c
 
-# CMake generated files
+# ── CMake generated ─────────────────────────────────────
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
@@ -33,7 +28,10 @@ _CPack_Packages/
 *.deb
 *.rpm
 
-# Editor/IDE files
+# ── BPF skeleton (generated at build time) ──────────────
+src/bpf/*.skel.h
+
+# ── Editor / IDE ────────────────────────────────────────
 *.swp
 *.swo
 *~
@@ -44,52 +42,83 @@ _CPack_Packages/
 .cproject
 .settings/
 *.kate-swp
+.ccls-cache/
+.clangd/
+.cache/
 
-# Claude Code
+# ── Claude Code / AI ────────────────────────────────────
 .claude/
 CLAUDE.md
 **/CLAUDE.md
-.cache
 
-# OS files
+# ── OS files ────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 .Spotlight-V100
 .Trashes
+desktop.ini
 
-# Secret/credential files
+# ── Secrets & credentials ───────────────────────────────
 .webui_secret_key
 *.pem
 *.key
 *.crt
+*.p12
+*.pfx
 .env
 .env.*
-research/
 
-# Old/legacy files (pre-refactor)
+# ── Research & local notes (never tracked) ──────────────
+research/
+*.txt
+
+# ── Legacy files (pre-refactor) ─────────────────────────
 sslsniff.c
 Makefile.new
 Makefile.legacy
 
-# Testing artifacts
+# ── Testing artifacts ───────────────────────────────────
 Testing/
 *.log
 core
 core.*
 vgcore.*
 
-# Coverage
+# ── Coverage ────────────────────────────────────────────
 *.gcno
 *.gcda
 *.gcov
 coverage/
 lcov.info
 
-# Package artifacts
+# ── Package / release artifacts ─────────────────────────
 *.tar.gz
+*.tar.bz2
+*.tar.xz
 *.zip
+*.AppImage
+*.flatpak
 
-# Backup files
+# ── Backup & temp files ────────────────────────────────
 *.bak
 *.orig
 *.backup
+*.tmp
+*.temp
+*.patch.bak
+
+# ── Documentation build output ──────────────────────────
+docs/html/
+docs/latex/
+docs/doxygen/
+
+# ── Profiling / debug dumps ─────────────────────────────
+perf.data
+perf.data.old
+*.perf
+*.strace
+*.valgrind
+callgrind.out.*
+cachegrind.out.*
+massif.out.*
+heaptrack.*
