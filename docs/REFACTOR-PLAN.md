@@ -7,7 +7,7 @@ research/Final.txt, research/LEGAL.txt
 **Target:** 1.0.0 (production-ready, stable API)
 **Versioning:** Semantic versioning (0.9.x → 0.10.0 → ... → 1.0.0)
 **Estimated Duration:** 8-12 weeks across multiple sessions
-**Last Updated:** 2026-02-08 (Phase 2 complete)
+**Last Updated:** 2026-02-24 (Phase 3 complete)
 
 ---
 
@@ -21,8 +21,8 @@ v0.9.11 (Current)
     ├─► v0.10.0 - FOUNDATION ──────────────────────────────────────────────┐
     │   ├── Phase 1: Memory Infrastructure ✅ COMPLETE (b037f88)           │
     │   ├── Phase 2: Ring Buffer Redesign  ✅ COMPLETE (5b48e76..4189fdf)  │
-    │   └── Phase 3: Flow Context Redesign (refcount, per-flow state)      │
-    │       └── Includes: ZSTD streaming, plain HTTP flow support          │
+    │   └── Phase 3: Flow Context Redesign ✅ COMPLETE (6aaa96f..e641dd5)  │
+    │       └── Refcount, ZSTD streaming, plaintext flows, bomb protection │
     │                                                                      │
     ├─► v0.11.0 - PROTOCOL EXPANSION ──────────────────────────────────────┤
     │   └── Phase 4: Protocol Detection/Routing/Parsing                    │
@@ -48,7 +48,7 @@ v0.9.11 (Current)
 
 | Version | Theme | Key Deliverables |
 |---------|-------|------------------|
-| **v0.10.0** | Foundation | ~~Mirrored buffers~~ ✅, ~~SPMC rings~~ ✅, refcounted flows, ZSTD streaming |
+| **v0.10.0** | Foundation | ~~Mirrored buffers~~ ✅, ~~SPMC rings~~ ✅, ~~refcounted flows~~ ✅, ~~ZSTD streaming~~ ✅ |
 | **v0.11.0** | Protocols | Plain HTTP, WebSocket, gRPC detection, HTTP/3 + QUIC |
 | **v0.12.0** | Operations | Enhanced dispatcher, comprehensive metrics, alerting |
 | **v0.13.0+** | Hardening | Security mitigations, performance tuning, stress testing |
@@ -176,81 +176,53 @@ Sharded ring buffers deferred to Phase 5+ (single ring sufficient at current sca
 
 This phase includes ZSTD streaming decompression and flow context support for plaintext (non-TLS) flows.
 
-### 3.1 Reference Counting Model
-**File:** `src/correlation/flow_context.c`
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 3.1.1 | Add `atomic_uint32_t ref_count` to `flow_context_t` | Low |
-| 3.1.2 | Initialize with 2 refs (kernel + user) on creation | Low |
-| 3.1.3 | Implement `flow_ref_acquire()` and `flow_ref_release()` | Medium |
-| 3.1.4 | Trigger cleanup when ref_count reaches 0 | Medium |
-| 3.1.5 | Remove current generation-based stale detection (replaced by refcount) | Medium |
-
-**Current Gap:** Using generation numbers; refcount is cleaner and prevents use-after-free races.
-
-### 3.2 Per-Flow Mirrored Buffers
-**File:** `src/correlation/flow_context.c`
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 3.2.1 | Add `char *stream_buf` (mirrored) for TCP reassembly | Medium |
-| 3.2.2 | Add `char *plaintext_buf` (mirrored) for decompressed output | Medium |
-| 3.2.3 | Lazy allocation on first data arrival | Medium |
-| 3.2.4 | Safe append with overflow protection (see research 6.3.2) | High |
-
-**Current Gap:** Body buffers exist but not mirrored; potential wrap issues.
-
-### 3.3 Lazy Parser Initialization
-**File:** `src/protocol/http1.c`, `src/protocol/http2.c`
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 3.3.1 | Move parser init from flow creation to first data | Medium |
-| 3.3.2 | Add `parser.initialized` flag checking | Low |
-| 3.3.3 | Implement `ensure_parser_initialized(flow, first_bytes)` | Medium |
-
-**Current Gap:** Per-flow H2 sessions exist (v0.9.11); ensure lazy init pattern.
-
-### 3.4 Per-Flow Vectorscan Stream State
-**File:** `src/correlation/flow_context.h`, `src/protocol/detector.c`
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 3.4.1 | Add `hs_stream_t *vs_stream` to flow_context_t | Low |
-| 3.4.2 | Add `detect.detection_stream` for protocol detection (separate) | Medium |
-| 3.4.3 | Implement stream recycling via `hs_reset_stream()` | Medium |
-| 3.4.4 | Cleanup streams in `flow_ref_release()` | Low |
-
-**Current Gap:** Vectorscan streams may be per-worker; should be per-flow for streaming.
-
-### 3.5 Per-Flow Decompression State & ZSTD Streaming
-**File:** `src/content/decompressor.c`
-
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 3.5.1 | Add `decomp` union to flow_context_t (zstd/zlib/brotli) | Medium |
-| 3.5.2 | Implement `init_*_decompressor(flow)` per type | Low |
-| 3.5.3 | Implement streaming decompression per flow | Medium |
-| 3.5.4 | **ZSTD streaming:** Use `ZSTD_decompressStream()` with per-flow `ZSTD_DStream` | Medium |
-| 3.5.5 | **ZSTD window limit:** `ZSTD_d_windowLogMax` to prevent memory exhaustion | Low |
-| 3.5.6 | Add decompression bomb detection (ratio + size limits) | High |
-| 3.5.7 | Cleanup decompressors in `flow_ref_release()` | Low |
-
-**Current Gap:** Decompression exists but not fully streaming; bomb protection may be incomplete.
-**Roadmap Item:** ZSTD streaming (from v0.10 roadmap).
-
-### 3.6 Plaintext Flow Support
+### 3.1 Reference Counting Model ✅ COMPLETE (6aaa96f)
 **File:** `src/correlation/flow_context.h`, `src/correlation/flow_context.c`
 
-| Task | Description | Complexity |
-|------|-------------|------------|
-| 3.6.1 | Add `FLOW_FLAG_PLAINTEXT` flag to distinguish from TLS flows | Low |
-| 3.6.2 | Support flow creation without SSL context (plaintext path) | Medium |
-| 3.6.3 | Modify shadow index to handle plaintext-only flows | Medium |
+Replaced ad-hoc `inflight_events` with formal `_Atomic uint32_t ref_count`.
+- Creator's reference (1) initialized in `flow_pool_alloc()`, released in `flow_terminate()`
+- Dispatcher acquires ref before dispatch, worker releases after processing
+- Inline helpers: `flow_ref_acquire()` (relaxed), `flow_ref_release()` (release), `flow_ref_count()` (acquire)
+- Deferred free gate: both ref_count==0 AND 2s grace required before actual free
+- 11 tests in `tests/test_flow_refcount.c`
 
-**Current Gap:** Flow context assumes TLS; need support for unencrypted flows.
-**Roadmap Item:** Plain HTTP capture (from v0.10 roadmap).
+### 3.2 Per-Flow Mirrored Buffers — DEFERRED
+**Reason:** Body buffers are written sequentially, never wrap. Mirrored buffers add
+complexity without benefit here. Revisit for TCP reassembly (Phase 4+).
+
+### 3.3 Lazy Parser Initialization ✅ ALREADY DONE
+**File:** `src/threading/worker.c`
+
+Already implemented: HTTP/2 checks `parser.h2.session == NULL` before `flow_h2_session_init()`,
+HTTP/1 checks `parser.h1.initialized` before `flow_h1_parser_init()`. Late init handles
+ALPN arriving after initial claim. No changes needed.
+
+### 3.4 Per-Flow Vectorscan Stream State — DEFERRED
+**Reason:** Vectorscan is used for one-shot protocol detection (`hs_scan` in BLOCK mode).
+Once `ctx->proto` is cached, scanning stops. Streaming mode only needed for ongoing
+security pattern matching (Phase 7).
+
+### 3.5 Per-Flow Streaming Decompression ✅ COMPLETE (e641dd5)
+**Files:** `src/content/stream_decompressor.h`, `src/content/stream_decompressor.c`
+
+New streaming decompression module supporting gzip/deflate (zlib-ng), zstd, and brotli:
+- `stream_decomp_t` embedded in `body_ctx_t` for per-flow lifetime
+- Lazy init on first chunk, reset between HTTP responses on persistent connections
+- ZSTD: `ZSTD_DStream` with `ZSTD_d_windowLogMax=23` (8MB window cap)
+- gzip/deflate: zlib-ng `inflateInit2(15+32)` for auto-detect wrapper
+- Brotli: `BrotliDecoderCreateInstance` streaming decoder
+- Bomb protection: >1000:1 ratio and >100MB total output, permanent reject until reset
+- Automatic cleanup in `flow_free_resources()` via `stream_decomp_cleanup()`
+- 13 tests in `tests/test_stream_decompressor.c`
+
+### 3.6 Plaintext Flow Support ✅ COMPLETE (6aaa96f)
+**Files:** `src/correlation/flow_context.h`, `src/correlation/flow_context.c`
+
+- Added `FLOW_FLAG_PLAINTEXT = (1 << 5)` to `enum flow_flags`
+- `flow_is_plaintext()` inline helper for flag checking
+- Auto-detect: `ssl_ctx == 0 && cookie != 0` sets PLAINTEXT flag in `flow_get_or_create()`
+- State transition: INIT→ACTIVE allowed with only XDP (no SSL required) for plaintext flows
+- Tests in `tests/test_flow_refcount.c` (plaintext tests #6-#9)
 
 ---
 
@@ -581,9 +553,9 @@ Phase 5 (Dispatcher) ─────┼─────────────�
 1. ~~**Week 1-2:** Complete Phase 1 (Memory Infrastructure)~~ ✅ DONE
    - Mirrored buffers, hugepage stubs, NUMA stubs, alignment macros
 
-2. **Week 2-3:** ~~Complete Phases 2~~-3 (~~Ring Buffers~~ ✅ + Flow Context)
-   - Phase 2 complete: SPMC ring, affinity, backpressure, worker dequeue, adaptive poll
-   - Phase 3 remaining: Session registry, refcounted flows, ZSTD streaming
+2. ~~**Week 2-3:** Complete Phases 2-3 (Ring Buffers + Flow Context)~~ ✅ DONE
+   - Phase 2: SPMC ring, affinity, backpressure, worker dequeue, adaptive poll
+   - Phase 3: ref_count, plaintext flows, streaming decompression, bomb protection
 
 3. **Week 3-4:** Complete Phases 4-5 (Protocol + Dispatcher)
    - Builds on new flow context
@@ -623,6 +595,7 @@ Consider adding compile-time flags to enable/disable new code paths:
 | `src/ring/backpressure.h/c` | Four-level state machine with hysteresis | 2 | ✅ |
 | `src/ring/worker_dequeue.h/c` | Three-phase worker consumption | 2 | ✅ |
 | `src/ring/adaptive_poll.h` | Polling timeout state machine | 2 | ✅ |
+| `src/content/stream_decompressor.h/c` | Per-flow streaming decompression | 3 | ✅ |
 | `src/protocol/alpn_router.c` | ALPN → parser routing | 4 | |
 | `src/protocol/alpn_router.h` | ALPN router API | 4 | |
 | `src/protocol/registry.c` | Protocol parser registry | 4 | |
@@ -642,8 +615,8 @@ Consider adding compile-time flags to enable/disable new code paths:
 
 | File | Changes | Phase |
 |------|---------|-------|
-| `src/correlation/flow_context.h` | Add ref_count, mirrored buffers, detect state, plaintext flag | 3 |
-| `src/correlation/flow_context.c` | Implement ref counting, safe append, plaintext support | 3 |
+| `src/correlation/flow_context.h` | ref_count, plaintext flag, stream_decomp_t ✅ | 3 |
+| `src/correlation/flow_context.c` | ref counting, plaintext detection, stream cleanup ✅ | 3 |
 | `src/threading/dispatcher.c` | SPMC integration, batch signaling | 2, 5 |
 | `src/threading/worker.c` | Batch dequeue, dual scratch spaces | 2 |
 | `src/protocol/detector.c` | Streaming detection, plaintext HTTP, WebSocket patterns | 4 |
