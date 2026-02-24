@@ -132,10 +132,11 @@ int deferred_queue_init(deferred_queue_t *q, size_t prealloc) {
 
     memset(q, 0, sizeof(*q));
 
-    /* Pre-allocate free list entries to avoid malloc in hot path
-     * FIX L3: Use aligned_alloc for cache-line alignment (64 bytes) */
+    /* Pre-allocate free list entries to avoid malloc in hot path.
+     * aligned_alloc requires size to be a multiple of alignment (C11 7.22.3.1). */
+    size_t alloc_size = (sizeof(deferred_msg_t) + 63) & ~(size_t)63;
     for (size_t i = 0; i < prealloc; i++) {
-        deferred_msg_t *entry = aligned_alloc(64, sizeof(deferred_msg_t));
+        deferred_msg_t *entry = aligned_alloc(64, alloc_size);
         if (entry) {
             memset(entry, 0, sizeof(deferred_msg_t));
             entry->next = q->free_list;
