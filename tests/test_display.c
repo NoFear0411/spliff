@@ -10,7 +10,7 @@
  *
  * @author spliff authors
  * @copyright 2025-2026 spliff authors
- * @license GPL-3.0-only
+ * @license LGPL-3.0-only
  */
 
 #include <stdio.h>

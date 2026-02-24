@@ -28,9 +28,9 @@
  *
  * @author spliff authors
  * @copyright 2025-2026 spliff authors
- * @license GPL-3.0-only
+ * @license LGPL-3.0-only
  *
- * SPDX-License-Identifier: GPL-3.0-only
+ * SPDX-License-Identifier: LGPL-3.0-only
  */
 
 #ifndef HTTP1_H

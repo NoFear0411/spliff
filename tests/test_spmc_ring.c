@@ -13,7 +13,7 @@
  *
  * Concurrent tests (multi-consumer) are in Task #16.
  *
- * SPDX-License-Identifier: GPL-3.0-only
+ * SPDX-License-Identifier: LGPL-3.0-only
  */
 
 #include <stdio.h>

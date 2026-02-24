@@ -40,7 +40,7 @@ spliff/
 ├── README.md                       # User documentation, examples, features
 ├── CHANGELOG.md                    # Version history and migration notes
 ├── ISSUES.md                       # Known issues, limitations, resolved bugs
-├── LICENSE                         # GPL-3.0 for userspace, GPL-2.0 for BPF
+├── LICENSE                         # LGPL-3.0 for userspace, GPL-2.0 for BPF
 ├── src/
 │   ├── main.c                      # Entry point, CLI parsing, orchestration
 │   ├── include/
@@ -65,8 +65,10 @@ spliff/
 │   │   ├── websocket.c             # WebSocket frame parser
 │   │   └── websocket.h             # WebSocket API
 │   ├── content/                    # Content decompression and identification
-│   │   ├── decompressor.c          # gzip/zstd/brotli decompression
+│   │   ├── decompressor.c          # Per-transaction gzip/zstd/brotli decompression
 │   │   ├── decompressor.h          # Decompressor API
+│   │   ├── stream_decompressor.c   # Per-flow streaming decompression with bomb protection (v0.10.0)
+│   │   ├── stream_decompressor.h   # Streaming decompressor API
 │   │   ├── signatures.c            # File magic detection (50+ formats)
 │   │   └── signatures.h            # Signature database and API
 │   ├── output/                     # Terminal output and logging
@@ -100,14 +102,53 @@ spliff/
 │       ├── safe_str.h              # String API
 │       ├── process.c               # Process info utilities (v0.9.11)
 │       └── process.h               # Process API
-├── tests/                          # Unit tests
-│   ├── test_common.c
-│   ├── test_http1.c
-│   ├── test_http2.c
-│   └── test_xdp.c
+│   ├── ring/                       # L1 ring transport (FROZEN, v0.10.0)
+│   │   ├── ring_event.h            # 56-byte event, 64-bit routing word
+│   │   ├── spmc_ring.h             # Vyukov SPMC ring with mirrored slots
+│   │   ├── spmc_ring.c             # SPMC implementation with CAS backoff
+│   │   ├── affinity.h              # Inline affinity check, MPSC overflow
+│   │   ├── affinity.c              # Affinity routing implementation
+│   │   ├── backpressure.h          # Four-level hysteresis state machine
+│   │   ├── backpressure.c          # Backpressure implementation
+│   │   ├── worker_dequeue.h        # Three-phase poll: overflow→SPMC→route
+│   │   ├── worker_dequeue.c        # Worker dequeue implementation
+│   │   └── adaptive_poll.h         # Header-only polling state machine
+│   └── memory/                     # Memory infrastructure (v0.10.0)
+│       ├── alignment.h             # Cache-line alignment macros
+│       ├── mirrored_buffer.h       # Zero-copy mirrored virtual memory
+│       ├── mirrored_buffer.c       # memfd + mmap mirrored buffer implementation
+│       ├── hugepage.h              # Hugepage allocation helpers
+│       ├── hugepage.c              # Hugepage implementation
+│       ├── numa_alloc.h            # NUMA-aware allocation stubs
+│       └── numa_alloc.c            # NUMA allocation implementation
+├── src/CMakeLists.txt              # OBJECT libraries + main executable (v0.10.0)
+├── tests/                          # Unit tests (17 suites, 19 files)
+│   ├── CMakeLists.txt              # Test targets, CTest labels, module groups (v0.10.0)
+│   ├── test_common.c              # Shared test helpers
+│   ├── test_stubs.c               # Stub functions for isolated testing
+│   ├── test_http1.c               # HTTP/1.x parser tests
+│   ├── test_http2.c               # HTTP/2 parser tests
+│   ├── test_flow_context.c        # Flow pool and dual-index tests
+│   ├── test_flow_refcount.c       # Reference counting tests (v0.10.0)
+│   ├── test_detector.c            # Vectorscan protocol detection tests
+│   ├── test_websocket.c           # WebSocket frame parsing tests
+│   ├── test_safe_str.c            # Safe string operation tests
+│   ├── test_display.c             # Output formatting tests
+│   ├── test_decompressor.c        # Per-transaction decompression tests
+│   ├── test_stream_decompressor.c # Streaming decompression tests (v0.10.0)
+│   ├── test_xdp.c                # XDP structure tests
+│   ├── test_mirrored_buffer.c    # Mirrored buffer tests (v0.10.0)
+│   ├── test_spmc_ring.c          # SPMC ring buffer tests (v0.10.0)
+│   ├── test_concurrent.c         # Concurrent ring stress tests (v0.10.0)
+│   ├── test_affinity.c           # Affinity routing tests (v0.10.0)
+│   ├── test_backpressure.c       # Backpressure state machine tests (v0.10.0)
+│   └── test_worker_dequeue.c     # Worker dequeue + adaptive poll tests (v0.10.0)
 └── docs/                           # Documentation
     ├── ARCHITECTURE.md             # System diagrams and data flow
+    ├── ARCHITECTURE-DECISIONS.md   # ADR-001 (SPMC), ADR-002 (three-layer), ADR-003 (session registry)
     ├── CODE-MAP.md                 # This file
+    ├── REFACTOR-PLAN.md            # Omni-Ring implementation roadmap (Phases 1-9)
+    ├── RESEARCH-ANALYSIS.md        # Research cross-reference and validation
     ├── EDR_XDR_ROADMAP.md          # Long-term EDR/XDR vision
     └── TROUBLESHOOTING.md          # Common issues and solutions
 ```
@@ -286,7 +327,7 @@ spliff/
 ### Content Processing
 
 #### `src/content/decompressor.c` (~237 lines)
-**Purpose:** Decompress HTTP bodies
+**Purpose:** Per-transaction HTTP body decompression
 
 **Supported Formats:**
 | Format | Library |
@@ -295,6 +336,25 @@ spliff/
 | deflate | zlib |
 | zstd | libzstd |
 | brotli | libbrotlidec |
+
+---
+
+#### `src/content/stream_decompressor.c` (~350 lines) (NEW v0.10.0)
+**Purpose:** Per-flow streaming decompression with bomb protection
+
+**Key Features:**
+- Streaming state persists across chunks (embedded in `body_ctx_t`)
+- Bomb protection: >1000:1 ratio or >100MB output → permanent reject
+- gzip/deflate (zlib-ng), zstd (ZSTD_DStream, windowLogMax=23), brotli
+- Cleanup via `flow_free_resources()` on flow termination
+
+**Key Functions:**
+| Function | Purpose |
+|----------|---------|
+| `stream_decomp_init()` | Initialize streaming state for encoding |
+| `stream_decomp_feed()` | Feed compressed chunk, get decompressed output |
+| `stream_decomp_reset()` | Reset between HTTP transactions |
+| `stream_decomp_cleanup()` | Free library contexts |
 
 ---
 
@@ -335,16 +395,23 @@ typedef struct flow_context {
     /* Application View (from SSL) */
     char comm[16], alpn[16], ifname[16];
 
+    /* Lifecycle (v0.10.0) */
+    _Atomic uint32_t ref_count;     // Reference counting (replaces inflight_events)
+                                    // flow_ref_acquire() / flow_ref_release()
+
     /* State and Flags */
     flow_proto_t proto;             // UNKNOWN, HTTP1, HTTP2, OTHER
     flow_state_t state;             // INIT, ACTIVE, CLOSING, CLOSED
-    uint8_t flags;                  // HAS_XDP, HAS_SSL, IN_COOKIE, IN_SHADOW
+    _Atomic uint8_t flags;          // HAS_XDP, HAS_SSL, IN_COOKIE, IN_SHADOW, PLAINTEXT
 
     /* Protocol Parser (union to save memory) */
     union {
         h1_parser_ctx_t h1;         // HTTP/1.x context
         h2_parser_ctx_t h2;         // HTTP/2 context
     } parser;
+
+    /* Per-Flow Streaming Decompression (v0.10.0) */
+    body_ctx_t body_ctx;            // Embedded stream_decomp_t with bomb protection
     ...
 } flow_context_t;
 ```
@@ -530,6 +597,59 @@ typedef struct {
 
 ---
 
+### Ring Transport (L1 — FROZEN, v0.10.0)
+
+#### `src/ring/ring_event.h` (header-only)
+**Purpose:** 56-byte event structure with 64-bit routing word for connection affinity
+
+#### `src/ring/spmc_ring.h/c` (~600 lines)
+**Purpose:** Vyukov-style SPMC ring with mirrored virtual memory slots, CAS backoff, mlock
+
+**Key Features:**
+- Single-producer (dispatcher), multi-consumer (workers)
+- Mirrored buffer eliminates wrap-around branching
+- Exponential CAS backoff (4 workers optimal, 8+ degrades)
+
+#### `src/ring/affinity.h/c` (~500 lines)
+**Purpose:** Connection affinity routing with per-worker MPSC overflow queues
+
+**Key Features:**
+- Inline affinity check: `hash(pid, ssl_ctx) % num_workers`
+- MPSC overflow (TTAS-CAS) for misrouted stateful events
+- Cache-isolated producer/consumer lines (zero false sharing)
+
+#### `src/ring/backpressure.h/c` (~300 lines)
+**Purpose:** Four-level hysteresis state machine (NORMAL → WARN → CRITICAL → SHED)
+
+#### `src/ring/worker_dequeue.h/c` (~400 lines)
+**Purpose:** Three-phase consumption: overflow → SPMC → affinity route
+
+#### `src/ring/adaptive_poll.h` (header-only)
+**Purpose:** Polling state machine with exponential backoff for worker threads
+
+---
+
+### Memory Infrastructure (v0.10.0)
+
+#### `src/memory/mirrored_buffer.h/c` (~300 lines)
+**Purpose:** Zero-copy mirrored virtual memory via memfd + mmap for wrap-free ring buffers
+
+**Key Features:**
+- Two virtual mappings of the same physical pages (memfd-backed)
+- Pre-fault with `MAP_POPULATE` + `mlock`
+- memfd sealing (F_SEAL_SHRINK | F_SEAL_GROW) for safety
+
+#### `src/memory/hugepage.h/c` (~200 lines)
+**Purpose:** Transparent hugepage allocation for large ring buffer backing stores
+
+#### `src/memory/alignment.h` (header-only)
+**Purpose:** Cache-line alignment macros (`CACHE_ALIGNED`, `CACHELINE_SIZE`)
+
+#### `src/memory/numa_alloc.h/c` (~100 lines)
+**Purpose:** NUMA-aware allocation stubs (future: pin worker memory to local NUMA node)
+
+---
+
 ### Output
 
 #### `src/output/display.c` (~730 lines, expanded in v0.9.11)
@@ -592,7 +712,28 @@ typedef struct {
 
 ## Build System
 
-### CMakeLists.txt
+### Architecture (3-File CMake Split, v0.10.0)
+
+The build system uses three CMake files with OBJECT libraries to solve the transitive
+dependency problem — adding a new dependency to `flow_context.c` now propagates automatically
+to all test targets.
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `CMakeLists.txt` | ~800 | Options, deps, BPF skeleton, docs, install, CPack |
+| `src/CMakeLists.txt` | ~190 | 3 OBJECT libraries + main executable |
+| `tests/CMakeLists.txt` | ~290 | INTERFACE library + 17 test targets + CTest labels |
+
+**OBJECT Libraries:**
+| Library | Files | Purpose |
+|---------|-------|---------|
+| `spliff_memory` | 1 | `mirrored_buffer.c` — shared by core + ring |
+| `spliff_core` | 15 | Correlation, protocol, content, threading, util |
+| `spliff_ring` | 4 | L1 transport layer (FROZEN) |
+
+**INTERFACE Library:**
+- `spliff_common_deps` wraps 9 shared link dependencies for heavy test targets
+- Uses `${ALLOCATOR_TARGET}` (jemalloc or mimalloc) instead of hardcoded `PkgConfig::JEMALLOC`
 
 **Language:** C23 with `-Wall -Wextra -Wpedantic`
 
@@ -612,6 +753,7 @@ typedef struct {
 |------|---------|---------|
 | `USE_VECTORSCAN` | ON | O(n) protocol detection |
 | `USE_ZLIB_NG` | ON | SIMD decompression |
+| `USE_MIMALLOC` | OFF | mimalloc instead of jemalloc |
 | `ENABLE_LTO` | ON | Link-time optimization |
 | `ENABLE_ZSTD` | ON | zstd decompression |
 | `ENABLE_BROTLI` | ON | brotli decompression |
@@ -629,9 +771,24 @@ typedef struct {
 | ck | Lock-free data structures |
 | libxdp | XDP attachment |
 | liburcu | RCU synchronization |
-| jemalloc | Memory allocation |
+| jemalloc/mimalloc | Memory allocation |
 | vectorscan/hyperscan | Pattern matching |
 | pcre2 | Regex fallback |
+
+### Makefile (Ninja Auto-Detection, v0.10.0)
+
+The Makefile auto-detects Ninja for 2-5x faster incremental builds and provides
+module-level test targets using CTest labels.
+
+**Module Test Targets:**
+| Target | Label | Suites |
+|--------|-------|--------|
+| `make test-ring` | ring | 5 (spmc_ring, affinity, concurrent, backpressure, worker_dequeue) |
+| `make test-protocol` | protocol | 4 (http1, http2, websocket, detector) |
+| `make test-flow` | flow | 2 (flow_context, flow_refcount) |
+| `make test-content` | content | 2 (decompressor, stream_decompressor) |
+| `make test-memory` | memory | 1 (mirrored_buffer) |
+| `make test-util` | util | 3 (safe_str, display, xdp) |
 
 ---
 
@@ -673,8 +830,13 @@ typedef struct {
 │                   USER SPACE (spliff)                           │
 ├─────────────────────────────────────────────────────────────────┤
 │ dispatcher_poll_ringbuf()                                       │
-│   ↓ hash(pid, ssl_ctx) % num_workers                            │
-│ worker input ring → worker thread                               │
+│   ↓ pack into ring_event_t (56B, routing word)                  │
+│   ↓ enqueue to SPMC ring (4096 mirrored slots)                  │
+│                                                                  │
+│ worker_dequeue (three-phase poll):                               │
+│   1. drain MPSC overflow inbox (zero CAS, highest priority)     │
+│   2. dequeue from shared SPMC ring (CAS tail advance)           │
+│   3. affinity_check → local or defer to target overflow queue   │
 │   ↓ flow_lookup() — cookie_index (fast) or shadow_index         │
 │   ↓ generation check — detect stale pointers                    │
 │   ↓ http1_try_process_event() or http2_try_process_event()      │
@@ -708,11 +870,13 @@ typedef struct {
 
 **Result:** Single flow_context_t with complete L3/L4/L7 view
 
-### 3. Connection Affinity
+### 3. Connection Affinity (v0.10.0)
 
-- `hash(pid, ssl_ctx) % num_workers` → deterministic routing
-- Same connection always → same worker
-- Worker has exclusive access (no locks on per-connection state)
+- `socket_cookie % num_workers` → deterministic routing via SPMC ring routing word
+- Stateless events (HTTP/1) processed by any worker (AFFINITY_LOCAL)
+- Stateful events (HTTP/2, WebSocket) routed to preferred worker
+- Misrouted events → MPSC overflow queue (TTAS-CAS push, zero-CAS drain)
+- Overflow full → process locally (slow path, increment `misrouted_local_hits`)
 
 ### 4. Modular Protocol Architecture
 
@@ -752,7 +916,9 @@ signature_detect(...);  // Fallback
 - Per-flow counters (`pkts_in`, `bytes_in`, etc.) use `_Atomic uint32_t`
 - Memory ordering: `memory_order_relaxed` for performance (counters are approximate)
 
-**Ring Buffer Semantics:**
+**Ring Buffer Semantics (v0.10.0):**
+- SPMC event ring: dispatcher→workers (Vyukov bounded, CAS tail, 4096 mirrored slots)
+- MPSC overflow: workers→home worker (per-worker inbox, TTAS-CAS head, 64 slots)
 - Logger `free_ring`: SPMC (workers dequeue, logger enqueues)
 - Logger `log_ring`: MPSC (workers enqueue, logger dequeues)
 - XDP rings: SPSC (dispatcher to worker)
@@ -764,10 +930,11 @@ signature_detect(...);  // Fallback
 See [../ISSUES.md](../ISSUES.md) for the full list of open issues, known limitations, and resolved bugs.
 
 ### Future Features
+- [ ] Protocol detection engine + multi-protocol routing (Phase 4, v0.11.0)
 - [ ] HTTP/3 (QUIC) support (planned v0.11.0)
-- [ ] WebSocket frame parsing (planned v1.0)
+- [ ] WebSocket upgrade detection + frame parsing (planned v0.11.0)
 - [ ] TUI mode
-- [ ] EDR/XDR agent mode + event streaming
+- [ ] EDR/XDR agent mode + NATS event streaming
 
 ---
 
@@ -775,15 +942,18 @@ See [../ISSUES.md](../ISSUES.md) for the full list of open issues, known limitat
 
 | Metric | Value |
 |--------|-------|
-| Total Lines of Code | ~18,600 (reduced ~800 lines in v0.9.11) |
+| Total Lines of Code | ~32,600 |
 | BPF Program | ~3,372 lines |
-| Source Files | 27+ (added process.c/h) |
+| Source Files | 67 (.c + .h in src/) |
+| Test Suites | 17 (19 test files) |
 | SSL Libraries | 5 (OpenSSL, GnuTLS, NSS, WolfSSL, BoringSSL) |
 | HTTP Protocols | 2 (HTTP/1.1, HTTP/2) |
-| Decompression Formats | 4 |
+| Decompression Formats | 4 (gzip, deflate, zstd, brotli) |
 | File Signatures | 50+ |
 | Max Workers | 16 |
 | Max HTTP/2 Streams | 64 per flow |
+| SPMC Ring Slots | 4096 (mirrored, zero-copy) |
+| Overflow Queue | 64 slots per worker (MPSC) |
 
 ---
 

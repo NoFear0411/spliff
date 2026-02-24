@@ -15,9 +15,9 @@
  *
  * @author spliff authors
  * @copyright 2025-2026 spliff authors
- * @license GPL-3.0-only
+ * @license LGPL-3.0-only
  *
- * SPDX-License-Identifier: GPL-3.0-only
+ * SPDX-License-Identifier: LGPL-3.0-only
  */
 
 /* _GNU_SOURCE defined via CMake for mmap flags */

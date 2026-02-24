@@ -84,9 +84,9 @@
  *
  * @author spliff authors
  * @copyright 2025-2026 spliff authors
- * @license GPL-3.0-only
+ * @license LGPL-3.0-only
  *
- * SPDX-License-Identifier: GPL-3.0-only
+ * SPDX-License-Identifier: LGPL-3.0-only
  */
 
 #ifndef SPLIFF_AFFINITY_H
@@ -189,7 +189,7 @@ typedef struct mpsc_slot {
     ring_event_t event;     /**< 56-byte event payload */
 } mpsc_slot_t;
 
-static_assert(sizeof(mpsc_slot_t) == 64);
+static_assert(sizeof(mpsc_slot_t) == 64, "mpsc_slot_t must be exactly one cache line");
 
 /*============================================================================
  * MPSC Overflow Queue Structure (Per-Worker)
@@ -234,8 +234,8 @@ typedef struct affinity_overflow {
 
 } affinity_overflow_t;
 
-static_assert(offsetof(affinity_overflow_t, tail) == 128);
-static_assert(offsetof(affinity_overflow_t, slots) == 256);
+static_assert(offsetof(affinity_overflow_t, tail) == 128, "tail must be on second cache line");
+static_assert(offsetof(affinity_overflow_t, slots) == 256, "slots must start at third cache line pair");
 
 /*============================================================================
  * Lifecycle

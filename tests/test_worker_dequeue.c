@@ -14,7 +14,7 @@
  * - Re-check helper (worker_dequeue_has_work)
  * - Adaptive poll state machine transitions
  *
- * SPDX-License-Identifier: GPL-3.0-only
+ * SPDX-License-Identifier: LGPL-3.0-only
  */
 
 #include <stdio.h>

@@ -4,7 +4,7 @@
 
 [![Version](https://img.shields.io/badge/version-0.10.0-blue.svg)](CHANGELOG.md)
 [![Release](https://github.com/NoFear0411/spliff/actions/workflows/release.yml/badge.svg)](https://github.com/NoFear0411/spliff/actions/workflows/release.yml)
-[![License](https://img.shields.io/badge/license-GPL--3.0-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-LGPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
 
 Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. spliff uses eBPF uprobes to hook SSL/TLS library functions, intercepting data after decryption but before it reaches the application.
@@ -32,7 +32,7 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **Dynamic Flow Pool**: On-demand allocation via jemalloc with cache-line alignment
 - **Generation Counters**: Safe pointer validation across worker threads
 - **RCU-Safe Memory**: liburcu `call_rcu()` for safe deferred hash table frees
-- **Inflight Event Counting**: Reference counting prevents use-after-free during cleanup
+- **Reference Counting**: Atomic ref_count lifecycle prevents use-after-free during cleanup (v0.10.0)
 
 ### XDP Packet-Level Tracking
 - **High-Performance Flow Tracking**: XDP programs at network interface level
@@ -42,11 +42,13 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 - **Dual Warm-up Strategy**: BPF map + Netlink SOCK_DIAG for pre-existing connections
 
 ### Multi-Threaded Architecture
-- **Lock-Free Event Processing**: Dispatcher → Worker threads via SPSC ring buffers
-- **Connection Affinity**: Same (pid, ssl_ctx) always routes to same worker
+- **SPMC Ring Transport**: Vyukov-style single-producer multi-consumer ring with mirrored buffer zero-copy (v0.10.0)
+- **Connection Affinity**: `hash(pid, ssl_ctx)` routes to consistent worker with MPSC overflow (v0.10.0)
+- **Backpressure Control**: Four-level hysteresis state machine (NORMAL→WARN→CRITICAL→SHED) (v0.10.0)
 - **Per-Flow HTTP/2 Sessions**: 64-stream pool per flow with O(1) free-list allocation
 - **Async MPSC Logger**: Lock-free logging pipeline with eventfd notification
 - **Deferred Display Queue**: Waits for XDP correlation before display (100ms timeout)
+- **Streaming Decompression**: Per-flow gzip/zstd/brotli with bomb protection (>1000:1 ratio reject) (v0.10.0)
 
 ### BPF-Level Filtering
 - **Socket Family Detection**: Filters AF_UNIX (IPC) at kernel level
@@ -208,7 +210,13 @@ sudo make install
 | `make` / `make debug` | Debug build with sanitizers (ASan, UBSan) |
 | `make release` | Optimized, stripped binary |
 | `make relsan` | Optimized with sanitizers (for testing) |
-| `make test` | Build and run tests |
+| `make tests` | Build and run all 17 test suites |
+| `make test-ring` | Ring transport tests only (5 suites) |
+| `make test-protocol` | Protocol parser tests only (4 suites) |
+| `make test-flow` | Flow context tests only (2 suites) |
+| `make test-content` | Decompression tests only (2 suites) |
+| `make test-memory` | Memory infrastructure tests only (1 suite) |
+| `make test-util` | Utility tests only (3 suites) |
 | `make docs` | Generate Doxygen API documentation |
 | `make clean` | Remove build artifacts |
 | `make install` | Install to /usr/local/bin |
@@ -235,33 +243,40 @@ Documentation includes:
 
 ### Testing
 
-Build and run the unit test suite (148 tests):
+Build and run the full test suite (17 suites):
 
 ```bash
-# Build all tests
-cmake --build build-release --target build_tests
+# Build and run all tests
+make tests
 
-# Run individual tests
-./build-release/test_http1       # HTTP/1.x parsing (10 tests)
-./build-release/test_http2       # HTTP/2 parsing (8 tests)
-./build-release/test_safe_str    # Memory-safe strings (30 tests)
-./build-release/test_flow_context # Flow correlation (24 tests)
-./build-release/test_decompressor # Compression (21 tests)
-./build-release/test_detector    # Protocol detection (18 tests)
-./build-release/test_websocket   # WebSocket frames (22 tests)
-./build-release/test_display     # Output formatting (15 tests)
+# Or run individual module groups
+make test-ring        # Ring transport tests (5 suites)
+make test-protocol    # Protocol parser tests (4 suites)
+make test-flow        # Flow context tests (2 suites)
+make test-content     # Decompression tests (2 suites)
+make test-memory      # Memory tests (1 suite)
+make test-util        # Utility tests (3 suites)
 ```
 
-| Test Module | Tests | Coverage |
-|-------------|-------|----------|
-| test_http1 | 10 | HTTP/1.x request/response parsing with llhttp |
-| test_http2 | 8 | HTTP/2 preface, frames, validation with nghttp2 |
-| test_safe_str | 30 | Memory-safe string operations (strcpy, strcat, memcpy) |
-| test_flow_context | 24 | Dual-index correlation, flow pools, stream management |
-| test_decompressor | 21 | gzip, deflate, zstd, brotli compression |
-| test_detector | 18 | Vectorscan protocol detection patterns |
-| test_websocket | 22 | RFC 6455 frame parsing, masking, fragmentation |
-| test_display | 15 | Color output, latency formatting, timestamps |
+| Test Suite | Module | Coverage |
+|------------|--------|----------|
+| test_http1 | protocol | HTTP/1.x request/response parsing with llhttp |
+| test_http2 | protocol | HTTP/2 preface, frames, validation with nghttp2 |
+| test_detector | protocol | Vectorscan protocol detection patterns |
+| test_websocket | protocol | RFC 6455 frame parsing, masking, fragmentation |
+| test_flow_context | flow | Dual-index correlation, flow pools, stream management |
+| test_flow_refcount | flow | Reference counting lifecycle (v0.10.0) |
+| test_spmc_ring | ring | SPMC ring buffer operations (v0.10.0) |
+| test_concurrent | ring | Multi-threaded ring stress tests (v0.10.0) |
+| test_affinity | ring | Affinity routing and MPSC overflow (v0.10.0) |
+| test_backpressure | ring | Four-level hysteresis state machine (v0.10.0) |
+| test_worker_dequeue | ring | Three-phase consumption + adaptive polling (v0.10.0) |
+| test_decompressor | content | gzip, deflate, zstd, brotli per-transaction |
+| test_stream_decompressor | content | Streaming decompression + bomb protection (v0.10.0) |
+| test_mirrored_buffer | memory | Mirrored virtual memory buffers (v0.10.0) |
+| test_safe_str | util | Memory-safe string operations |
+| test_display | util | Color output, latency formatting, timestamps |
+| test_xdp | util | XDP event structure validation |
 
 ### CMake Options
 
@@ -409,7 +424,7 @@ The codebase follows C23 standards with strict compiler warnings (`-Wall -Wextra
 
 ## License
 
-GPL-3.0-only - See [LICENSE](LICENSE) for details.
+LGPL-3.0-only - See [LICENSE](LICENSE) for details.
 
 BPF code (`src/bpf/spliff.bpf.c`) is licensed under GPL-2.0-only (Linux kernel requirement).
 

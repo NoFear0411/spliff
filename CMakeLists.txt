@@ -720,7 +720,7 @@ set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 # Standard naming: <name>-<version>-<release>.<dist>.<arch>.rpm
 set(CPACK_RPM_PACKAGE_RELEASE "1${RPM_DIST_TAG}")
 set(CPACK_RPM_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CPACK_RPM_PACKAGE_RELEASE}.${CMAKE_SYSTEM_PROCESSOR}.rpm")
-set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0")
+set(CPACK_RPM_PACKAGE_LICENSE "LGPL-3.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/System")
 
 # Use automatic dependency detection for RPM

@@ -1170,7 +1170,7 @@ main.c (orchestration only, ~50 lines of protocol routing)
   - CMake 3.20+ required
   - Makefile retained as wrapper for backward compatibility
   - Added CPack support for .deb and .rpm packaging
-- **License**: Re-licensed under GPL-3.0-only (GPL-2.0-only for BPF code)
+- **License**: Re-licensed under LGPL-3.0-only (GPL-2.0-only for BPF code)
 - **C Standard**: Now requires C23 with GNU extensions
 
 ### Added
