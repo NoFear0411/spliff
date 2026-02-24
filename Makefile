@@ -1,26 +1,39 @@
-# spliff Makefile - CMake wrapper
+# spliff Makefile - CMake wrapper with Ninja auto-detection
 #
 # This Makefile wraps CMake for convenient command-line usage.
-# Default target is release build (optimized, stripped, no sanitizers).
+# Ninja is used automatically when available (2-5x faster incremental builds).
 #
 # Usage:
-#   make          Build release version (same as 'make release')
-#   make debug    Build debug version with sanitizers
-#   make tests    Build and run tests
-#   make clean    Remove all build artifacts and configuration
+#   make              Build release version (same as 'make release')
+#   make debug        Build debug version with sanitizers
+#   make tests        Build and run all tests
+#   make test-ring    Build and run ring transport tests only
+#   make clean        Remove all build artifacts
 
 .PHONY: all release debug relsan sanitize tests test clean distclean install \
         coverage coverage-html coverage-clean \
+        test-ring test-protocol test-flow test-content test-memory test-util \
         package-deb package-rpm docs clean-docs help
 
-# Build directories
-# Each build type gets its own directory to prevent overwrites
-BUILD_DIR_DEBUG := build-debug
-BUILD_DIR_RELEASE := build-release
+# ============================================================================
+# Build Configuration
+# ============================================================================
+
+# Build directories — each build type gets its own directory
+BUILD_DIR_DEBUG    := build-debug
+BUILD_DIR_RELEASE  := build-release
 BUILD_DIR_SANITIZE := build-sanitize
 
-# Number of parallel jobs (default: number of CPUs)
+# Parallel jobs (default: number of CPUs)
 JOBS := $(shell nproc 2>/dev/null || echo 4)
+
+# Auto-detect Ninja for faster incremental builds
+NINJA := $(shell command -v ninja 2>/dev/null)
+ifdef NINJA
+    CMAKE_GEN := -G Ninja
+else
+    CMAKE_GEN :=
+endif
 
 # ============================================================================
 # Main Build Targets
@@ -32,50 +45,62 @@ all: release
 # Release build (optimized, stripped, no sanitizers)
 release:
 	@echo "==> Configuring release build..."
-	@cmake -B $(BUILD_DIR_RELEASE) \
+	@cmake -B $(BUILD_DIR_RELEASE) $(CMAKE_GEN) \
 		-DCMAKE_BUILD_TYPE=Release \
 		-DENABLE_SANITIZERS=OFF
 	@echo "==> Building release..."
 	@cmake --build $(BUILD_DIR_RELEASE) --parallel $(JOBS)
-	@ln -sf $(BUILD_DIR_RELEASE)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_RELEASE)/spliff spliff
+	@ln -sf $(BUILD_DIR_RELEASE)/src/spliff spliff 2>/dev/null || \
+	 ln -sf $(BUILD_DIR_RELEASE)/spliff spliff 2>/dev/null || \
+	 cp $(BUILD_DIR_RELEASE)/src/spliff spliff 2>/dev/null || \
+	 cp $(BUILD_DIR_RELEASE)/spliff spliff
 	@echo "==> Release build complete: ./spliff"
 
 # Debug build (symbols, sanitizers enabled)
 debug:
 	@echo "==> Configuring debug build..."
-	@cmake -B $(BUILD_DIR_DEBUG) \
+	@cmake -B $(BUILD_DIR_DEBUG) $(CMAKE_GEN) \
 		-DCMAKE_BUILD_TYPE=Debug \
 		-DENABLE_SANITIZERS=ON
 	@echo "==> Building debug..."
 	@cmake --build $(BUILD_DIR_DEBUG) --parallel $(JOBS)
-	@ln -sf $(BUILD_DIR_DEBUG)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_DEBUG)/spliff spliff
+	@ln -sf $(BUILD_DIR_DEBUG)/src/spliff spliff 2>/dev/null || \
+	 ln -sf $(BUILD_DIR_DEBUG)/spliff spliff 2>/dev/null || \
+	 cp $(BUILD_DIR_DEBUG)/src/spliff spliff 2>/dev/null || \
+	 cp $(BUILD_DIR_DEBUG)/spliff spliff
 	@echo "==> Debug build complete: ./spliff"
 
 # Release build with sanitizers (for testing optimized code)
 relsan:
 	@echo "==> Configuring release+sanitizers build..."
-	@cmake -B $(BUILD_DIR_SANITIZE) \
+	@cmake -B $(BUILD_DIR_SANITIZE) $(CMAKE_GEN) \
 		-DCMAKE_BUILD_TYPE=RelWithSan \
 		-DENABLE_SANITIZERS=ON
 	@echo "==> Building release+sanitizers..."
 	@cmake --build $(BUILD_DIR_SANITIZE) --parallel $(JOBS)
-	@ln -sf $(BUILD_DIR_SANITIZE)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_SANITIZE)/spliff spliff
+	@ln -sf $(BUILD_DIR_SANITIZE)/src/spliff spliff 2>/dev/null || \
+	 ln -sf $(BUILD_DIR_SANITIZE)/spliff spliff 2>/dev/null || \
+	 cp $(BUILD_DIR_SANITIZE)/src/spliff spliff 2>/dev/null || \
+	 cp $(BUILD_DIR_SANITIZE)/spliff spliff
 	@echo "==> RelWithSan build complete: ./spliff"
 
 # Sanitize build (optimized for maximum ASan/UBSan accuracy with -O1)
 sanitize:
 	@echo "==> Configuring sanitize build (ASan/UBSan optimized)..."
-	@cmake -B $(BUILD_DIR_SANITIZE) \
+	@cmake -B $(BUILD_DIR_SANITIZE) $(CMAKE_GEN) \
 		-DCMAKE_BUILD_TYPE=Sanitize \
 		-DENABLE_SANITIZERS=ON
 	@echo "==> Building sanitize..."
 	@cmake --build $(BUILD_DIR_SANITIZE) --parallel $(JOBS)
-	@ln -sf $(BUILD_DIR_SANITIZE)/spliff spliff 2>/dev/null || cp $(BUILD_DIR_SANITIZE)/spliff spliff
+	@ln -sf $(BUILD_DIR_SANITIZE)/src/spliff spliff 2>/dev/null || \
+	 ln -sf $(BUILD_DIR_SANITIZE)/spliff spliff 2>/dev/null || \
+	 cp $(BUILD_DIR_SANITIZE)/src/spliff spliff 2>/dev/null || \
+	 cp $(BUILD_DIR_SANITIZE)/spliff spliff
 	@echo "==> Sanitize build complete: ./spliff"
 	@echo "    Run with: ASAN_OPTIONS=check_initialization_order=1 ./spliff"
 
 # ============================================================================
-# Test Targets
+# Test Targets — Full Suite
 # ============================================================================
 
 # Build and run all tests (uses debug build)
@@ -83,11 +108,59 @@ tests: debug
 	@echo "==> Building test executables..."
 	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests --parallel $(JOBS)
 	@echo "==> Running tests..."
-	@cd $(BUILD_DIR_DEBUG) && ctest --output-on-failure
+	@cd $(BUILD_DIR_DEBUG) && ctest --output-on-failure --parallel $(JOBS)
 	@echo "==> All tests passed"
 
 # Alias for tests
 test: tests
+
+# ============================================================================
+# Module-Level Test Targets
+# ============================================================================
+# Each target builds only the relevant test group, then runs only those tests
+# via CTest label filtering. Much faster than building + running everything.
+
+# Ring transport tests (5 suites: spmc_ring, affinity, concurrent, backpressure, worker_dequeue)
+test-ring: debug
+	@echo "==> Building ring test executables..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests_ring --parallel $(JOBS)
+	@echo "==> Running ring tests..."
+	@cd $(BUILD_DIR_DEBUG) && ctest -L ring --output-on-failure --parallel $(JOBS)
+
+# Protocol parser tests (4 suites: http1, http2, websocket, detector)
+test-protocol: debug
+	@echo "==> Building protocol test executables..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests_protocol --parallel $(JOBS)
+	@echo "==> Running protocol tests..."
+	@cd $(BUILD_DIR_DEBUG) && ctest -L protocol --output-on-failure --parallel $(JOBS)
+
+# Flow context tests (2 suites: flow_context, flow_refcount)
+test-flow: debug
+	@echo "==> Building flow test executables..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests_flow --parallel $(JOBS)
+	@echo "==> Running flow tests..."
+	@cd $(BUILD_DIR_DEBUG) && ctest -L flow --output-on-failure --parallel $(JOBS)
+
+# Content/decompression tests (2 suites: decompressor, stream_decompressor)
+test-content: debug
+	@echo "==> Building content test executables..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests_content --parallel $(JOBS)
+	@echo "==> Running content tests..."
+	@cd $(BUILD_DIR_DEBUG) && ctest -L content --output-on-failure --parallel $(JOBS)
+
+# Memory infrastructure tests (1 suite: mirrored_buffer)
+test-memory: debug
+	@echo "==> Building memory test executables..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests_memory --parallel $(JOBS)
+	@echo "==> Running memory tests..."
+	@cd $(BUILD_DIR_DEBUG) && ctest -L memory --output-on-failure --parallel $(JOBS)
+
+# Utility tests (3 suites: safe_str, display, xdp)
+test-util: debug
+	@echo "==> Building utility test executables..."
+	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests_util --parallel $(JOBS)
+	@echo "==> Running utility tests..."
+	@cd $(BUILD_DIR_DEBUG) && ctest -L util --output-on-failure --parallel $(JOBS)
 
 # ============================================================================
 # Documentation Targets
@@ -96,7 +169,7 @@ test: tests
 # Generate Doxygen API documentation
 docs:
 	@echo "==> Configuring for documentation..."
-	@cmake -B $(BUILD_DIR_DEBUG) -DCMAKE_BUILD_TYPE=Debug
+	@cmake -B $(BUILD_DIR_DEBUG) $(CMAKE_GEN) -DCMAKE_BUILD_TYPE=Debug
 	@echo "==> Generating API documentation with Doxygen..."
 	@cmake --build $(BUILD_DIR_DEBUG) --target docs
 	@echo "==> Documentation generated: docs/html/index.html"
@@ -130,7 +203,7 @@ distclean: clean
 # Build with coverage instrumentation and run tests
 coverage:
 	@echo "==> Configuring coverage build..."
-	@cmake -B $(BUILD_DIR_DEBUG) \
+	@cmake -B $(BUILD_DIR_DEBUG) $(CMAKE_GEN) \
 		-DCMAKE_BUILD_TYPE=Debug \
 		-DENABLE_COVERAGE=ON \
 		-DENABLE_SANITIZERS=OFF
@@ -139,7 +212,7 @@ coverage:
 	@echo "==> Building test executables..."
 	@cmake --build $(BUILD_DIR_DEBUG) --target build_tests --parallel $(JOBS)
 	@echo "==> Running tests for coverage..."
-	@cd $(BUILD_DIR_DEBUG) && ctest --output-on-failure
+	@cd $(BUILD_DIR_DEBUG) && ctest --output-on-failure --parallel $(JOBS)
 	@echo ""
 	@echo "==> Coverage data generated. Run 'make coverage-html' for HTML report."
 
@@ -210,9 +283,17 @@ help:
 	@echo "  make debug            Build with debug symbols and sanitizers"
 	@echo "  make relsan           Build optimized with sanitizers"
 	@echo "  make sanitize         Build for ASan/UBSan accuracy (-O1, frame pointers)"
-	@echo "  make tests            Build and run all tests"
 	@echo "  make clean            Remove all build artifacts and configuration"
 	@echo "  make install          Install to /usr/local/bin (requires sudo)"
+	@echo ""
+	@echo "Test targets:"
+	@echo "  make tests            Build and run ALL tests (17 suites)"
+	@echo "  make test-ring        Ring transport tests      (5 suites)"
+	@echo "  make test-protocol    Protocol parser tests     (4 suites)"
+	@echo "  make test-flow        Flow context tests        (2 suites)"
+	@echo "  make test-content     Decompression tests       (2 suites)"
+	@echo "  make test-memory      Memory infrastructure     (1 suite)"
+	@echo "  make test-util        Utility + display tests   (3 suites)"
 	@echo ""
 	@echo "Documentation targets:"
 	@echo "  make docs             Generate Doxygen API documentation"
@@ -232,17 +313,24 @@ help:
 	@echo "  build-debug/          Debug builds (make debug, make tests, make coverage)"
 	@echo "  build-sanitize/       Sanitizer builds (make relsan, make sanitize)"
 	@echo ""
+ifdef NINJA
+	@echo "Build generator: Ninja (auto-detected)"
+else
+	@echo "Build generator: Make (install ninja-build for faster builds)"
+endif
+	@echo "Parallel jobs:   $(JOBS)"
+	@echo ""
 	@echo "Required dependencies:"
 	@echo "  Fedora:   libbpf-devel elfutils-libelf-devel zlib-ng-devel"
 	@echo "            libzstd-devel brotli-devel llhttp-devel"
 	@echo "            libnghttp2-devel ck-devel libxdp-devel"
 	@echo "            userspace-rcu-devel jemalloc-devel vectorscan-devel"
-	@echo "            clang llvm"
+	@echo "            clang llvm bpftool"
 	@echo ""
 	@echo "  Debian:   libbpf-dev libelf-dev zlib1g-ng-dev libzstd-dev"
 	@echo "            libbrotli-dev libllhttp-dev libnghttp2-dev"
 	@echo "            libck-dev libxdp-dev liburcu-dev libjemalloc-dev"
-	@echo "            libhyperscan-dev clang llvm"
+	@echo "            libhyperscan-dev clang llvm linux-tools-common"
 	@echo ""
 	@echo "Optional performance libraries (v0.9.5+):"
 	@echo "  zlib-ng:     SIMD-accelerated compression (auto-detected)"
