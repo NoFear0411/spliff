@@ -222,6 +222,17 @@ const char *compress_type_name(compress_type_t type);
 int decompress_body(const uint8_t *data, int len, const char *encoding,
                    uint8_t *decomp_buf, int decomp_buf_size);
 
+/**
+ * @brief Map Content-Encoding header value to compression type
+ *
+ * Converts standard HTTP Content-Encoding values to compress_type_t
+ * for use with the streaming decompressor API.
+ *
+ * @param[in] encoding Content-Encoding header value (e.g., "gzip", "br", "zstd")
+ * @return Corresponding compress_type_t, or COMPRESS_NONE if unrecognized
+ */
+compress_type_t detect_encoding_type(const char *encoding);
+
 /** @} */ /* end of decompressor group */
 
 #endif /* DECOMPRESSOR_H */

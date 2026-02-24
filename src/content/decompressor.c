@@ -280,3 +280,19 @@ int decompress_body(const uint8_t *data, int len, const char *encoding,
     }
     return decomp_len;
 }
+
+compress_type_t detect_encoding_type(const char *encoding) {
+    if (!encoding || !encoding[0])
+        return COMPRESS_NONE;
+
+    if (strcasestr(encoding, "gzip"))
+        return COMPRESS_GZIP;
+    if (strcasestr(encoding, "deflate"))
+        return COMPRESS_DEFLATE;
+    if (strcasestr(encoding, "zstd"))
+        return COMPRESS_ZSTD;
+    if (strcasestr(encoding, "br"))
+        return COMPRESS_BROTLI;
+
+    return COMPRESS_NONE;
+}

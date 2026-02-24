@@ -202,6 +202,8 @@ static void test_pool_drain_deferred(void) {
     flow_pool_init(&pool);
 
     flow_context_t *ctx = flow_pool_alloc(&pool);
+    /* Release creator reference (normally done by flow_terminate) */
+    flow_ref_release(ctx);
     flow_pool_free(&pool, ctx);
 
     /* Drain with current time - should NOT free (grace period) */
@@ -287,103 +289,94 @@ static void test_pool_active_list(void) {
  * Cookie Index Tests
  *============================================================================*/
 
-static void test_cookie_index_init(void) {
-    TEST("cookie_index_init");
+static void test_ck_cookie_index_init(void) {
+    TEST("ck_cookie_index_init");
 
     cookie_index_t idx;
-    int ret = cookie_index_init(&idx, 64);
+    int ret = ck_cookie_index_init(&idx, 64);
 
     if (ret != 0) {
         FAIL("init returned error");
         return;
     }
-    if (idx.capacity != 64) {
-        FAIL("wrong capacity");
-        cookie_index_cleanup(&idx);
-        return;
-    }
-    if (idx.buckets == NULL) {
-        FAIL("buckets is NULL");
-        return;
-    }
-    if (atomic_load(&idx.count) != 0) {
+    if (ck_cookie_index_count(&idx) != 0) {
         FAIL("count not zero");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
 
-    cookie_index_cleanup(&idx);
+    ck_cookie_index_cleanup(&idx);
     PASS();
 }
 
-static void test_cookie_index_insert_lookup(void) {
+static void test_ck_cookie_index_insert_lookup(void) {
     TEST("cookie_index insert/lookup");
 
     cookie_index_t idx;
-    cookie_index_init(&idx, 64);
+    ck_cookie_index_init(&idx, 64);
 
     /* Create a dummy flow context */
     flow_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.socket_cookie = 12345;
 
-    int ret = cookie_index_insert(&idx, 12345, &ctx);
+    int ret = ck_cookie_index_insert(&idx, 12345, &ctx);
     if (ret != 0) {
         FAIL("insert failed");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
 
     /* Lookup */
-    flow_context_t *found = cookie_index_lookup(&idx, 12345);
+    flow_context_t *found = ck_cookie_index_lookup(&idx, 12345);
     if (found != &ctx) {
         FAIL("lookup returned wrong pointer");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
 
     /* Lookup non-existent */
-    found = cookie_index_lookup(&idx, 99999);
+    found = ck_cookie_index_lookup(&idx, 99999);
     if (found != NULL) {
         FAIL("found non-existent cookie");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
 
-    cookie_index_cleanup(&idx);
+    ck_cookie_index_cleanup(&idx);
     PASS();
 }
 
-static void test_cookie_index_remove(void) {
+static void test_ck_cookie_index_remove(void) {
     TEST("cookie_index remove");
 
     cookie_index_t idx;
-    cookie_index_init(&idx, 64);
+    ck_cookie_index_init(&idx, 64);
 
     flow_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.socket_cookie = 12345;
 
-    cookie_index_insert(&idx, 12345, &ctx);
+    ck_cookie_index_insert(&idx, 12345, &ctx);
 
     /* Remove */
-    cookie_index_remove(&idx, 12345);
+    ck_cookie_index_remove(&idx, 12345);
 
     /* Should not find it anymore */
-    flow_context_t *found = cookie_index_lookup(&idx, 12345);
+    flow_context_t *found = ck_cookie_index_lookup(&idx, 12345);
     if (found != NULL) {
         FAIL("still found after remove");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
 
-    if (atomic_load(&idx.count) != 0) {
+    if (ck_cookie_index_count(&idx) != 0) {
         FAIL("count not zero after remove");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
 
-    cookie_index_cleanup(&idx);
+    ck_cookie_index_cleanup(&idx);
     PASS();
 }
 
@@ -391,7 +384,7 @@ static void test_cookie_index_collision(void) {
     TEST("cookie_index collision handling");
 
     cookie_index_t idx;
-    cookie_index_init(&idx, 8);  /* Small table to force collisions */
+    ck_cookie_index_init(&idx, 8);  /* Small table to force collisions */
 
     flow_context_t ctx1, ctx2, ctx3;
     memset(&ctx1, 0, sizeof(ctx1));
@@ -399,28 +392,28 @@ static void test_cookie_index_collision(void) {
     memset(&ctx3, 0, sizeof(ctx3));
 
     /* Insert multiple entries that may collide */
-    cookie_index_insert(&idx, 1, &ctx1);
-    cookie_index_insert(&idx, 9, &ctx2);   /* 9 % 8 = 1, same bucket as 1 */
-    cookie_index_insert(&idx, 17, &ctx3);  /* 17 % 8 = 1, same bucket */
+    ck_cookie_index_insert(&idx, 1, &ctx1);
+    ck_cookie_index_insert(&idx, 9, &ctx2);   /* 9 % 8 = 1, same bucket as 1 */
+    ck_cookie_index_insert(&idx, 17, &ctx3);  /* 17 % 8 = 1, same bucket */
 
     /* All should be findable */
-    if (cookie_index_lookup(&idx, 1) != &ctx1) {
+    if (ck_cookie_index_lookup(&idx, 1) != &ctx1) {
         FAIL("can't find cookie 1");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
-    if (cookie_index_lookup(&idx, 9) != &ctx2) {
+    if (ck_cookie_index_lookup(&idx, 9) != &ctx2) {
         FAIL("can't find cookie 9");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
-    if (cookie_index_lookup(&idx, 17) != &ctx3) {
+    if (ck_cookie_index_lookup(&idx, 17) != &ctx3) {
         FAIL("can't find cookie 17");
-        cookie_index_cleanup(&idx);
+        ck_cookie_index_cleanup(&idx);
         return;
     }
 
-    cookie_index_cleanup(&idx);
+    ck_cookie_index_cleanup(&idx);
     PASS();
 }
 
@@ -428,7 +421,7 @@ static void test_cookie_index_many_entries(void) {
     TEST("cookie_index many entries (resize)");
 
     cookie_index_t idx;
-    cookie_index_init(&idx, 16);
+    ck_cookie_index_init(&idx, 16);
 
     /* Insert enough to trigger resize (75% load = 12 entries) */
     flow_context_t contexts[20];
@@ -436,31 +429,31 @@ static void test_cookie_index_many_entries(void) {
 
     for (int i = 0; i < 20; i++) {
         contexts[i].socket_cookie = 1000 + i;
-        if (cookie_index_insert(&idx, 1000 + i, &contexts[i]) != 0) {
+        if (ck_cookie_index_insert(&idx, 1000 + i, &contexts[i]) != 0) {
             FAIL("insert failed during resize");
-            cookie_index_cleanup(&idx);
+            ck_cookie_index_cleanup(&idx);
             return;
         }
     }
 
     /* Verify all are findable */
     for (int i = 0; i < 20; i++) {
-        flow_context_t *found = cookie_index_lookup(&idx, 1000 + i);
+        flow_context_t *found = ck_cookie_index_lookup(&idx, 1000 + i);
         if (found != &contexts[i]) {
             FAIL("can't find entry after resize");
-            cookie_index_cleanup(&idx);
+            ck_cookie_index_cleanup(&idx);
             return;
         }
     }
 
-    /* Capacity should have grown */
-    if (idx.capacity <= 16) {
-        FAIL("capacity didn't grow");
-        cookie_index_cleanup(&idx);
+    /* All 20 should be tracked */
+    if (ck_cookie_index_count(&idx) != 20) {
+        FAIL("count wrong after mass insert");
+        ck_cookie_index_cleanup(&idx);
         return;
     }
 
-    cookie_index_cleanup(&idx);
+    ck_cookie_index_cleanup(&idx);
     PASS();
 }
 
@@ -468,92 +461,92 @@ static void test_cookie_index_many_entries(void) {
  * Shadow Index Tests
  *============================================================================*/
 
-static void test_shadow_index_init(void) {
-    TEST("shadow_index_init");
+static void test_ck_shadow_index_init(void) {
+    TEST("ck_shadow_index_init");
 
     shadow_index_t idx;
-    int ret = shadow_index_init(&idx, 64);
+    int ret = ck_shadow_index_init(&idx, 64);
 
     if (ret != 0) {
         FAIL("init returned error");
         return;
     }
-    if (idx.capacity != 64) {
-        FAIL("wrong capacity");
-        shadow_index_cleanup(&idx);
+    if (ck_shadow_index_count(&idx) != 0) {
+        FAIL("count not zero");
+        ck_shadow_index_cleanup(&idx);
         return;
     }
 
-    shadow_index_cleanup(&idx);
+    ck_shadow_index_cleanup(&idx);
     PASS();
 }
 
-static void test_shadow_index_insert_lookup(void) {
+static void test_ck_shadow_index_insert_lookup(void) {
     TEST("shadow_index insert/lookup");
 
     shadow_index_t idx;
-    shadow_index_init(&idx, 64);
+    ck_shadow_index_init(&idx, 64);
 
     flow_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.pid = 1234;
     ctx.ssl_ctx = 0xDEADBEEF;
 
-    int ret = shadow_index_insert(&idx, 1234, 0xDEADBEEF, &ctx);
+    int ret = ck_shadow_index_insert(&idx, 1234, 0xDEADBEEF, &ctx);
     if (ret != 0) {
         FAIL("insert failed");
-        shadow_index_cleanup(&idx);
+        ck_shadow_index_cleanup(&idx);
         return;
     }
 
     /* Lookup */
-    flow_context_t *found = shadow_index_lookup(&idx, 1234, 0xDEADBEEF);
+    flow_context_t *found = ck_shadow_index_lookup(&idx, 1234, 0xDEADBEEF);
     if (found != &ctx) {
         FAIL("lookup returned wrong pointer");
-        shadow_index_cleanup(&idx);
+        ck_shadow_index_cleanup(&idx);
         return;
     }
 
     /* Lookup with wrong pid */
-    found = shadow_index_lookup(&idx, 9999, 0xDEADBEEF);
+    found = ck_shadow_index_lookup(&idx, 9999, 0xDEADBEEF);
     if (found != NULL) {
         FAIL("found with wrong pid");
-        shadow_index_cleanup(&idx);
+        ck_shadow_index_cleanup(&idx);
         return;
     }
 
     /* Lookup with wrong ssl_ctx */
-    found = shadow_index_lookup(&idx, 1234, 0x11111111);
+    found = ck_shadow_index_lookup(&idx, 1234, 0x11111111);
     if (found != NULL) {
         FAIL("found with wrong ssl_ctx");
-        shadow_index_cleanup(&idx);
+        ck_shadow_index_cleanup(&idx);
         return;
     }
 
-    shadow_index_cleanup(&idx);
+    ck_shadow_index_cleanup(&idx);
     PASS();
 }
 
-static void test_shadow_index_remove(void) {
+static void test_ck_shadow_index_remove(void) {
     TEST("shadow_index remove");
 
     shadow_index_t idx;
-    shadow_index_init(&idx, 64);
+    ck_shadow_index_init(&idx, 64);
 
     flow_context_t ctx;
     memset(&ctx, 0, sizeof(ctx));
 
-    shadow_index_insert(&idx, 1234, 0xDEADBEEF, &ctx);
-    shadow_index_remove(&idx, 1234, 0xDEADBEEF);
+    ck_shadow_index_insert(&idx, 1234, 0xDEADBEEF, &ctx);
+    ck_shadow_index_remove(&idx, 1234, 0xDEADBEEF);
 
-    flow_context_t *found = shadow_index_lookup(&idx, 1234, 0xDEADBEEF);
+    flow_context_t *found = ck_shadow_index_lookup(&idx, 1234, 0xDEADBEEF);
     if (found != NULL) {
         FAIL("still found after remove");
-        shadow_index_cleanup(&idx);
+        ck_shadow_index_cleanup(&idx);
         return;
     }
 
-    shadow_index_cleanup(&idx);
+    ck_shadow_index_cleanup(&idx);
     PASS();
 }
 
@@ -572,14 +565,14 @@ static void test_manager_init(void) {
         return;
     }
 
-    /* Verify all components initialized */
-    if (mgr.cookie_idx.buckets == NULL) {
-        FAIL("cookie_idx not initialized");
+    /* Verify all components initialized (CK hs is opaque, check counts) */
+    if (ck_cookie_index_count(&mgr.cookie_idx) != 0) {
+        FAIL("cookie_idx count not zero");
         flow_manager_cleanup(&mgr);
         return;
     }
-    if (mgr.shadow_idx.buckets == NULL) {
-        FAIL("shadow_idx not initialized");
+    if (ck_shadow_index_count(&mgr.shadow_idx) != 0) {
+        FAIL("shadow_idx count not zero");
         flow_manager_cleanup(&mgr);
         return;
     }
@@ -603,7 +596,7 @@ static void test_manager_get_or_create(void) {
     }
 
     /* Verify it's in shadow index */
-    flow_context_t *found = shadow_index_lookup(&mgr.shadow_idx, 1234, 0xBEEF);
+    flow_context_t *found = ck_shadow_index_lookup(&mgr.shadow_idx, 1234, 0xBEEF);
     if (found != ctx) {
         FAIL("not in shadow index");
         flow_manager_cleanup(&mgr);
@@ -637,12 +630,12 @@ static void test_manager_get_or_create_with_cookie(void) {
     }
 
     /* Should be in both indexes */
-    if (cookie_index_lookup(&mgr.cookie_idx, 99999) != ctx) {
+    if (ck_cookie_index_lookup(&mgr.cookie_idx, 99999) != ctx) {
         FAIL("not in cookie index");
         flow_manager_cleanup(&mgr);
         return;
     }
-    if (shadow_index_lookup(&mgr.shadow_idx, 1234, 0xBEEF) != ctx) {
+    if (ck_shadow_index_lookup(&mgr.shadow_idx, 1234, 0xBEEF) != ctx) {
         FAIL("not in shadow index");
         flow_manager_cleanup(&mgr);
         return;
@@ -705,7 +698,7 @@ static void test_manager_promote_cookie(void) {
     flow_context_t *ctx = flow_get_or_create(&mgr, 0, 1234, 0xBEEF);
 
     /* Should not be in cookie index */
-    if (cookie_index_lookup(&mgr.cookie_idx, 99999) != NULL) {
+    if (ck_cookie_index_lookup(&mgr.cookie_idx, 99999) != NULL) {
         FAIL("shouldn't be in cookie index yet");
         flow_manager_cleanup(&mgr);
         return;
@@ -720,7 +713,7 @@ static void test_manager_promote_cookie(void) {
     }
 
     /* Now should be in cookie index */
-    if (cookie_index_lookup(&mgr.cookie_idx, 99999) != ctx) {
+    if (ck_cookie_index_lookup(&mgr.cookie_idx, 99999) != ctx) {
         FAIL("not in cookie index after promote");
         flow_manager_cleanup(&mgr);
         return;
@@ -750,12 +743,12 @@ static void test_manager_terminate(void) {
     flow_terminate(&mgr, ctx);
 
     /* Should be removed from both indexes */
-    if (cookie_index_lookup(&mgr.cookie_idx, 99999) != NULL) {
+    if (ck_cookie_index_lookup(&mgr.cookie_idx, 99999) != NULL) {
         FAIL("still in cookie index");
         flow_manager_cleanup(&mgr);
         return;
     }
-    if (shadow_index_lookup(&mgr.shadow_idx, 1234, 0xBEEF) != NULL) {
+    if (ck_shadow_index_lookup(&mgr.shadow_idx, 1234, 0xBEEF) != NULL) {
         FAIL("still in shadow index");
         flow_manager_cleanup(&mgr);
         return;
@@ -795,7 +788,7 @@ static void test_manager_evict_stale(void) {
     }
 
     /* Flow should be removed from indexes */
-    if (cookie_index_lookup(&mgr.cookie_idx, 99999) != NULL) {
+    if (ck_cookie_index_lookup(&mgr.cookie_idx, 99999) != NULL) {
         FAIL("stale flow still in cookie index");
         flow_manager_cleanup(&mgr);
         return;
@@ -913,15 +906,15 @@ static void test_txn_body_buffer(void) {
     flow_transaction_t txn;
     memset(&txn, 0, sizeof(txn));
 
-    /* Allocate body buffer (min capacity is 4096) */
+    /* Allocate body buffer (mirrored, fixed 256KB) */
     int ret = flow_txn_alloc_body(&txn, 1024);
     if (ret != 0) {
         FAIL("body alloc failed");
         return;
     }
 
-    /* Capacity is clamped to minimum of 4096 */
-    if (txn.body_buf == NULL || txn.body_capacity != 4096) {
+    /* Mirrored buffer should be allocated */
+    if (flow_txn_body_ptr(&txn) == NULL) {
         FAIL("body buffer not allocated");
         flow_txn_free_body(&txn);
         return;
@@ -942,7 +935,7 @@ static void test_txn_body_buffer(void) {
         return;
     }
 
-    if (memcmp(txn.body_buf, "Hello World", 11) != 0) {
+    if (memcmp(flow_txn_body_ptr(&txn), "Hello World", 11) != 0) {
         FAIL("wrong body content");
         flow_txn_free_body(&txn);
         return;
@@ -950,7 +943,7 @@ static void test_txn_body_buffer(void) {
 
     flow_txn_free_body(&txn);
 
-    if (txn.body_buf != NULL || txn.body_len != 0) {
+    if (flow_txn_body_ptr(&txn) != NULL || txn.body_len != 0) {
         FAIL("body not freed properly");
         return;
     }
@@ -974,16 +967,16 @@ int main(void) {
     test_pool_active_list();
 
     /* Cookie index tests */
-    test_cookie_index_init();
-    test_cookie_index_insert_lookup();
-    test_cookie_index_remove();
+    test_ck_cookie_index_init();
+    test_ck_cookie_index_insert_lookup();
+    test_ck_cookie_index_remove();
     test_cookie_index_collision();
     test_cookie_index_many_entries();
 
     /* Shadow index tests */
-    test_shadow_index_init();
-    test_shadow_index_insert_lookup();
-    test_shadow_index_remove();
+    test_ck_shadow_index_init();
+    test_ck_shadow_index_insert_lookup();
+    test_ck_shadow_index_remove();
 
     /* Flow manager tests */
     test_manager_init();

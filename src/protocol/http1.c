@@ -42,6 +42,7 @@
 #include "../output/display.h"
 #include "../output/logger.h"
 #include "../content/decompressor.h"
+#include "../content/stream_decompressor.h"
 #include "../threading/threading.h"
 #include "../threading/deferred.h"
 #include <llhttp.h>
@@ -716,10 +717,40 @@ static int on_body_flow(llhttp_t *parser, const char *at, size_t len) {
     flow_transaction_t *txn = &cb->flow_ctx->parser.h1.txn;
 
     /* Only accumulate body if body display is enabled (-b flag) */
-    if (g_config.show_body) {
-        flow_txn_append_body(txn, (const uint8_t *)at, len);
+    if (!g_config.show_body)
+        return 0;
+
+    /*
+     * Streaming decompression: if Content-Encoding is set, decompress
+     * each body chunk as it arrives rather than buffering compressed
+     * data for one-shot decompression at display time.
+     */
+    if (txn->encoding[0] != '\0') {
+        compress_type_t ctype = detect_encoding_type(txn->encoding);
+        if (ctype != COMPRESS_NONE) {
+            /* Lazy init on first body chunk */
+            if (!txn->stream_decomp.initialized && !txn->stream_decomp.bomb_detected) {
+                if (stream_decomp_init(&txn->stream_decomp, ctype) != 0) {
+                    /* Init failed — fall through to raw append */
+                    goto raw_append;
+                }
+            }
+
+            /* Feed compressed chunk, append decompressed output */
+            uint8_t decomp_tmp[16384];
+            int n = stream_decomp_feed(&txn->stream_decomp,
+                                       (const uint8_t *)at, len,
+                                       decomp_tmp, sizeof(decomp_tmp));
+            if (n > 0) {
+                flow_txn_append_body(txn, decomp_tmp, (size_t)n);
+            }
+            /* n == 0: no output yet (buffered), n < 0: error/bomb — skip */
+            return 0;
+        }
     }
 
+raw_append:
+    flow_txn_append_body(txn, (const uint8_t *)at, len);
     return 0;
 }
 
@@ -769,6 +800,9 @@ static int on_message_complete_flow(llhttp_t *parser) {
 static int on_reset_flow(llhttp_t *parser) {
     h1_flow_cb_ctx_t *cb = (h1_flow_cb_ctx_t *)parser->data;
     h1_parser_ctx_t *h1 = &cb->flow_ctx->parser.h1;
+
+    /* Free per-transaction resources before zeroing (keep-alive reuse) */
+    flow_txn_free_body(&h1->txn);
 
     /* Clear transaction for next message (keep-alive pipelining) */
     memset(&h1->txn, 0, sizeof(h1->txn));
@@ -886,29 +920,30 @@ static void h1_display_message_flow(struct flow_context *flow_ctx,
  */
 static void h1_display_body_flow(struct flow_context *flow_ctx) {
     flow_transaction_t *txn = &flow_ctx->parser.h1.txn;
+    const uint8_t *body_data = flow_txn_body_ptr(txn);
 
-    if (!txn->body_buf || txn->body_len == 0) {
+    if (!body_data || txn->body_len == 0) {
         return;
     }
 
-    const uint8_t *display_data = txn->body_buf;
+    const uint8_t *display_data = body_data;
     size_t display_len = txn->body_len;
 
-    /* Decompress if Content-Encoding present */
+    /*
+     * If streaming decompression was active, body is already decompressed.
+     * Only fall back to one-shot decompress_body() when streaming wasn't used
+     * (e.g., body arrived in a single complete chunk before encoding was known).
+     */
     uint8_t *decomp_buf = NULL;
-    if (txn->encoding[0] != '\0') {
-        /* Smart buffer allocation based on compressed size:
-         * - Estimate 10x compression ratio (typical for text content)
-         * - Minimum 8KB for small payloads
-         * - Maximum 10MB to prevent memory bombs
-         */
+    if (txn->encoding[0] != '\0' && !txn->stream_decomp.initialized &&
+        !txn->stream_decomp.finished) {
         size_t est_size = txn->body_len * 10;
         if (est_size < 8 * 1024) est_size = 8 * 1024;
         if (est_size > 10 * 1024 * 1024) est_size = 10 * 1024 * 1024;
 
         decomp_buf = malloc(est_size);
         if (decomp_buf) {
-            int decomp_len = decompress_body(txn->body_buf, (int)txn->body_len,
+            int decomp_len = decompress_body(body_data, (int)txn->body_len,
                                              txn->encoding, decomp_buf, (int)est_size);
             if (decomp_len > 0) {
                 display_data = decomp_buf;
@@ -918,7 +953,6 @@ static void h1_display_body_flow(struct flow_context *flow_ctx) {
     }
 
     display_body(display_data, display_len, txn->content_type);
-    /* Flush handled by async logger */
 
     if (decomp_buf) {
         free(decomp_buf);

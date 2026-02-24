@@ -57,6 +57,7 @@
 #include "../output/display.h"
 #include "../output/logger.h"
 #include "../content/decompressor.h"
+#include "../content/stream_decompressor.h"
 #include "../content/signatures.h"
 #include "../correlation/flow_context.h"
 #include "../threading/threading.h"
@@ -461,10 +462,34 @@ static int on_data_chunk_recv_callback(nghttp2_session *session,
 
     /* Append to flow_transaction_t body buffer if configured */
     flow_transaction_t *ftxn = get_flow_stream(ctx, stream_id, false);
-    if (ftxn && g_config.show_body) {
-        flow_txn_append_body(ftxn, data, len);
+    if (!ftxn || !g_config.show_body)
+        return 0;
+
+    /*
+     * Streaming decompression per-stream: if Content-Encoding was set
+     * in HEADERS, decompress each DATA chunk incrementally.
+     */
+    if (ftxn->encoding[0] != '\0') {
+        compress_type_t ctype = detect_encoding_type(ftxn->encoding);
+        if (ctype != COMPRESS_NONE) {
+            if (!ftxn->stream_decomp.initialized && !ftxn->stream_decomp.bomb_detected) {
+                if (stream_decomp_init(&ftxn->stream_decomp, ctype) != 0)
+                    goto raw_append;
+            }
+
+            uint8_t decomp_tmp[16384];
+            int n = stream_decomp_feed(&ftxn->stream_decomp,
+                                       data, len,
+                                       decomp_tmp, sizeof(decomp_tmp));
+            if (n > 0) {
+                flow_txn_append_body(ftxn, decomp_tmp, (size_t)n);
+            }
+            return 0;
+        }
     }
 
+raw_append:
+    flow_txn_append_body(ftxn, data, len);
     return 0;
 }
 
@@ -619,29 +644,29 @@ static void h2_display_request_flow(flow_transaction_t *txn, flow_context_t *flo
  */
 static void h2_display_body_flow(flow_transaction_t *txn, flow_context_t *flow_ctx) {
     (void)flow_ctx;
+    const uint8_t *body_data = flow_txn_body_ptr(txn);
 
-    if (!txn->body_buf || txn->body_len == 0) {
+    if (!body_data || txn->body_len == 0) {
         return;
     }
 
-    const uint8_t *display_data = txn->body_buf;
+    const uint8_t *display_data = body_data;
     size_t display_len = txn->body_len;
 
-    /* Decompress if Content-Encoding present */
+    /*
+     * If streaming decompression was active, body is already decompressed.
+     * Only fall back to one-shot decompress_body() when streaming wasn't used.
+     */
     uint8_t *decomp_buf = NULL;
-    if (txn->encoding[0] != '\0') {
-        /* Smart buffer allocation based on compressed size:
-         * - Estimate 10x compression ratio (typical for text content)
-         * - Minimum 8KB for small payloads
-         * - Maximum 10MB to prevent memory bombs
-         */
+    if (txn->encoding[0] != '\0' && !txn->stream_decomp.initialized &&
+        !txn->stream_decomp.finished) {
         size_t est_size = txn->body_len * 10;
         if (est_size < 8 * 1024) est_size = 8 * 1024;
         if (est_size > 10 * 1024 * 1024) est_size = 10 * 1024 * 1024;
 
         decomp_buf = malloc(est_size);
         if (decomp_buf) {
-            int decomp_len = decompress_body(txn->body_buf, (int)txn->body_len,
+            int decomp_len = decompress_body(body_data, (int)txn->body_len,
                                              txn->encoding, decomp_buf, (int)est_size);
             if (decomp_len > 0) {
                 display_data = decomp_buf;
@@ -651,7 +676,6 @@ static void h2_display_body_flow(flow_transaction_t *txn, flow_context_t *flow_c
     }
 
     display_body(display_data, display_len, txn->content_type);
-    /* Flush handled by async logger */
 
     if (decomp_buf) {
         free(decomp_buf);

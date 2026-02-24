@@ -956,23 +956,15 @@ void flow_free_resources(flow_context_t *ctx) {
             ctx->parser.h2.callback_ctx = NULL;
         }
 
-        /* Free H2 stream bodies if any were allocated */
+        /* Free H2 stream bodies and decompressors */
         for (int32_t i = 0; i < FLOW_MAX_H2_STREAMS; i++) {
             flow_txn_free_body(&ctx->parser.h2.streams[i]);
         }
     } else if (ctx->proto == FLOW_PROTO_HTTP1) {
-        /* Free HTTP/1 transaction body if allocated */
+        /* Free HTTP/1 transaction body and decompressor */
         flow_txn_free_body(&ctx->parser.h1.txn);
     }
     /* FLOW_PROTO_UNKNOWN and FLOW_PROTO_OTHER have no allocated resources */
-
-    /* Free streaming decompressor if initialized */
-    stream_decomp_cleanup(&ctx->body.stream_decomp);
-
-    if (ctx->body.buffer) {
-        free(ctx->body.buffer);
-        ctx->body.buffer = NULL;
-    }
 
     ctx->state = FLOW_STATE_CLOSED;
     atomic_store(&ctx->flags, 0);
@@ -999,15 +991,14 @@ void flow_h2_init_stream_pool(flow_context_t *ctx) {
         h2->streams[i].stream_id = 0;
         h2->streams[i].state = TXN_STATE_IDLE;
         h2->streams[i].flags = 0;
-        h2->streams[i].body_buf = NULL;
+        h2->streams[i].body_mirror = NULL;
         h2->streams[i].body_len = 0;
-        h2->streams[i].body_capacity = 0;
         h2->streams[i].next_free = i + 1;
     }
     h2->streams[FLOW_MAX_H2_STREAMS - 1].stream_id = 0;
     h2->streams[FLOW_MAX_H2_STREAMS - 1].state = TXN_STATE_IDLE;
     h2->streams[FLOW_MAX_H2_STREAMS - 1].flags = 0;
-    h2->streams[FLOW_MAX_H2_STREAMS - 1].body_buf = NULL;
+    h2->streams[FLOW_MAX_H2_STREAMS - 1].body_mirror = NULL;
     h2->streams[FLOW_MAX_H2_STREAMS - 1].next_free = -1;
 
     h2->free_head = 0;
@@ -1130,33 +1121,26 @@ void flow_h1_reset_txn(flow_context_t *ctx) {
     }
 }
 
+/** Body buffer size: 256KB mirrored buffer (power-of-2, within alignment.h range) */
+#define FLOW_BODY_BUFFER_SIZE  (256 * 1024)
+
 int flow_txn_alloc_body(flow_transaction_t *txn, size_t capacity) {
     if (!txn) {
         return -1;
     }
 
-    if (txn->body_buf) {
-        return 0;
+    if (txn->body_mirror) {
+        return 0;  /* Already allocated */
     }
 
-    if (capacity < 4096) {
-        capacity = 4096;
-    }
+    (void)capacity;  /* Mirrored buffer uses fixed size */
 
-    /*
-     * FIX: Use cache-line aligned allocation for transaction body buffer.
-     * This improves performance by avoiding false sharing and ensures
-     * proper alignment for SIMD operations. Round up capacity to be
-     * a multiple of 64 for aligned_alloc requirements.
-     */
-    size_t aligned_capacity = (capacity + 63) & ~(size_t)63;
-    txn->body_buf = aligned_alloc(64, aligned_capacity);
-    if (!txn->body_buf) {
+    txn->body_mirror = mirrored_buffer_create(FLOW_BODY_BUFFER_SIZE);
+    if (!txn->body_mirror) {
         return -1;
     }
 
     txn->body_len = 0;
-    txn->body_capacity = capacity;
     txn->flags |= TXN_FLAG_BODY_ALLOCATED;
 
     return 0;
@@ -1167,37 +1151,23 @@ int flow_txn_append_body(flow_transaction_t *txn, const uint8_t *data, size_t le
         return 0;
     }
 
-    if (!txn->body_buf) {
-        if (flow_txn_alloc_body(txn, len * 2) != 0) {
+    /* Lazy allocate on first body chunk */
+    if (!txn->body_mirror) {
+        if (flow_txn_alloc_body(txn, 0) != 0) {
             return -1;
         }
     }
 
-    if (txn->body_len + len > txn->body_capacity) {
-        size_t new_capacity = txn->body_capacity * 2;
-        if (new_capacity < txn->body_len + len) {
-            new_capacity = txn->body_len + len + 4096;
+    /* Truncate if exceeds fixed buffer size (same 256KB cap as before) */
+    if (txn->body_len + len > txn->body_mirror->size) {
+        len = txn->body_mirror->size - txn->body_len;
+        if (len == 0) {
+            return 0;  /* Buffer full */
         }
-
-        if (new_capacity > 256 * 1024) {
-            new_capacity = 256 * 1024;
-            if (txn->body_len + len > new_capacity) {
-                len = new_capacity - txn->body_len;
-                if (len == 0) {
-                    return 0;
-                }
-            }
-        }
-
-        uint8_t *new_buf = realloc(txn->body_buf, new_capacity);
-        if (!new_buf) {
-            return -1;
-        }
-        txn->body_buf = new_buf;
-        txn->body_capacity = new_capacity;
     }
 
-    memcpy(txn->body_buf + txn->body_len, data, len);
+    /* Direct write via mirrored base — no realloc, no memcpy-on-grow */
+    memcpy((uint8_t *)txn->body_mirror->base + txn->body_len, data, len);
     txn->body_len += len;
     txn->flags |= TXN_FLAG_HAS_BODY;
 
@@ -1209,12 +1179,14 @@ void flow_txn_free_body(flow_transaction_t *txn) {
         return;
     }
 
-    if (txn->body_buf) {
-        free(txn->body_buf);
-        txn->body_buf = NULL;
+    /* Clean up streaming decompressor */
+    stream_decomp_cleanup(&txn->stream_decomp);
+
+    if (txn->body_mirror) {
+        mirrored_buffer_destroy(txn->body_mirror);
+        txn->body_mirror = NULL;
     }
     txn->body_len = 0;
-    txn->body_capacity = 0;
     txn->flags &= ~(TXN_FLAG_BODY_ALLOCATED | TXN_FLAG_HAS_BODY);
 }
 

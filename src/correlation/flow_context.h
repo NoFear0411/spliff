@@ -29,6 +29,7 @@
 #include <nghttp2/nghttp2.h>
 #include "../include/spliff.h"
 #include "../content/stream_decompressor.h"
+#include "../memory/mirrored_buffer.h"
 
 /*============================================================================
  * Constants and Configuration
@@ -184,10 +185,12 @@ typedef struct flow_transaction {
     char content_type[64];          /**< Content-Type for body parsing */
     char encoding[32];              /**< Content-Encoding (gzip, br, etc.) */
 
-    /*=== Body Buffer (dynamically allocated, 24 bytes) ===*/
-    uint8_t *body_buf;              /**< Body data (NULL if not capturing) */
-    size_t body_len;                /**< Current body length */
-    size_t body_capacity;           /**< Allocated capacity */
+    /*=== Body Buffer (mirrored, fixed 256KB, 16 bytes) ===*/
+    mirrored_buffer_t *body_mirror; /**< Mirrored body buffer (NULL until first chunk) */
+    size_t body_len;                /**< Current data length in buffer */
+
+    /*=== Streaming Decompression (per-transaction) ===*/
+    stream_decomp_t stream_decomp;  /**< Per-txn streaming decompressor */
 
     /*=== Free List (4 bytes) ===*/
     int32_t next_free;              /**< Index of next free slot (-1 = end) */
@@ -283,24 +286,6 @@ typedef struct {
     void *callback_ctx;                     /**< Opaque nghttp2 callback context */
 } h2_parser_ctx_t;
 
-/**
- * @brief Response body assembly state
- *
- * Accumulates chunked or streaming response bodies for display.
- * Handles decompression of gzip/brotli/zstd content.
- */
-typedef struct {
-    uint8_t *buffer;                /**< Accumulation buffer */
-    size_t len;                     /**< Current data length */
-    size_t capacity;                /**< Allocated capacity */
-    size_t expected;                /**< Content-Length (0 if chunked) */
-    char content_type[128];         /**< Content-Type header */
-    char encoding[32];              /**< Content-Encoding */
-    bool needs_decompress;          /**< Requires decompression */
-    bool header_printed;            /**< Headers already output */
-    stream_decomp_t stream_decomp;  /**< Per-flow streaming decompression state */
-} body_ctx_t;
-
 /** @} */
 
 /*============================================================================
@@ -381,9 +366,6 @@ typedef struct flow_context {
         h1_parser_ctx_t h1;         /**< HTTP/1.x context */
         h2_parser_ctx_t h2;         /**< HTTP/2 context */
     } parser;
-
-    /*=== Body Assembly ===*/
-    body_ctx_t body;                /**< Response body state */
 
     /*=== Thread Safety / Worker Affinity ===*/
     /**
@@ -1083,6 +1065,20 @@ int flow_txn_append_body(flow_transaction_t *txn, const uint8_t *data, size_t le
  * @param[in,out] txn Transaction
  */
 void flow_txn_free_body(flow_transaction_t *txn);
+
+/**
+ * @brief Get pointer to transaction body data
+ *
+ * Returns the base address of the mirrored body buffer, or NULL
+ * if no body has been allocated yet.
+ *
+ * @param txn  Transaction (may be NULL)
+ * @return Pointer to body data, or NULL
+ */
+static inline uint8_t *flow_txn_body_ptr(const flow_transaction_t *txn) {
+    if (!txn || !txn->body_mirror) return NULL;
+    return (uint8_t *)txn->body_mirror->base;
+}
 
 /**
  * @brief Get current monotonic time in milliseconds
