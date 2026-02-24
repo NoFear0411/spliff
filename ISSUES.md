@@ -76,11 +76,11 @@ These are architectural or design constraints rather than bugs.
   - Detection relies on heuristic binary scanning that may fail
   - Recommended: Use Firefox (NSS) for reliable browser traffic capture
 
-- **Protocol Detection Timing**: ALPN-based protocol detection may miss if the ALPN event arrives after data events. Content-based fallback detection is planned for v0.10.0.
+- **Protocol Detection Timing**: ALPN-based protocol detection may miss if the ALPN event arrives after data events. Content-based fallback detection is planned for v0.11.0 (Phase 4).
 - **HTTP/2 Mid-Stream Capture**: Joining existing HTTP/2 connections may cause HPACK decode errors for first few responses. Recovery is automatic via `hpack_corrupted` flag per RFC 7540.
 - **HTTP/2 Stream Limits**: 64 concurrent streams per flow. Ghost streams (inactive >10s) are automatically reaped.
 - **XDP Native Mode**: Some network drivers don't support XDP native mode; spliff automatically falls back to SKB mode with a status message.
-- **Plain HTTP Capture**: Currently only captures TLS-encrypted traffic. Plain HTTP capture planned for future release.
+- **Plain HTTP Capture**: Currently only captures TLS-encrypted traffic. Plaintext flow support added in v0.10.0 (`FLOW_FLAG_PLAINTEXT`), but protocol detection engine for plain HTTP not yet wired (Phase 4, v0.11.0).
 - **QUIC/HTTP/3**: Not yet supported (planned for v0.11.0).
 - **Kernel Requirements**: Requires Linux 5.x+ with BTF support (`CONFIG_DEBUG_INFO_BTF=y`).
 
@@ -89,6 +89,70 @@ These are architectural or design constraints rather than bugs.
 ---
 
 ## Resolved Issues
+
+### AlmaLinux 9 Build Failure — static_assert (Fixed in v0.10.0)
+
+**Symptoms:**
+- CI pipeline fails on AlmaLinux 9 with `expected declaration specifiers or '...' before 'sizeof'`
+- Compilation errors in `src/ring/affinity.h` at lines 192, 237, 238
+
+**Root Cause:**
+GCC 11 (AlmaLinux 9's default) doesn't support the C23 single-argument `static_assert(expr)` form. Only the two-argument C11 form `static_assert(expr, "message")` is portable across all supported compilers.
+
+**Resolution:**
+Added descriptive message strings to all three `static_assert()` calls in `affinity.h`.
+
+**Fixed in:** `src/ring/affinity.h`
+
+---
+
+### Hardcoded PkgConfig::JEMALLOC in Test Targets (Fixed in v0.10.0)
+
+**Symptoms:**
+- `cmake -DUSE_MIMALLOC=ON` builds the main executable correctly but test targets fail to link
+- 5 test targets (http1, http2, flow_context, flow_refcount, detector) hardcode `PkgConfig::JEMALLOC`
+
+**Root Cause:**
+Test targets were independently specifying `PkgConfig::JEMALLOC` instead of using the `${ALLOCATOR_TARGET}` variable that resolves to whichever allocator was configured.
+
+**Resolution:**
+CMake modernization introduced `spliff_common_deps` INTERFACE library that wraps all 9 shared link dependencies using `${ALLOCATOR_TARGET}`. All heavy test targets now link against this instead of listing dependencies individually.
+
+**Fixed in:** `tests/CMakeLists.txt` (CMake subdirectory split)
+
+---
+
+### Transitive Dependency Propagation in Tests (Fixed in v0.10.0)
+
+**Symptoms:**
+- Adding a new dependency to `flow_context.c` requires manually updating 6+ test targets
+- Missed propagation causes link failures (e.g., `stream_decompressor.c` added to `flow_free_resources()` broke 8 test targets)
+
+**Root Cause:**
+The 15-file "flow_context cluster" was copy-pasted into each test target independently. No shared compilation unit existed.
+
+**Resolution:**
+Introduced three OBJECT libraries (`spliff_memory`, `spliff_core`, `spliff_ring`) in `src/CMakeLists.txt`. Test targets link against object libraries instead of listing source files individually. New dependencies propagate automatically.
+
+**Fixed in:** `src/CMakeLists.txt`, `tests/CMakeLists.txt`
+
+---
+
+### ASan Alignment Violation in deferred_msg_t (Fixed in v0.10.0)
+
+**Symptoms:**
+- AddressSanitizer reports `ERROR: AddressSanitizer: heap-buffer-overflow` in deferred free path
+- Only triggers in debug builds with sanitizers enabled
+
+**Root Cause:**
+`aligned_alloc()` requires the allocation size to be a multiple of the alignment. `deferred_msg_t` was 264 bytes but allocated with 128-byte alignment, and 264 is not a multiple of 128.
+
+**Resolution:**
+Rounded allocation size up to the next multiple of `CACHELINE_SIZE` (128 bytes), resulting in 384-byte allocation that satisfies `aligned_alloc()` requirements.
+
+**Fixed in:** `src/threading/deferred.c`
+
+---
 
 ### IPv6 XOR Hash Collisions (Fixed in v0.9.10)
 
@@ -229,7 +293,7 @@ When reporting issues, please include:
 
 **Example report:**
 ```
-Version: spliff 0.9.11
+Version: spliff 0.10.0
 OS: Fedora 43, kernel 6.18.5
 Steps: 1. Start spliff, 2. Connect to VPN, 3. curl https://example.com
 Expected: XDP correlation info shown with HTTP output
