@@ -101,6 +101,11 @@
 #include "../memory/alignment.h"
 #include "ring_event.h"
 
+/* GCC 11 (AlmaLinux 9) doesn't support C23 static_assert keyword */
+#if !defined(static_assert) && !defined(__cplusplus)
+# define static_assert _Static_assert
+#endif
+
 /**
  * @defgroup affinity Worker Affinity
  * @brief Affinity check and MPSC overflow queue for SPMC dispatch
