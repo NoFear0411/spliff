@@ -151,7 +151,6 @@ spliff/
     ├── ARCHITECTURE-DECISIONS.md   # ADR-001 (SPMC), ADR-002 (three-layer), ADR-003 (session registry)
     ├── CODE-MAP.md                 # This file
     ├── REFACTOR-PLAN.md            # Omni-Ring implementation roadmap (Phases 1-9)
-    ├── RESEARCH-ANALYSIS.md        # Research cross-reference and validation
     ├── EDR_XDR_ROADMAP.md          # Long-term EDR/XDR vision
     └── TROUBLESHOOTING.md          # Common issues and solutions
 ```

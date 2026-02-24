@@ -2,7 +2,6 @@
 
 **Based on:** research/omni-ring-complete-reference.md, research/vyukov_spmc_mpsc.txt,
 research/Final.txt, research/LEGAL.txt
-**Cross-Reference:** docs/RESEARCH-ANALYSIS.md (comprehensive research paper)
 **Current Version:** 0.10.0
 **Target:** 1.0.0 (production-ready, stable API)
 **Versioning:** Semantic versioning (0.10.x → 0.11.0 → ... → 1.0.0)
@@ -60,7 +59,6 @@ v0.10.0 (Current) - FOUNDATION ✅ RELEASED
 ## Research Validation Summary
 
 > Cross-referenced against `vyukov_spmc_mpsc.txt`, `Final.txt`, `LEGAL.txt`.
-> Full analysis: `docs/RESEARCH-ANALYSIS.md`
 
 **Research validates existing design (no changes needed):**
 - Two-stage pipeline (BPF MPSC → Vyukov SPMC) — matches ADR-001/ADR-002
