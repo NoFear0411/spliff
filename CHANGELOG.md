@@ -297,11 +297,11 @@ All audit items from v0.9.10 now resolved.
   - Workers check `flow_ctx->generation != expected_gen` before processing
   - Catches both freed and reused flows with a single 4-byte compare
 
-- **Inflight Event Reference Counting**: Prevents use-after-free during flow cleanup
-  - `_Atomic int32_t inflight_events` on `flow_context_t` tracks dispatched-but-unprocessed events
-  - Dispatcher increments before enqueue, worker decrements after processing
-  - Deferred free blocks until inflight count reaches zero
-  - All early-exit paths (cookie retry, misroute defer) properly decrement
+- **Flow Reference Counting**: Prevents use-after-free during flow cleanup
+  - `_Atomic uint32_t ref_count` on `flow_context_t` tracks all live references
+  - Starts at 1 (creator's ref), dispatcher acquires before dispatch, worker releases after processing
+  - Creator's ref released in `flow_terminate()`; deferred free blocks until ref_count reaches zero
+  - Inline helpers: `flow_ref_acquire()`, `flow_ref_release()`, `flow_ref_count()`
 
 - **Deferred Free with Grace Period**: Safe memory reclamation for flow contexts
   - Terminated flows moved to deferred FIFO queue instead of immediate free

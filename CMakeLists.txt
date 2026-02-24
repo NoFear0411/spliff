@@ -939,6 +939,39 @@ target_link_libraries(test_flow_context PRIVATE
 )
 # add_test(NAME flow_context_tests COMMAND test_flow_context)  # Disabled until API updated for CK hash tables
 
+# Flow refcount + plaintext tests (P3 - lifecycle management)
+add_executable(test_flow_refcount EXCLUDE_FROM_ALL
+    tests/test_flow_refcount.c
+    tests/test_stubs.c
+    src/correlation/flow_context.c
+    src/correlation/ck_cookie_index.c
+    src/correlation/ck_shadow_index.c
+    src/util/safe_str.c
+    src/protocol/http2.c
+    src/protocol/http1.c
+    src/output/display.c
+    src/output/logger.c
+    src/content/decompressor.c
+    src/content/signatures.c
+    src/threading/state.c
+    src/threading/deferred.c
+    src/threading/pool.c
+    src/threading/xdp_ring.c
+)
+target_include_directories(test_flow_refcount PRIVATE ${CMAKE_SOURCE_DIR}/src/include)
+target_link_libraries(test_flow_refcount PRIVATE
+    PkgConfig::LLHTTP
+    PkgConfig::NGHTTP2
+    PkgConfig::CK
+    PkgConfig::JEMALLOC
+    PkgConfig::LIBURCU
+    PkgConfig::LIBURCU_CDS
+    ${ZLIB_TARGET}
+    PkgConfig::ZSTD
+    PkgConfig::BROTLI
+)
+add_test(NAME flow_refcount_tests COMMAND test_flow_refcount)
+
 # Decompressor tests (P1 - content handling)
 add_executable(test_decompressor EXCLUDE_FROM_ALL
     tests/test_decompressor.c
@@ -1015,7 +1048,7 @@ add_test(NAME display_tests COMMAND test_display)
 # Custom target to build all tests
 # Note: test_http1 and test_http2 need API updates for current codebase
 add_custom_target(build_tests
-    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_mirrored_buffer test_spmc_ring test_affinity test_concurrent test_backpressure test_worker_dequeue test_decompressor test_detector test_websocket test_display
+    DEPENDS test_http1 test_http2 test_xdp test_safe_str test_mirrored_buffer test_spmc_ring test_affinity test_concurrent test_backpressure test_worker_dequeue test_flow_refcount test_decompressor test_detector test_websocket test_display
     # Note: test_flow_context excluded until API updated for CK hash tables (v0.9.9)
     COMMENT "Building all test executables..."
 )

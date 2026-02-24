@@ -393,13 +393,16 @@ typedef struct flow_context {
     _Atomic bool active;
 
     /**
-     * @brief Count of events dispatched but not yet processed by workers.
+     * @brief Reference count for safe deferred deallocation.
      *
-     * Incremented by dispatcher when dispatching an event with this flow_ctx.
-     * Decremented by worker after finishing event processing.
-     * Deferred free will not release resources while inflight_events > 0.
+     * Starts at 1 (creator's reference via flow_pool_alloc). Acquired by
+     * dispatcher before dispatching an event, released by worker after
+     * processing. Creator's reference released via flow_terminate().
+     * Deferred free will not release resources while ref_count > 0.
+     *
+     * @see flow_ref_acquire(), flow_ref_release(), flow_ref_count()
      */
-    _Atomic int32_t inflight_events;
+    _Atomic uint32_t ref_count;
 
     /**
      * @brief Home worker ID for "Sticky" worker affinity
@@ -449,8 +452,87 @@ enum flow_flags {
     FLOW_FLAG_HAS_SSL     = (1 << 1),   /**< SSL data populated */
     FLOW_FLAG_IN_COOKIE   = (1 << 2),   /**< In cookie_index */
     FLOW_FLAG_IN_SHADOW   = (1 << 3),   /**< In shadow_index */
-    FLOW_FLAG_PARSER_INIT = (1 << 4)    /**< Parser initialized */
+    FLOW_FLAG_PARSER_INIT = (1 << 4),   /**< Parser initialized */
+    FLOW_FLAG_PLAINTEXT   = (1 << 5)    /**< Non-TLS flow (XDP-only, no SSL) */
 };
+
+/** @} */
+
+/*============================================================================
+ * Reference Count Helpers (Inline)
+ *============================================================================*/
+
+/**
+ * @defgroup flow_refcount Reference Counting
+ * @brief Atomic reference counting for safe deferred deallocation
+ *
+ * @par Memory Ordering Rationale
+ * - Acquire (increment): relaxed — caller already holds a reference,
+ *   so the object is guaranteed alive. No cross-thread synchronization
+ *   needed for the increment itself.
+ * - Release (decrement): release — ensures all prior writes by the
+ *   releasing thread are visible to the janitor's acquire-load.
+ * - Drain check (read): acquire — synchronizes with workers' release
+ *   stores, ensuring the janitor sees a consistent count.
+ * @{
+ */
+
+/**
+ * @brief Acquire a reference to a flow context.
+ *
+ * Called by the dispatcher before dispatching an event that carries
+ * a flow_context_t pointer. The caller must already hold a reference.
+ *
+ * @param ctx  Flow context (must not be NULL)
+ * @return Previous reference count (before increment)
+ */
+static inline uint32_t flow_ref_acquire(flow_context_t *ctx) {
+    return atomic_fetch_add_explicit(&ctx->ref_count, 1,
+                                      memory_order_relaxed);
+}
+
+/**
+ * @brief Release a reference to a flow context.
+ *
+ * Called by workers after processing an event, and by the creator
+ * (via flow_terminate) when the flow is being destroyed.
+ *
+ * @param ctx  Flow context (must not be NULL)
+ * @return true if this was the last reference (count reached 0)
+ */
+static inline bool flow_ref_release(flow_context_t *ctx) {
+    uint32_t prev = atomic_fetch_sub_explicit(&ctx->ref_count, 1,
+                                               memory_order_release);
+    return (prev == 1);  /* was 1, now 0 */
+}
+
+/**
+ * @brief Read the current reference count (snapshot).
+ *
+ * Uses acquire semantics to synchronize with workers' releases,
+ * ensuring the janitor sees all completed decrements.
+ *
+ * @param ctx  Flow context (must not be NULL)
+ * @return Current reference count
+ */
+static inline uint32_t flow_ref_count(flow_context_t *ctx) {
+    return atomic_load_explicit(&ctx->ref_count, memory_order_acquire);
+}
+
+/**
+ * @brief Check if a flow is plaintext (non-TLS).
+ *
+ * Plaintext flows are observed only via XDP packet capture without
+ * any SSL/TLS hooks. They can transition to ACTIVE with only XDP
+ * data (no SSL view required).
+ *
+ * @param ctx  Flow context (must not be NULL)
+ * @return true if FLOW_FLAG_PLAINTEXT is set
+ */
+static inline bool flow_is_plaintext(flow_context_t *ctx) {
+    return (atomic_load_explicit(&ctx->flags, memory_order_acquire) &
+            FLOW_FLAG_PLAINTEXT) != 0;
+}
 
 /** @} */
 

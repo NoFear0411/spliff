@@ -147,6 +147,7 @@ flow_context_t *flow_pool_alloc(flow_pool_t *pool) {
     ctx->proto = FLOW_PROTO_UNKNOWN;
     atomic_store_explicit(&ctx->home_worker_id, WORKER_ID_NONE,
                           memory_order_relaxed);
+    atomic_store_explicit(&ctx->ref_count, 1, memory_order_relaxed);
     atomic_store_explicit(&ctx->active, true, memory_order_release);
 
     /* Insert at head of active list */
@@ -183,7 +184,7 @@ void flow_pool_free(flow_pool_t *pool, flow_context_t *ctx) {
      * flow_ctx and be actively using the nghttp2 session / body buffer.
      * Resources are freed by flow_pool_drain_deferred() only after:
      *   1. The 2s grace period has expired, AND
-     *   2. No in-flight events reference this flow (inflight_events == 0)
+     *   2. All references have been released (ref_count == 0)
      * The struct and all its resources remain valid in the deferred queue. */
 
     /* Mark as inactive */
@@ -226,9 +227,9 @@ void flow_pool_drain_deferred(flow_pool_t *pool, uint64_t now) {
         if (now - ctx->last_seen_ns < FLOW_DEFERRED_FREE_GRACE_NS) {
             break;  /* Not yet expired */
         }
-        /* Don't free if workers still have in-flight events referencing this flow */
-        if (atomic_load_explicit(&ctx->inflight_events, memory_order_acquire) > 0) {
-            break;  /* Workers still processing — retry next janitor cycle */
+        /* Don't free if any references are still held (workers, dispatcher) */
+        if (flow_ref_count(ctx) > 0) {
+            break;  /* References outstanding — retry next janitor cycle */
         }
         pool->deferred_head = ctx->list_next;
         if (!pool->deferred_head) {
@@ -564,6 +565,13 @@ flow_context_t *flow_get_or_create(flow_manager_t *mgr, uint64_t cookie,
     ctx->pid = pid;
     ctx->ssl_ctx = ssl_ctx;
 
+    /* Mark as plaintext if no SSL context but has a socket cookie.
+     * These are non-TLS flows observed only via XDP packet capture. */
+    if (ssl_ctx == 0 && cookie != 0) {
+        atomic_fetch_or_explicit(&ctx->flags, FLOW_FLAG_PLAINTEXT,
+                                  memory_order_relaxed);
+    }
+
     /* Add to shadow_index (always) - uses CK hs (single-writer safe) */
     if (pid != 0) {
         if (ck_shadow_index_insert(&mgr->shadow_idx, pid, ssl_ctx, ctx) == 0) {
@@ -701,7 +709,12 @@ void flow_terminate(flow_manager_t *mgr, flow_context_t *ctx) {
         ck_shadow_index_remove(&mgr->shadow_idx, ctx->pid, ctx->ssl_ctx);
     }
 
-    /* Free to pool (deferred) */
+    /* Release creator's reference (acquired in flow_pool_alloc).
+     * If workers still hold refs, ref_count stays > 0 and drain
+     * will wait for them before freeing. */
+    flow_ref_release(ctx);
+
+    /* Move to deferred free queue (2s grace + ref_count == 0 required) */
     flow_pool_free(&mgr->pool, ctx);
 }
 
@@ -781,9 +794,15 @@ void flow_update_xdp(flow_context_t *ctx, const xdp_packet_event_t *evt) {
      */
     atomic_fetch_or_explicit(&ctx->flags, FLOW_FLAG_HAS_XDP, memory_order_release);
 
-    /* Update state if we have both views */
-    if ((atomic_load(&ctx->flags) & FLOW_FLAG_HAS_SSL) && ctx->state == FLOW_STATE_INIT) {
-        ctx->state = FLOW_STATE_ACTIVE;
+    /* Update state if sufficient views are available.
+     * SSL flows require both XDP + SSL views.
+     * Plaintext flows need only XDP (no SSL to wait for). */
+    if (ctx->state == FLOW_STATE_INIT) {
+        uint8_t cur_flags = atomic_load(&ctx->flags);
+        if ((cur_flags & FLOW_FLAG_HAS_SSL) ||
+            (cur_flags & FLOW_FLAG_PLAINTEXT)) {
+            ctx->state = FLOW_STATE_ACTIVE;
+        }
     }
 }
 

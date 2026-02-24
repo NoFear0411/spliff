@@ -208,7 +208,7 @@
            │  │  │           flow_context_t               │  │  │
            │  │  │  • socket_cookie, pid, ssl_ctx         │  │  │
            │  │  │  • generation (stale pointer detect)   │  │  │
-           │  │  │  • inflight_events (ref counting)      │  │  │
+           │  │  │  • ref_count (ref counting)      │  │  │
            │  │  │  • flags: HAS_XDP | HAS_SSL | IN_*     │  │  │
            │  │  │  • home_worker_id (atomic ownership)   │  │  │
            │  │  │  • parser.h2 (nghttp2 + streams[64])   │  │  │
@@ -281,7 +281,7 @@ connection from which process.
 │  │ • flow_key, ifindex, first_seen, last_seen, atomic counters    │  │
 │  │                                                                │  │
 │  │ Cache line 2+ (protocol state):                                │  │
-│  │ • flags, home_worker_id, inflight_events (atomic)              │  │
+│  │ • flags, home_worker_id, ref_count (atomic)              │  │
 │  │ • parser.h2 (nghttp2 + streams[64] + hpack_corrupted)          │  │
 │  │ • parser.h1 (llhttp + current_txn)                             │  │
 │  │ • alpn, body buffers, proto                                    │  │

@@ -176,8 +176,8 @@ static void worker_handle_xdp_event(const xdp_ring_event_t *event, void *ctx_arg
                 fprintf(stderr, "[Worker %d] XDP: STALE flow_ctx (gen %u != expected %u)\n",
                         ctx->worker_id, flow->generation, event->expected_gen);
             }
-            /* Decrement inflight (dispatcher incremented it) */
-            atomic_fetch_sub_explicit(&flow->inflight_events, 1, memory_order_release);
+            /* Release ref (dispatcher acquired it) */
+            flow_ref_release(flow);
             return;
         }
 
@@ -190,8 +190,8 @@ static void worker_handle_xdp_event(const xdp_ring_event_t *event, void *ctx_arg
                     (unsigned long long)event->socket_cookie);
         }
 
-        /* Decrement inflight counter (dispatcher incremented it) */
-        atomic_fetch_sub_explicit(&flow->inflight_events, 1, memory_order_release);
+        /* Release ref (dispatcher acquired it) */
+        flow_ref_release(flow);
     }
 }
 
@@ -624,11 +624,9 @@ static void worker_loop(worker_ctx_t *ctx) {
             /* Check if cookie retry needed */
             if (event->needs_cookie_retry && event->flow_ctx == NULL) {
                 if (defer_event_for_retry(ctx, event) == 0) {
-                    /* Decrement inflight on original flow (generation check
-                     * may have NULLed flow_ctx, but dispatcher incremented) */
+                    /* Release ref on original flow (dispatcher acquired it) */
                     if (inflight_flow_ctx) {
-                        atomic_fetch_sub_explicit(&inflight_flow_ctx->inflight_events,
-                                                   1, memory_order_release);
+                        flow_ref_release(inflight_flow_ctx);
                     }
                     /* Successfully deferred - don't count against budget */
                     continue;
@@ -845,11 +843,9 @@ static void worker_loop(worker_ctx_t *ctx) {
                                             my_id, event->flow_ctx->self_id);
                                 }
                                 if (defer_event_for_retry(ctx, event) == 0) {
-                                    /* Decrement inflight — will be re-processed later */
+                                    /* Release ref — will be re-acquired on retry */
                                     if (inflight_flow_ctx) {
-                                        atomic_fetch_sub_explicit(
-                                            &inflight_flow_ctx->inflight_events,
-                                            1, memory_order_release);
+                                        flow_ref_release(inflight_flow_ctx);
                                     }
                                     continue; /* Skip process_worker_event, will retry later */
                                 }
@@ -873,9 +869,7 @@ static void worker_loop(worker_ctx_t *ctx) {
                                                 "(home=%u)\n", my_id, event->flow_ctx->self_id, home);
                                     }
                                     if (inflight_flow_ctx) {
-                                        atomic_fetch_sub_explicit(
-                                            &inflight_flow_ctx->inflight_events,
-                                            1, memory_order_release);
+                                        flow_ref_release(inflight_flow_ctx);
                                     }
                                     continue; /* Skip process_worker_event, will retry later */
                                 }
@@ -886,9 +880,7 @@ static void worker_loop(worker_ctx_t *ctx) {
                                             "(defer queue full)\n", my_id, event->flow_ctx->self_id);
                                 }
                                 if (inflight_flow_ctx) {
-                                    atomic_fetch_sub_explicit(
-                                        &inflight_flow_ctx->inflight_events,
-                                        1, memory_order_release);
+                                    flow_ref_release(inflight_flow_ctx);
                                 }
                                 continue; /* Skip process_worker_event */
                             }
@@ -905,12 +897,11 @@ static void worker_loop(worker_ctx_t *ctx) {
 
             process_worker_event(ctx, event);
 
-            /* Decrement in-flight count so deferred free knows we're done.
+            /* Release ref so deferred free knows we're done.
              * Use saved pointer — event->flow_ctx may have been NULLed by
-             * generation check, but the dispatcher still incremented inflight. */
+             * generation check, but the dispatcher still acquired a ref. */
             if (inflight_flow_ctx) {
-                atomic_fetch_sub_explicit(&inflight_flow_ctx->inflight_events, 1,
-                                           memory_order_release);
+                flow_ref_release(inflight_flow_ctx);
             }
 
             pool_free(&ctx->event_pool, event);

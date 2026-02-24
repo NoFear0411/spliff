@@ -304,22 +304,16 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
         memcpy(event->data, bpf_event->data, event->data_len);
     }
 
-    /* Track in-flight events for safe deferred free */
+    /* Acquire reference for the event we're about to dispatch */
     if (flow_ctx) {
-        atomic_fetch_add_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+        flow_ref_acquire(flow_ctx);
     }
 
     /* Enqueue to worker's input ring */
     if (!ck_ring_enqueue_spsc(&worker->in_ring, worker->in_buffer, event)) {
         /* Queue full - return event to pool and drop */
         if (flow_ctx) {
-            /*
-             * FIX: Use memory_order_release for inflight_events decrement.
-             * Ensures janitor thread sees this decrement before potentially
-             * freeing the flow context. memory_order_relaxed could allow
-             * the janitor to observe stale count and free prematurely.
-             */
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+            flow_ref_release(flow_ctx);
         }
         pool_free(&worker->event_pool, event);
         /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
@@ -718,20 +712,15 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
     }
     worker_ctx_t *worker = &dispatcher->workers[worker_id];
 
-    /* Track in-flight events for safe deferred free */
+    /* Acquire reference for the event we're about to dispatch */
     if (flow_ctx) {
-        atomic_fetch_add_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+        flow_ref_acquire(flow_ctx);
     }
 
     /* Push to worker's SPSC ring (includes eventfd signal) */
     if (!worker->xdp_ring) {
         if (flow_ctx) {
-            /*
-             * FIX: Use memory_order_release for inflight_events decrement.
-             * Ensures janitor thread sees this decrement before potentially
-             * freeing the flow context.
-             */
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+            flow_ref_release(flow_ctx);
         }
         /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
@@ -740,12 +729,7 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
 
     if (!xdp_ring_push(worker->xdp_ring, &ring_evt)) {
         if (flow_ctx) {
-            /*
-             * FIX: Use memory_order_release for inflight_events decrement.
-             * Ensures janitor thread sees this decrement before potentially
-             * freeing the flow context.
-             */
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+            flow_ref_release(flow_ctx);
         }
         /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
@@ -844,19 +828,14 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
     }
     worker_ctx_t *worker = &dispatcher->workers[worker_id];
 
-    /* Track in-flight events for safe deferred free */
+    /* Acquire reference for the event we're about to dispatch */
     if (flow_ctx) {
-        atomic_fetch_add_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+        flow_ref_acquire(flow_ctx);
     }
 
     if (!worker->xdp_ring) {
         if (flow_ctx) {
-            /*
-             * FIX: Use memory_order_release for inflight_events decrement.
-             * Ensures janitor thread sees this decrement before potentially
-             * freeing the flow context.
-             */
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+            flow_ref_release(flow_ctx);
         }
         /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
@@ -865,12 +844,7 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
 
     if (!xdp_ring_push(worker->xdp_ring, &ring_evt)) {
         if (flow_ctx) {
-            /*
-             * FIX: Use memory_order_release for inflight_events decrement.
-             * Ensures janitor thread sees this decrement before potentially
-             * freeing the flow context.
-             */
-            atomic_fetch_sub_explicit(&flow_ctx->inflight_events, 1, memory_order_release);
+            flow_ref_release(flow_ctx);
         }
         /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
