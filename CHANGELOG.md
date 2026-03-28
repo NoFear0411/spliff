@@ -2,6 +2,17 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.10.1] - 2026-03-28
+
+### Fixed
+
+- **Shutdown use-after-free**: Reordered cleanup sequence to drain
+  ring buffers before freeing flow state. Previously,
+  `threading_cleanup()` freed the flow manager before
+  `bpf_loader_cleanup()` drained the XDP ring, causing
+  heap-buffer-overflow when ring callbacks referenced freed memory.
+  Cleanup order is now: detach sources, drain rings, free state.
+
 ## [0.10.0] - 2026-02-24
 
 ### Omni-Ring Foundation Release

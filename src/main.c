@@ -540,29 +540,34 @@ static void cleanup_all_resources(void) {
     /* Now mark logger as uninitialized */
     g_logger_initialized = false;
 
-    /* Now safe to free threading resources */
-    if (g_threading_initialized) {
-        threading_cleanup(&g_threading);
-        g_threading_initialized = false;
-    }
+    /* Shutdown order: detach sources first, drain rings while state is
+     * alive, then free state. This prevents use-after-free in ring
+     * callbacks that reference flow/dispatcher state. */
 
-    /* Cleanup probe handler (ring buffer) */
-    if (g_probe_initialized) {
-        probe_handler_cleanup(&g_handler);
-        g_probe_initialized = false;
-    }
-
-    /* Cleanup XDP (detach from all interfaces) - before BPF cleanup */
+    /* 1. Detach XDP from interfaces (stop new events entering ring) */
     if (g_xdp_initialized) {
         bpf_loader_xdp_detach_all(&g_loader, g_debug_mode);
         g_xdp_initialized = false;
     }
 
-    /* Cleanup BPF loader (detach probes, but NOT the object - skeleton owns it)
-     * FIX: The owns_object flag now properly handles this - no NULL hack needed */
+    /* 2. Drain ring buffers while flow state is still alive.
+     * bpf_loader_cleanup drains the XDP ring via ring_buffer__poll,
+     * which fires callbacks into dispatcher/flow_lookup.
+     * probe_handler_cleanup drains the SSL ring similarly. */
     if (g_bpf_initialized) {
         bpf_loader_cleanup(&g_loader);
         g_bpf_initialized = false;
+    }
+
+    if (g_probe_initialized) {
+        probe_handler_cleanup(&g_handler);
+        g_probe_initialized = false;
+    }
+
+    /* 3. Now safe to free threading/flow resources (no more callbacks) */
+    if (g_threading_initialized) {
+        threading_cleanup(&g_threading);
+        g_threading_initialized = false;
     }
 
     /* Destroy BPF skeleton (this properly frees the embedded BPF object) */
