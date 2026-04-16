@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.10.1-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.10.2-blue.svg)](CHANGELOG.md)
 [![Release](https://github.com/NoFear0411/spliff/actions/workflows/release.yml/badge.svg)](https://github.com/NoFear0411/spliff/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)

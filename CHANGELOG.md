@@ -2,6 +2,33 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.10.2] - 2026-04-16
+
+### Changed
+
+- Strip redundant `@author`/`@copyright`/`@license` Doxygen tags from 49 file
+  headers. SPDX-License-Identifier is the canonical source.
+- Replace hand-coded FNV-1a hex literals with `FNV_OFFSET_BASIS`/`FNV_PRIME`
+  constants in flow_context.c, ck_cookie_index.c, ck_shadow_index.c, threading.h.
+- Const-widen read-only parameters: `bpf_loader_get_link_count`,
+  `bpf_loader_xdp_is_active`, `bpf_loader_sockops_is_attached`,
+  `bpf_loader_xdp_get_last_error`, `threading_is_running`,
+  `dispatcher_get_xdp_events_received`, `flow_ref_count`, `flow_is_plaintext`,
+  `probe_handler_set_filter_pids`.
+- Tighten `http2_frame_name` parameter from `int` to `uint8_t`.
+
+### Removed
+
+- Dead type `ssl_event_t` from spliff.h (zero references, replaced by
+  `ssl_data_event_t` in probe_handler.h).
+- Dead enum `h2_stream_state_t` and `H2_STREAM_*` enumerators from http2.h
+  (zero references, replaced by `txn_state_t` in flow_context.h).
+- Dead macro `#define inflateReset zng_inflateReset` from stream_decompressor.c.
+- Unused variable `original_gen` from test_flow_context.c.
+- 10 v0.9.11 tombstone comment blocks from main.c, worker.c, state.c, threading.h.
+- 13 redundant "FIX L1: Use relaxed ordering" comments from dispatcher.c.
+- `@details` restatement blocks from safe_str.c, display.c, logger.c, logger.h.
+
 ## [0.10.1] - 2026-03-28
 
 ### Fixed
