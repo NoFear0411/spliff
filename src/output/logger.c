@@ -2,13 +2,7 @@
  * @file logger.c
  * @brief Async MPSC logging pipeline implementation
  *
- * Implements lock-free async logging with:
- * - MPSC ring buffer (ck_ring)
- * - Pre-allocated entry pool with free-list recycling
- * - eventfd edge-triggered wake-up
- * - writev() batch writes for atomic output
- *
- * @copyright Copyright (c) 2026
+ * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 #include "logger.h"

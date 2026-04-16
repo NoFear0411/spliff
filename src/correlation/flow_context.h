@@ -499,7 +499,7 @@ static inline bool flow_ref_release(flow_context_t *ctx) {
  * @param ctx  Flow context (must not be NULL)
  * @return Current reference count
  */
-static inline uint32_t flow_ref_count(flow_context_t *ctx) {
+static inline uint32_t flow_ref_count(const flow_context_t *ctx) {
     return atomic_load_explicit(&ctx->ref_count, memory_order_acquire);
 }
 
@@ -513,7 +513,7 @@ static inline uint32_t flow_ref_count(flow_context_t *ctx) {
  * @param ctx  Flow context (must not be NULL)
  * @return true if FLOW_FLAG_PLAINTEXT is set
  */
-static inline bool flow_is_plaintext(flow_context_t *ctx) {
+static inline bool flow_is_plaintext(const flow_context_t *ctx) {
     return (atomic_load_explicit(&ctx->flags, memory_order_acquire) &
             FLOW_FLAG_PLAINTEXT) != 0;
 }

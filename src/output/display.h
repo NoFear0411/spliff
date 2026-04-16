@@ -27,10 +27,6 @@
  * 10:30:45.234 ← 200 https://example.com/api ALPN:h2 application/json (1234 bytes) curl (1234) [2.1ms]
  * @endcode
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

@@ -29,10 +29,6 @@
  * Sessions are managed per flow_context_t, with streams stored in
  * flow_transaction_t structures. Each flow maintains independent HPACK state.
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -131,13 +127,6 @@ struct flow_context;
  *                     +--------+
  * @endcode
  */
-typedef enum {
-    H2_STREAM_IDLE = 0,           /**< Initial state before HEADERS */
-    H2_STREAM_OPEN,               /**< Active bidirectional stream */
-    H2_STREAM_HALF_CLOSED_LOCAL,  /**< Local side closed (sent END_STREAM) */
-    H2_STREAM_HALF_CLOSED_REMOTE, /**< Remote side closed (received END_STREAM) */
-    H2_STREAM_CLOSED              /**< Stream fully closed */
-} h2_stream_state_t;
 
 /**
  * @brief Initialize HTTP/2 parser system
@@ -218,7 +207,7 @@ void http2_cleanup(void);
  *
  * @return Static string with frame name (e.g., "HEADERS", "DATA")
  */
-const char *http2_frame_name(int type);
+const char *http2_frame_name(uint8_t type);
 
 /**
  * @brief Check if data looks like HTTP/2 connection preface

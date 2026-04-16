@@ -8,9 +8,6 @@
  * - display_format_latency (ns/us/ms/s ranges)
  * - display_get_timestamp format validation
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
  */
 
 #include <stdio.h>

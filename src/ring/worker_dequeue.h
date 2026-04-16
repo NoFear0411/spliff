@@ -45,10 +45,6 @@
  * @see src/ring/backpressure.h    Backpressure levels
  * @see src/ring/adaptive_poll.h   Polling timeout computation (Task #15)
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

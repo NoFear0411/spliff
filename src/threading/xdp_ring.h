@@ -30,10 +30,6 @@
  * - Head/tail are cache-line aligned to prevent false sharing
  * - Shares worker's existing eventfd for instant wakeup
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

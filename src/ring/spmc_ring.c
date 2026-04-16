@@ -20,10 +20,6 @@
  *   4. ck_pr_fence_release()             — ensures read done before free
  *   5. ck_pr_store_64(&slot->seq, pos+cap) — release back to producer
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

@@ -7,9 +7,6 @@
  * - http1_parse message parsing (auto-detect direction)
  * - Request/response field extraction
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
  */
 
 #include <stdio.h>

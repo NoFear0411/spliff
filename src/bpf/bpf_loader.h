@@ -260,7 +260,7 @@ int bpf_loader_attach_tracepoint(bpf_loader_t *loader, const char *category,
 struct bpf_object *bpf_loader_get_object(bpf_loader_t *loader);
 
 /* Get number of attached probes */
-int bpf_loader_get_link_count(bpf_loader_t *loader);
+int bpf_loader_get_link_count(const bpf_loader_t *loader);
 
 /* Get library type name for display */
 const char *bpf_loader_lib_type_name(lib_type_t type);
@@ -551,7 +551,7 @@ const char *bpf_loader_xdp_mode_name(xdp_mode_t mode);
  * @param loader   BPF loader
  * @return true if XDP active, false otherwise
  */
-bool bpf_loader_xdp_is_active(bpf_loader_t *loader);
+bool bpf_loader_xdp_is_active(const bpf_loader_t *loader);
 
 /**
  * Check if sock_ops program is attached for socket cookie caching.
@@ -563,7 +563,7 @@ bool bpf_loader_xdp_is_active(bpf_loader_t *loader);
  * @param loader   BPF loader
  * @return true if sock_ops attached, false otherwise
  */
-bool bpf_loader_sockops_is_attached(bpf_loader_t *loader);
+bool bpf_loader_sockops_is_attached(const bpf_loader_t *loader);
 
 /**
  * Get last XDP error (for functions that don't have err_out parameter).
@@ -571,7 +571,7 @@ bool bpf_loader_sockops_is_attached(bpf_loader_t *loader);
  * @param loader   BPF loader
  * @return Pointer to internal error struct (valid until next XDP call)
  */
-const xdp_error_t *bpf_loader_xdp_get_last_error(bpf_loader_t *loader);
+const xdp_error_t *bpf_loader_xdp_get_last_error(const bpf_loader_t *loader);
 
 /**
  * Warm-up flow_cookie_map with existing TCP connections.

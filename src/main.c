@@ -639,13 +639,7 @@ void process_worker_event(worker_ctx_t *worker, worker_event_t *event) {
 
     /* Handle process exit events - cleanup resources */
     if (event->event_type == EVENT_PROCESS_EXIT) {
-        /*
-         * HTTP/2 session cleanup removed in v0.9.11.
-         * Sessions are now managed per-flow in flow_ctx->parser.h2 and
-         * cleaned up by flow_terminate() on FIN/RST events.
-         * See flow_context.c for the flow-based implementation.
-         */
-        (void)state;  /* Suppress unused warning */
+        (void)state;
         return;
     }
 
@@ -1381,20 +1375,7 @@ int main(int argc, char **argv) {
              * stable 3-arg signatures: (SSL*, buf, len)
              */
 
-            /*
-             * FIX M7: Removed dead BoringSSL async hook code blocks.
-             *
-             * Previously had #if 0 blocks for experimental hooks:
-             * - ssl_read_impl: only takes SSL*, no buffer args (crashes)
-             * - DoPayloadWrite: no buffer arguments, can't capture data
-             * - Async I/O hooks: complex C++ ABI, need more analysis
-             * - DoPayloadRead: base::span ABI, unverified
-             *
-             * These were kept as dead code for reference but never worked.
-             * Using SSL_read/SSL_write public API hooks instead.
-             */
-
-            /* Public API fallback hooks */
+            /* Public API hooks */
             bpf_loader_attach_uprobe_offset(&g_loader, b->path,
                 b->ssl_write_offset, "probe_ssl_rw_enter", false, debug_mode);
             bpf_loader_attach_uprobe_offset(&g_loader, b->path,

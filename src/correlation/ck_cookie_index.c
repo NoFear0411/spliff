@@ -121,11 +121,11 @@ static struct ck_malloc cookie_allocator = {
  */
 static unsigned long cookie_hash(const void *key, unsigned long seed) {
     const ck_cookie_entry_t *entry = key;
-    uint64_t h = 14695981039346656037ULL ^ seed;
+    uint64_t h = FNV_OFFSET_BASIS ^ seed;
     h ^= entry->cookie;
-    h *= 1099511628211ULL;
+    h *= FNV_PRIME;
     h ^= (entry->cookie >> 32);
-    h *= 1099511628211ULL;
+    h *= FNV_PRIME;
     return (unsigned long)h;
 }
 

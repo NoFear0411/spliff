@@ -13,10 +13,6 @@
  *
  * @see worker_dequeue.h for API documentation and design rationale
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

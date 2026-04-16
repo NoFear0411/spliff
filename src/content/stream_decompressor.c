@@ -11,10 +11,6 @@
  * checked. Once flagged, the stream permanently rejects further input
  * until reset or cleanup.
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -30,8 +26,6 @@
 #define inflateInit2    zng_inflateInit2
 #define inflate         zng_inflate
 #define inflateEnd      zng_inflateEnd
-#define inflateReset    zng_inflateReset
-
 #include <zstd.h>
 #include <brotli/decode.h>
 

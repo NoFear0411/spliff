@@ -6,10 +6,6 @@
  * validation) and the cold-path transition recorder (matrix, timing,
  * depth capture). The hot-path evaluator is inline in backpressure.h.
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

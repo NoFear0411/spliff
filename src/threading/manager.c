@@ -38,10 +38,6 @@
  *       └── Free all resources
  * @endcode
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -355,7 +351,7 @@ void threading_get_aggregate_stats(threading_mgr_t *mgr, threading_stats_t *stat
  * @{
  */
 
-bool threading_is_running(threading_mgr_t *mgr) {
+bool threading_is_running(const threading_mgr_t *mgr) {
     return mgr && mgr->initialized && !atomic_load(&mgr->shutdown_requested);
 }
 

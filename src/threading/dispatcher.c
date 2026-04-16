@@ -34,10 +34,6 @@
  * land on the same worker, enabling correlation without locking.
  * Falls back to (pid, ssl_ctx) hash when socket_cookie unavailable.
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -205,8 +201,7 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
     /* Allocate event from worker's pool */
     worker_event_t *event = pool_alloc(&worker->event_pool);
     if (!event) {
-        /* Pool empty - drop event
-         * FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        /* Pool empty - drop event */
         atomic_fetch_add_explicit(&ctx->events_dropped, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&worker->events_dropped, 1, memory_order_relaxed);
         return -1;
@@ -316,7 +311,6 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
             flow_ref_release(flow_ctx);
         }
         pool_free(&worker->event_pool, event);
-        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&ctx->events_dropped, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&worker->events_dropped, 1, memory_order_relaxed);
         return -1;
@@ -329,7 +323,6 @@ static int dispatch_event_to_worker(dispatcher_ctx_t *ctx,
         (void)n;  /* Ignore write result */
     }
 
-    /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
     atomic_fetch_add_explicit(&ctx->events_dispatched, 1, memory_order_relaxed);
     return 0;
 }
@@ -606,7 +599,7 @@ void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
  * @param[in] ctx Dispatcher context
  * @return Total events received from ring buffer, 0 if ctx is NULL
  */
-uint64_t dispatcher_get_xdp_events_received(dispatcher_ctx_t *ctx) {
+uint64_t dispatcher_get_xdp_events_received(const dispatcher_ctx_t *ctx) {
     if (!ctx) return 0;
     return atomic_load(&ctx->xdp_events_received);
 }
@@ -722,7 +715,6 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
         if (flow_ctx) {
             flow_ref_release(flow_ctx);
         }
-        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
         return false;
     }
@@ -731,7 +723,6 @@ static bool dispatcher_route_xdp_to_worker(dispatcher_ctx_t *dispatcher,
         if (flow_ctx) {
             flow_ref_release(flow_ctx);
         }
-        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
         return false;
     }
@@ -837,7 +828,6 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
         if (flow_ctx) {
             flow_ref_release(flow_ctx);
         }
-        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
         return false;
     }
@@ -846,7 +836,6 @@ static bool dispatcher_route_ambiguous_to_worker(dispatcher_ctx_t *dispatcher,
         if (flow_ctx) {
             flow_ref_release(flow_ctx);
         }
-        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
         return false;
     }
@@ -890,12 +879,10 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
         return 0;  /* Continue processing */
     }
 
-    /* Track total events received for debugging ring buffer consumption
-     * FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+    /* Track total events received for debugging ring buffer consumption */
     atomic_fetch_add_explicit(&dispatcher->xdp_events_received, 1, memory_order_relaxed);
 
-    /* Sampling counter for debug output
-     * FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+    /* Sampling counter for debug output */
     uint64_t sample_count = atomic_fetch_add_explicit(&dispatcher->xdp_debug_samples, 1, memory_order_relaxed);
     bool should_debug = g_config.debug_mode &&
                         (sample_count % XDP_DEBUG_SAMPLE_RATE == 0);
@@ -908,7 +895,6 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
          */
         const xdp_payload_event_t *payload_evt = (const xdp_payload_event_t *)data;
 
-        /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
         atomic_fetch_add_explicit(&dispatcher->xdp_ambiguous_events, 1, memory_order_relaxed);
 
         if (should_debug) {
@@ -966,7 +952,6 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
             /* ==================== FLOW_END ====================
              * Flow terminated (FIN or RST)
              */
-            /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
             atomic_fetch_add_explicit(&dispatcher->xdp_flows_terminated, 1, memory_order_relaxed);
 
             /* Terminate flow from Shared Pool if present */
@@ -1002,7 +987,6 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
              * Workers set FLOW_FLAG_HAS_XDP before processing SSL events,
              * ensuring proper correlation timing.
              */
-            /* FIX L1: Use relaxed ordering for non-synchronizing stats counters */
             atomic_fetch_add_explicit(&dispatcher->xdp_flows_discovered, 1, memory_order_relaxed);
 
             /*
@@ -1030,8 +1014,7 @@ int dispatcher_xdp_event_handler(void *ctx, void *data, size_t data_sz) {
         }
 
     } else {
-        /* Unknown struct size - should not happen
-         * FIX L1: Use relaxed ordering for non-synchronizing stats counters */
+        /* Unknown struct size - should not happen */
         atomic_fetch_add_explicit(&dispatcher->xdp_events_dropped, 1, memory_order_relaxed);
 
         if (should_debug) {

@@ -26,10 +26,6 @@
  * whether data is a request or response. Callbacks populate the
  * http_message_t structure with parsed data.
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

@@ -45,10 +45,6 @@
  * marks such streams with hpack_decode_failed and attempts fallback
  * parsing for subsequent frames.
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -726,12 +722,12 @@ void http2_cleanup(void) {
     g_h2_initialized = false;
 }
 
-const char *http2_frame_name(int type) {
+const char *http2_frame_name(uint8_t type) {
     static const char *names[] = {
         "DATA", "HEADERS", "PRIORITY", "RST_STREAM", "SETTINGS",
         "PUSH_PROMISE", "PING", "GOAWAY", "WINDOW_UPDATE", "CONTINUATION"
     };
-    return (type >= 0 && type < 10) ? names[type] : "UNKNOWN";
+    return (type < 10) ? names[type] : "UNKNOWN";
 }
 
 bool http2_is_preface(const uint8_t *data, size_t len) {

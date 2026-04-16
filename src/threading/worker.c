@@ -42,10 +42,6 @@
  * - __builtin_popcountll() counts pending in one cycle
  * - Fixed array with no pointer chasing, excellent cache locality
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -552,13 +548,6 @@ static void worker_drain_queues(worker_ctx_t *ctx) {
     }
 }
 
-/*
- * worker_check_dying_connections() and worker_cleanup_deferred() removed in v0.9.11.
- *
- * These functions were for the legacy per-worker H2 connection pool cleanup.
- * HTTP/2 sessions are now managed per-flow in flow_ctx->parser.h2 and cleaned
- * up automatically by flow_terminate() on FIN/RST events.
- */
 
 /**
  * @brief NAPI-style main worker processing loop

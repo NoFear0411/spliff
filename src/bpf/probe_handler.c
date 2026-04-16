@@ -399,7 +399,7 @@ void probe_handler_set_filter_comm(probe_handler_t *handler, const char *comm) {
     snprintf(handler->target_comm, sizeof(handler->target_comm), "%s", comm);
 }
 
-void probe_handler_set_filter_pids(probe_handler_t *handler, int *pids, int count) {
+void probe_handler_set_filter_pids(probe_handler_t *handler, const int *pids, int count) {
     if (!handler) return;
     handler->target_pids = pids;
     handler->num_target_pids = count;

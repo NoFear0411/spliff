@@ -30,10 +30,6 @@
  * static_assert(IS_POWER_OF_TWO(BUFFER_SIZE), "Buffer must be power of 2");
  * @endcode
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

@@ -95,7 +95,7 @@ typedef struct {
     event_callback_t callback;   /**< User callback for events */
     void *callback_ctx;          /**< User context passed to callback */
     char target_comm[64];        /**< Filter: target process command name */
-    int *target_pids;            /**< Filter: array of target PIDs */
+    const int *target_pids;      /**< Filter: array of target PIDs */
     int num_target_pids;         /**< Filter: number of target PIDs */
     int target_ppid;             /**< Filter: target parent PID */
     int ppid_cache[PID_CACHE_SIZE]; /**< Cache of PIDs matching ppid filter */
@@ -113,7 +113,7 @@ void probe_handler_set_callback(probe_handler_t *handler, event_callback_t callb
 
 /* Set filtering options */
 void probe_handler_set_filter_comm(probe_handler_t *handler, const char *comm);
-void probe_handler_set_filter_pids(probe_handler_t *handler, int *pids, int count);
+void probe_handler_set_filter_pids(probe_handler_t *handler, const int *pids, int count);
 void probe_handler_set_filter_ppid(probe_handler_t *handler, int ppid);
 void probe_handler_set_filter_ipc(probe_handler_t *handler, bool filter);
 

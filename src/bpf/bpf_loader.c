@@ -726,7 +726,7 @@ struct bpf_object *bpf_loader_get_object(bpf_loader_t *loader) {
 }
 
 /* Get number of attached probes */
-int bpf_loader_get_link_count(bpf_loader_t *loader) {
+int bpf_loader_get_link_count(const bpf_loader_t *loader) {
     return loader ? loader->link_count : 0;
 }
 
@@ -1411,7 +1411,7 @@ void bpf_loader_sockops_detach(bpf_loader_t *loader, bool debug) {
 }
 
 /* Check if sock_ops is attached */
-bool bpf_loader_sockops_is_attached(bpf_loader_t *loader) {
+bool bpf_loader_sockops_is_attached(const bpf_loader_t *loader) {
     return loader && loader->xdp.sockops_link != NULL;
 }
 
@@ -1622,7 +1622,7 @@ int bpf_loader_xdp_read_stats(bpf_loader_t *loader, xdp_stats_t *stats) {
 }
 
 /* Check if XDP is enabled and has at least one attached interface */
-bool bpf_loader_xdp_is_active(bpf_loader_t *loader) {
+bool bpf_loader_xdp_is_active(const bpf_loader_t *loader) {
     if (!loader || !loader->xdp.enabled) return false;
 
     for (int i = 0; i < loader->xdp.interface_count; i++) {
@@ -1634,7 +1634,7 @@ bool bpf_loader_xdp_is_active(bpf_loader_t *loader) {
 }
 
 /* Get last XDP error */
-const xdp_error_t *bpf_loader_xdp_get_last_error(bpf_loader_t *loader) {
+const xdp_error_t *bpf_loader_xdp_get_last_error(const bpf_loader_t *loader) {
     if (!loader) return NULL;
     return &loader->xdp.last_error;
 }

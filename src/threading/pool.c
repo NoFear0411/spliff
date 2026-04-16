@@ -25,10 +25,6 @@
  * - pool_alloc: SPSC dequeue (single consumer per worker)
  * - pool_free: SPSC enqueue (single producer per worker)
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

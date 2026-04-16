@@ -10,9 +10,6 @@
  *
  * Note: Session/stream management is in flow_context.c (see test_flow_context.c)
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
  */
 
 #include <stdio.h>

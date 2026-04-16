@@ -26,10 +26,6 @@
  * 4. Return message to worker's output pool
  * 5. Flush periodically or when idle
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

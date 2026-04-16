@@ -47,10 +47,6 @@
  * @see docs/ARCHITECTURE-DECISIONS.md ADR-002 (Three-layer extensibility)
  * @see src/ring/spmc_ring.h SPMC ring transport
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

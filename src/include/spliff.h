@@ -16,10 +16,6 @@
  * @note This header must be kept in sync with the BPF program (spliff.bpf.c)
  * for structures that are shared between userspace and kernel space.
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -65,7 +61,7 @@
  */
 
 /** @brief Full version string (major.minor.patch) */
-#define SPLIFF_VERSION "0.10.1"
+#define SPLIFF_VERSION "0.10.2"
 
 /** @brief Major version number (breaking changes) */
 #define SPLIFF_VERSION_MAJOR 0
@@ -74,7 +70,7 @@
 #define SPLIFF_VERSION_MINOR 10
 
 /** @brief Patch version number (bug fixes) */
-#define SPLIFF_VERSION_PATCH 1
+#define SPLIFF_VERSION_PATCH 2
 
 /** @} */ /* end of version group */
 
@@ -445,31 +441,6 @@ typedef struct {
 
 /** @} */ /* end of http group */
 
-/**
- * @defgroup ssl SSL Event Capture
- * @brief Structures for captured SSL/TLS events from BPF uprobes
- * @{
- */
-
-/**
- * @brief Captured SSL event from BPF uprobes
- *
- * Contains raw SSL/TLS data captured by eBPF uprobes attached to
- * SSL library functions (SSL_read, SSL_write, etc.).
- *
- * @note Uses a flexible array member for variable-length payload data.
- */
-typedef struct {
-    uint32_t pid;               /**< Process ID */
-    uint32_t tid;               /**< Thread ID */
-    uint64_t timestamp_ns;      /**< Capture timestamp */
-    char comm[TASK_COMM_LEN];   /**< Process command name */
-    uint8_t direction;          /**< 0=write(request), 1=read(response) */
-    uint32_t len;               /**< Length of data buffer */
-    uint8_t data[];             /**< Captured SSL data (flexible array member) */
-} ssl_event_t;
-
-/** @} */ /* end of ssl group */
 
 /**
  * @defgroup config Configuration

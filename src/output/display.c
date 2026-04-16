@@ -2,24 +2,6 @@
  * @file display.c
  * @brief Implementation of console output formatting and display functions
  *
- * @details This file implements the display module for spliff, handling
- * all formatted console output including HTTP traffic, TLS events,
- * and body content visualization.
- *
- * Key features:
- * - Thread-local formatting buffer for lock-free output
- * - Async output via MPSC logger
- * - Configurable ANSI color output
- * - Automatic content type detection (text vs binary)
- * - Human-readable latency formatting
- * - File signature detection for binary content
- *
- * @see display.h for public API documentation
- *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

@@ -2,18 +2,7 @@
  * @file logger.h
  * @brief Async MPSC logging pipeline for lock-free output serialization
  *
- * This module provides a global MPSC (Multiple Producer, Single Consumer) ring buffer
- * for async logging. All worker threads enqueue formatted messages to a single ring,
- * and a dedicated logger thread drains with writev() for atomic batch writes.
- *
- * Key features:
- * - Lock-free MPSC ring using ck_ring
- * - Pre-allocated entry pool (zero malloc in hot path)
- * - eventfd notification (edge-triggered, empty→non-empty only)
- * - writev() batching for atomic output
- * - 64-byte cache-line aligned entries
- *
- * @copyright Copyright (c) 2026
+ * SPDX-License-Identifier: AGPL-3.0-only
  */
 
 #ifndef SPLIFF_LOGGER_H

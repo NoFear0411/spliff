@@ -12,10 +12,7 @@
  * flow_hash(). This eliminates the need for any locking on per-worker
  * state - each worker is the sole accessor of its state.
  *
- * @par HTTP/2 Session Management (v0.9.11+):
- * HTTP/2 sessions are now managed per-flow in flow_ctx->parser.h2,
- * not in per-worker pools. This eliminates:
- * - Arbitrary 16-slot LRU limits
+ * HTTP/2 sessions are managed per-flow in flow_ctx->parser.h2.
  * - Race conditions between dispatcher and worker
  * - Shadow queue complexity for deferred cleanup
  *
@@ -27,10 +24,6 @@
  *       ├── body_buf              [MAX_BODY_BUFFER, HTTP/1 parsing]
  *       └── h2_callbacks          [nghttp2 session callbacks]
  * @endcode
- *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
  *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
@@ -89,11 +82,6 @@ int worker_state_init(worker_state_t *state, int worker_id) {
     memset(state, 0, sizeof(*state));
     state->worker_id = worker_id;
 
-    /*
-     * HTTP/2 connection and stream pools removed in v0.9.11.
-     * Sessions are now managed per-flow in flow_ctx->parser.h2.
-     * Streams are tracked in flow_ctx->transactions[].
-     */
 
     /* Allocate decompression buffer */
     state->decomp_buf_size = MAX_BODY_BUFFER;
@@ -125,14 +113,6 @@ cleanup:
     return -1;
 }
 
-/*
- * Shadow queue helpers removed in v0.9.11.
- *
- * The shadow queue was used for deferred cleanup of per-worker H2 connection
- * resources. Now that H2 sessions are per-flow, cleanup happens automatically
- * when flow_terminate() is called on FIN/RST events.
- */
-
 /**
  * @brief Cleanup per-worker state
  *
@@ -148,10 +128,6 @@ void worker_state_cleanup(worker_state_t *state) {
         return;
     }
 
-    /*
-     * HTTP/2 connection and stream pools removed in v0.9.11.
-     * Sessions are now cleaned up when flow_terminate() is called.
-     */
 
     /* Free buffers */
     if (state->decomp_buf) {
@@ -173,14 +149,3 @@ void worker_state_cleanup(worker_state_t *state) {
     state->initialized = false;
 }
 
-/*
- * HTTP/2 Connection and Stream Management functions removed in v0.9.11.
- *
- * Sessions are now managed per-flow in flow_ctx->parser.h2:
- * - flow_h2_session_init() creates nghttp2 session
- * - flow_h2_alloc_stream() allocates transaction for stream
- * - flow_h2_find_stream() looks up stream by ID
- * - flow_terminate() cleans up session on FIN/RST
- *
- * See flow_context.c for the flow-based implementation.
- */

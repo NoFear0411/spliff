@@ -59,23 +59,23 @@ _Static_assert(alignof(max_align_t) >= 16,
 
 /** FNV-1a hash for socket_cookie */
 static inline uint64_t hash_cookie(uint64_t cookie) {
-    uint64_t hash = 14695981039346656037ULL;  /* FNV offset basis */
+    uint64_t hash = FNV_OFFSET_BASIS;  /* FNV offset basis */
     hash ^= cookie;
-    hash *= 1099511628211ULL;                  /* FNV prime */
+    hash *= FNV_PRIME;                  /* FNV prime */
     hash ^= (cookie >> 32);
-    hash *= 1099511628211ULL;
+    hash *= FNV_PRIME;
     return hash;
 }
 
 /** FNV-1a hash for (pid, ssl_ctx) pair */
 static inline uint64_t hash_shadow_key(uint32_t pid, uint64_t ssl_ctx) {
-    uint64_t hash = 14695981039346656037ULL;
+    uint64_t hash = FNV_OFFSET_BASIS;
     hash ^= pid;
-    hash *= 1099511628211ULL;
+    hash *= FNV_PRIME;
     hash ^= ssl_ctx;
-    hash *= 1099511628211ULL;
+    hash *= FNV_PRIME;
     hash ^= (ssl_ctx >> 32);
-    hash *= 1099511628211ULL;
+    hash *= FNV_PRIME;
     return hash;
 }
 
@@ -324,10 +324,8 @@ void flow_manager_cleanup(flow_manager_t *mgr) {
     }
 
     /*
-     * COMPREHENSIVE CLEANUP: Collect all unique flow pointers, then free them.
-     *
-     * With CK hs, we iterate using ck_hs_next() to find all entries.
-     * Flows may exist in both indices, so we deduplicate.
+     * Collect all unique flow pointers from both indices, deduplicate,
+     * then free. Flows may exist in both cookie and shadow indices.
      */
 
     /* Estimate max flows from pool stats */

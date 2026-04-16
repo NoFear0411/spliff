@@ -4,7 +4,8 @@
  *
  * @details Implements virtual memory mirroring to eliminate wrap-around
  * branching in ring buffer operations. The same physical pages are mapped
- * twice consecutively in virtual address space, allowing seamless wrap-around.
+ * twice consecutively in virtual address space, so reads across the
+ * boundary succeed without special-case code.
  *
  * @par How It Works:
  * @code
@@ -39,10 +40,6 @@
  *   2. Read payload data
  *   3. Atomically set state: READY → IDLE (release buffer)
  * @endcode
- *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
  *
  * SPDX-License-Identifier: AGPL-3.0-only
  */

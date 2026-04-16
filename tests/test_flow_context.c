@@ -165,7 +165,6 @@ static void test_pool_free_deferred(void) {
     flow_pool_init(&pool);
 
     flow_context_t *ctx = flow_pool_alloc(&pool);
-    uint32_t original_gen = ctx->generation;
 
     /* Free the context (deferred) */
     flow_pool_free(&pool, ctx);

@@ -10,10 +10,6 @@
  * - Pop: load head with acquire, load event with relaxed, store tail with release
  * This ensures the consumer sees the event data before seeing the updated head.
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

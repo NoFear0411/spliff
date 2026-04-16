@@ -39,10 +39,6 @@
  * - ALPN cache (protocol negotiation results)
  * - Pending body tracking (chunked response assembly)
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
@@ -58,7 +54,7 @@
 #include "../include/spliff.h"
 #include "../bpf/probe_handler.h"
 #include "../bpf/bpf_loader.h"  /* For bpf_loader_t (XDP polling in dispatcher) */
-#include "../protocol/http2.h"  /* For h2_stream_state_t, frame types */
+#include "../protocol/http2.h"  /* For frame types */
 #include "../correlation/flow_context.h"  /* For flow_manager_t (Shared Pool) */
 
 /**
@@ -254,29 +250,8 @@ struct nghttp2_session_callbacks; /**< nghttp2 callback table */
 /** Response reassembly buffer size for fragmented HTTP/2 frames */
 #define H2_REASSEMBLY_BUF_SIZE 65536
 
-/* Note: h2_stream_state_t and H2_BODY_BUFFER_SIZE are defined in http2.h */
+/* Note: H2_BODY_BUFFER_SIZE is defined in http2.h */
 
-/*
- * Legacy per-worker H2 connection pool removed in v0.9.11.
- *
- * HTTP/2 sessions are now managed per-flow in flow_ctx->parser.h2,
- * following the FIN lifecycle. This eliminates:
- * - Arbitrary 16-slot LRU limits
- * - Race conditions between dispatcher and worker
- * - Shadow queue complexity for deferred cleanup
- *
- * See flow_context.h for flow_context_t::parser.h2 structure.
- */
-
-/*
- * Legacy per-worker H2 stream pool removed in v0.9.11.
- *
- * HTTP/2 streams are now managed per-flow in flow_ctx->transactions[],
- * using flow_transaction_t for unified request/response tracking.
- * This enables proper FIN-based cleanup and eliminates arbitrary limits.
- *
- * See flow_context.h for flow_transaction_t structure.
- */
 
 /** @} */ /* end threading_h2 group */
 
@@ -506,12 +481,6 @@ void pool_free(object_pool_t *pool, void *obj);
  */
 typedef struct worker_state {
     int worker_id;          /**< Worker index (0 to num_workers-1) */
-
-    /*
-     * HTTP/2 connection and stream pools removed in v0.9.11.
-     * Sessions are now managed per-flow in flow_ctx->parser.h2.
-     * Streams are tracked in flow_ctx->transactions[].
-     */
 
     /** @name Scratch Buffers */
     /** @{ */
@@ -1064,17 +1033,17 @@ int threading_default_workers(void);
  * @par Algorithm:
  * FNV-1a with 64-bit prime, truncated to 32 bits:
  * - XOR each input component
- * - Multiply by FNV prime (1099511628211)
+ * - Multiply by FNV_PRIME
  * - Include both halves of ssl_ctx for better distribution
  */
 static inline uint32_t flow_hash(uint32_t pid, uint64_t ssl_ctx) {
-    uint64_t hash = 14695981039346656037ULL;  /* FNV offset basis */
+    uint64_t hash = FNV_OFFSET_BASIS;  /* FNV offset basis */
     hash ^= pid;
-    hash *= 1099511628211ULL;                  /* FNV prime */
+    hash *= FNV_PRIME;                  /* FNV prime */
     hash ^= ssl_ctx;
-    hash *= 1099511628211ULL;
+    hash *= FNV_PRIME;
     hash ^= (ssl_ctx >> 32);
-    hash *= 1099511628211ULL;
+    hash *= FNV_PRIME;
     return (uint32_t)hash;
 }
 
@@ -1141,15 +1110,6 @@ void set_current_worker_state(worker_state_t *state);
 
 /** @} */ /* end threading_util group */
 
-/*
- * Per-Worker HTTP/2 Management functions removed in v0.9.11.
- *
- * HTTP/2 sessions and streams are now managed per-flow:
- * - Sessions: flow_ctx->parser.h2 (created lazily, freed on FIN)
- * - Streams: flow_ctx->transactions[] via flow_h2_alloc_stream()
- *
- * See flow_context.h for the flow-based API.
- */
 
 /**
  * @defgroup threading_stats Statistics Functions
@@ -1234,7 +1194,7 @@ void dispatcher_get_xdp_stats(dispatcher_ctx_t *ctx, uint64_t *flows_discovered,
  * @param[in] ctx Dispatcher context
  * @return Total events received from ring buffer, 0 if ctx is NULL
  */
-uint64_t dispatcher_get_xdp_events_received(dispatcher_ctx_t *ctx);
+uint64_t dispatcher_get_xdp_events_received(const dispatcher_ctx_t *ctx);
 
 /**
  * @brief Get output thread statistics
@@ -1311,7 +1271,7 @@ int output_write(worker_ctx_t *worker, const char *fmt, ...);
  *
  * @return true if threads are running
  */
-bool threading_is_running(threading_mgr_t *mgr);
+bool threading_is_running(const threading_mgr_t *mgr);
 
 /**
  * @brief Get global threading manager instance

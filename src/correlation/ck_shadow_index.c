@@ -108,17 +108,17 @@ static struct ck_malloc shadow_allocator = {
  */
 static unsigned long shadow_hash(const void *key, unsigned long seed) {
     const ck_shadow_entry_t *entry = key;
-    uint64_t h = 14695981039346656037ULL ^ seed;
+    uint64_t h = FNV_OFFSET_BASIS ^ seed;
 
     /* Hash pid */
     h ^= entry->pid;
-    h *= 1099511628211ULL;
+    h *= FNV_PRIME;
 
     /* Hash ssl_ctx (both halves) */
     h ^= entry->ssl_ctx;
-    h *= 1099511628211ULL;
+    h *= FNV_PRIME;
     h ^= (entry->ssl_ctx >> 32);
-    h *= 1099511628211ULL;
+    h *= FNV_PRIME;
 
     return (unsigned long)h;
 }
@@ -143,13 +143,13 @@ static bool shadow_compare(const void *a, const void *b) {
  */
 static unsigned long cookie_hash(const void *key, unsigned long seed) {
     const ck_shadow_cookie_entry_t *entry = key;
-    uint64_t h = 14695981039346656037ULL ^ seed;
+    uint64_t h = FNV_OFFSET_BASIS ^ seed;
 
     /* Hash cookie (both halves) */
     h ^= entry->cookie;
-    h *= 1099511628211ULL;
+    h *= FNV_PRIME;
     h ^= (entry->cookie >> 32);
-    h *= 1099511628211ULL;
+    h *= FNV_PRIME;
 
     return (unsigned long)h;
 }

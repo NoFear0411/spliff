@@ -2,19 +2,6 @@
  * @file safe_str.c
  * @brief Implementation of memory-safe string and buffer operations
  *
- * @details This file implements the safe string functions declared in safe_str.h.
- * The implementation prioritizes:
- *
- * - **Safety**: All operations check bounds and handle edge cases
- * - **Performance**: Uses efficient C library functions (memccpy, memcpy, memmove)
- * - **Compatibility**: Works with C11+ compilers, uses C23 features when available
- *
- * @see safe_str.h for function documentation and usage examples
- *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

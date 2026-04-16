@@ -82,10 +82,6 @@
  * @see src/ring/ring_event.h Event structure with routing word
  * @see docs/ARCHITECTURE-DECISIONS.md ADR-001
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

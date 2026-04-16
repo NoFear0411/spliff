@@ -55,10 +55,6 @@
  * between. A ck_pr_fence_load() should be added there for ARM correctness
  * (follow-up fix).
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 

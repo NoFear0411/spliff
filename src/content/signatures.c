@@ -29,10 +29,6 @@
  * 3. Optionally add trailer bytes for validation
  * 4. The init function auto-sorts by magic_len
  *
- * @author spliff authors
- * @copyright 2025-2026 spliff authors
- * @license AGPL-3.0-only
- *
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
