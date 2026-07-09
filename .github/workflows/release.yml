@@ -101,7 +101,7 @@ jobs:
         run: mkdir -p /var/cache/dnf /var/cache/libdnf5
 
       - name: Cache DNF packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             /var/cache/dnf
@@ -126,7 +126,7 @@ jobs:
             rpm-build
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure (Release)
         run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
@@ -138,7 +138,7 @@ jobs:
         run: cd build-release && cpack -G RPM
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spliff-fedora-44
           path: |
@@ -161,7 +161,7 @@ jobs:
         run: mkdir -p /var/cache/dnf /var/cache/libdnf5
 
       - name: Cache DNF packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             /var/cache/dnf
@@ -186,7 +186,7 @@ jobs:
             rpm-build
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure (Release)
         run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
@@ -198,7 +198,7 @@ jobs:
         run: cd build-release && cpack -G RPM
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spliff-fedora-43
           path: |
@@ -221,7 +221,7 @@ jobs:
         run: mkdir -p /var/cache/dnf /var/cache/libdnf5
 
       - name: Cache DNF packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             /var/cache/dnf
@@ -246,7 +246,7 @@ jobs:
             rpm-build
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure (Release)
         run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
@@ -258,7 +258,7 @@ jobs:
         run: cd build-release && cpack -G RPM
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spliff-fedora-42
           path: |
@@ -281,7 +281,7 @@ jobs:
         run: mkdir -p /var/cache/dnf
 
       - name: Cache DNF packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /var/cache/dnf
           key: dnf-alma10-${{ hashFiles('.github/workflows/release.yml') }}
@@ -321,7 +321,7 @@ jobs:
 
       - name: Restore vectorscan cache
         id: cache-vectorscan
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             /usr/local/include/hs
@@ -359,7 +359,7 @@ jobs:
 
       - name: Save vectorscan cache
         if: steps.build-vectorscan.outputs.built == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             /usr/local/include/hs
@@ -372,7 +372,7 @@ jobs:
         run: ldconfig
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure (Release, static vectorscan)
         run: |
@@ -389,7 +389,7 @@ jobs:
         run: cd build-release && cpack -G RPM
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spliff-almalinux-10
           path: |
@@ -412,7 +412,7 @@ jobs:
         run: mkdir -p /var/cache/dnf
 
       - name: Cache DNF packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: /var/cache/dnf
           key: dnf-alma9-${{ hashFiles('.github/workflows/release.yml') }}
@@ -447,7 +447,7 @@ jobs:
 
       - name: Restore vectorscan cache
         id: cache-vectorscan
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             /usr/local/include/hs
@@ -484,7 +484,7 @@ jobs:
 
       - name: Save vectorscan cache
         if: steps.build-vectorscan.outputs.built == 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             /usr/local/include/hs
@@ -497,7 +497,7 @@ jobs:
         run: ldconfig
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Configure (Release, static vectorscan)
         run: |
@@ -514,7 +514,7 @@ jobs:
         run: cd build-release && cpack -G RPM
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: spliff-almalinux-9
           path: |
@@ -546,7 +546,7 @@ jobs:
         run: mkdir -p /var/cache/dnf /var/cache/libdnf5
 
       - name: Cache DNF packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             /var/cache/dnf
@@ -560,7 +560,7 @@ jobs:
         run: dnf install -y --setopt=keepcache=True --setopt=install_weak_deps=False file
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -602,7 +602,7 @@ jobs:
         run: mkdir -p /var/cache/dnf /var/cache/libdnf5
 
       - name: Cache DNF packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             /var/cache/dnf
@@ -616,7 +616,7 @@ jobs:
         run: dnf install -y --setopt=keepcache=True --setopt=install_weak_deps=False rpm-sign gnupg2
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -776,7 +776,7 @@ jobs:
           cat SHA256SUMS.txt
 
       - name: Upload signed artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: signed-release
           path: release/
@@ -795,7 +795,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -842,7 +842,7 @@ jobs:
           echo "file=/tmp/changelog.txt" >> $GITHUB_OUTPUT
 
       - name: Download signed artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: signed-release
           path: release
