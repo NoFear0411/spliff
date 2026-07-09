@@ -209,7 +209,7 @@ spliff/
 | `MAX_HEADERS` | 128 |
 | `MAX_BODY_BUFFER` | 1 MB |
 | `XDP_PAYLOAD_MAX` | 128 bytes |
-| `SPLIFF_VERSION` | "0.10.0" |
+| `SPLIFF_VERSION` | "0.10.3" |
 
 ---
 

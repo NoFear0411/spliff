@@ -2,7 +2,7 @@
 
 **eBPF-based SSL/TLS Traffic Sniffer**
 
-[![Version](https://img.shields.io/badge/version-0.10.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.10.3-blue.svg)](CHANGELOG.md)
 [![Release](https://github.com/NoFear0411/spliff/actions/workflows/release.yml/badge.svg)](https://github.com/NoFear0411/spliff/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![C Standard](https://img.shields.io/badge/C-C23-orange.svg)](CMakeLists.txt)
@@ -156,7 +156,7 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 | libelf | ELF parsing | elfutils-libelf-devel | libelf-dev |
 | zlib-ng | SIMD gzip decompression | zlib-ng-devel | (build from source) |
 | llhttp | HTTP/1.1 parsing | llhttp-devel | libllhttp-dev |
-| nghttp2 | HTTP/2 parsing | nghttp2-devel | libnghttp2-dev |
+| nghttp2 | HTTP/2 parsing | libnghttp2-devel | libnghttp2-dev |
 | ck | Lock-free data structures | ck-devel | libck-dev |
 | libxdp | XDP program loading | libxdp-devel | libxdp-dev |
 | liburcu | Read-Copy-Update | userspace-rcu-devel | liburcu-dev |
@@ -169,7 +169,7 @@ Capture and inspect decrypted HTTPS traffic in real-time without MITM proxies. s
 ### Quick Install (Fedora)
 ```bash
 sudo dnf install libbpf-devel elfutils-libelf-devel zlib-ng-devel \
-    llhttp-devel nghttp2-devel ck-devel libxdp-devel userspace-rcu-devel \
+    llhttp-devel libnghttp2-devel ck-devel libxdp-devel userspace-rcu-devel \
     jemalloc-devel vectorscan-devel pcre2-devel libzstd-devel brotli-devel clang
 ```
 

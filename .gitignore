@@ -9,6 +9,10 @@ obj/
 *.dylib
 *.bpf.o
 
+# ── BPF: vmlinux.h is regenerated at build time from ─────
+# ── /sys/kernel/btf/vmlinux — never committed.       ─────
+src/bpf/vmlinux.h
+
 # ── Binaries & symlinks ─────────────────────────────────
 spliff
 sslsniff

@@ -18,7 +18,20 @@
  */
 
 #include "vmlinux.h"
+
+#ifdef SPLIFF_KERNEL_7_0_PLUS
+/* Kernel 7.0 added an `aux__prog` parameter to bpf_stream_vprintk that
+ * libbpf ≤ 1.6.3 does not know about. vmlinux.h (dumped from the running
+ * kernel) has the 5-arg version; bpf_helpers.h declares the stale 4-arg one.
+ * Rename libbpf's stale declaration so vmlinux.h's canonical one wins.
+ * Delete this block once libbpf catches up with the kernel ABI. */
+#define bpf_stream_vprintk _libbpf_stale_bpf_stream_vprintk
+#endif
 #include <bpf/bpf_helpers.h>
+#ifdef SPLIFF_KERNEL_7_0_PLUS
+#undef bpf_stream_vprintk
+#endif
+
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>

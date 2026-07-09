@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(spliff
-    VERSION 0.10.2
+    VERSION 0.10.3
     DESCRIPTION "eBPF-based SSL/TLS traffic sniffer for capturing decrypted HTTPS traffic"
     HOMEPAGE_URL "https://github.com/NoFear0411/spliff"
     LANGUAGES C
@@ -535,11 +535,46 @@ find_program(BPFTOOL bpftool REQUIRED)
 message(STATUS "Found bpftool: ${BPFTOOL}")
 
 # ============================================================================
+# Kernel BTF + version detection
+# ============================================================================
+
+# vmlinux.h is NOT committed. It is regenerated at build time from the running
+# kernel's BTF so that every host builds against its own kernel. Requires
+# /sys/kernel/btf/vmlinux, standard on Linux 5.4+ with CONFIG_DEBUG_INFO_BTF.
+
+if(NOT EXISTS "/sys/kernel/btf/vmlinux")
+    message(FATAL_ERROR
+        "Missing /sys/kernel/btf/vmlinux — kernel is not built with "
+        "CONFIG_DEBUG_INFO_BTF. Rebuild the kernel or install a distro kernel.")
+endif()
+
+# Detect kernel version — used to gate ABI-drift workarounds.
+execute_process(
+    COMMAND uname -r
+    OUTPUT_VARIABLE KERNEL_RELEASE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" _ "${KERNEL_RELEASE}")
+set(KERNEL_MAJOR ${CMAKE_MATCH_1})
+set(KERNEL_MINOR ${CMAKE_MATCH_2})
+message(STATUS "Host kernel: ${KERNEL_RELEASE} (major=${KERNEL_MAJOR})")
+
+# Per-kernel BPF define flags. Add new entries here when the kernel introduces
+# an ABI change that libbpf hasn't caught up with yet.
+set(BPF_KERNEL_DEFS "")
+if(KERNEL_MAJOR GREATER_EQUAL 7)
+    # Kernel 7.0 added an `aux__prog` parameter to bpf_stream_vprintk that
+    # libbpf ≤ 1.6.3 does not know about — see spliff.bpf.c for the shim.
+    list(APPEND BPF_KERNEL_DEFS -DSPLIFF_KERNEL_7_0_PLUS)
+endif()
+
+# ============================================================================
 # BPF Program Compilation
 # ============================================================================
 
 set(BPF_SOURCE ${CMAKE_SOURCE_DIR}/src/bpf/spliff.bpf.c)
 set(BPF_OBJECT ${CMAKE_BINARY_DIR}/spliff.bpf.o)
+set(VMLINUX_H ${CMAKE_BINARY_DIR}/vmlinux.h)
 
 # BPF include paths for architecture
 if(EXISTS ${ARCH_INCLUDE_PATH})
@@ -548,17 +583,31 @@ else()
     set(BPF_ARCH_INCLUDE "")
 endif()
 
+# Dump vmlinux.h from running kernel BTF at build time.
+add_custom_command(
+    OUTPUT ${VMLINUX_H}
+    COMMAND ${BPFTOOL} btf dump file /sys/kernel/btf/vmlinux format c > ${VMLINUX_H}
+    COMMENT "Dumping vmlinux.h from /sys/kernel/btf/vmlinux (kernel ${KERNEL_RELEASE})"
+    VERBATIM
+)
+
 add_custom_command(
     OUTPUT ${BPF_OBJECT}
     COMMAND ${CLANG_EXECUTABLE}
         -g -O2
         -target bpf
         -D__TARGET_ARCH_${BPF_ARCH}
+        ${BPF_KERNEL_DEFS}
+        # bpftool BTF-dump emits forward-declared kernel structs inside outer
+        # scopes (`struct aes_enckey;` etc.), which clang flags as
+        # "declaration does not declare anything". Harmless — silence.
+        -Wno-missing-declarations
+        -I${CMAKE_BINARY_DIR}
         -I${CMAKE_SOURCE_DIR}/src/bpf
         ${BPF_ARCH_INCLUDE}
         -c ${BPF_SOURCE}
         -o ${BPF_OBJECT}
-    DEPENDS ${BPF_SOURCE}
+    DEPENDS ${BPF_SOURCE} ${VMLINUX_H}
     COMMENT "Compiling BPF program for ${BPF_ARCH}..."
     VERBATIM
 )

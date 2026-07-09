@@ -2,6 +2,33 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.10.3] - 2026-07-09
+
+### Fixed
+
+- Build failure on Linux kernel 7.0+ with libbpf ≤1.6.3. Kernel 7.0 added an
+  `aux__prog` parameter to `bpf_stream_vprintk` that libbpf does not yet know
+  about, causing a declaration conflict between vmlinux.h and bpf_helpers.h.
+  Include order in `spliff.bpf.c` is now guarded by `SPLIFF_KERNEL_7_0_PLUS`
+  (auto-detected from `uname -r` at configure time) and renames libbpf's stale
+  4-arg declaration so vmlinux.h's canonical 5-arg version wins.
+- Fedora dependency name in README: `nghttp2-devel` → `libnghttp2-devel`.
+
+### Changed
+
+- `vmlinux.h` is now regenerated at build time from `/sys/kernel/btf/vmlinux`
+  via bpftool and written to `${CMAKE_BINARY_DIR}`. No longer committed.
+  Every host builds against its own kernel. Configure fails early on kernels
+  without `CONFIG_DEBUG_INFO_BTF`.
+- Silence bpftool BTF-dump `-Wmissing-declarations` warnings (forward-declared
+  kernel structs inside outer scopes — harmless).
+
+### Removed
+
+- Committed `src/bpf/vmlinux.h` (now generated). Added to `.gitignore`.
+- Dead local `total_bytes` accumulator in `drain_and_write` — `bytes_written`
+  atomic already tracks the actual `writev()` return value.
+
 ## [0.10.2] - 2026-04-16
 
 ### Changed

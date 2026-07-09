@@ -128,7 +128,6 @@ static size_t drain_and_write(void)
     log_entry_t *entries[LOG_BATCH_SIZE];
     struct iovec iov[LOG_BATCH_SIZE];
     size_t count = 0;
-    size_t total_bytes = 0;
 
     /* Dequeue up to batch size */
     while (count < LOG_BATCH_SIZE) {
@@ -141,7 +140,6 @@ static size_t drain_and_write(void)
         entries[count] = entry;
         iov[count].iov_base = entry->data;
         iov[count].iov_len = entry->len;
-        total_bytes += entry->len;
         count++;
     }
 
