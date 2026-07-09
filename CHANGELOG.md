@@ -2,6 +2,27 @@
 
 All notable changes to spliff will be documented in this file.
 
+## [0.10.4] - 2026-07-09
+
+### Fixed
+
+- HTTP/2 `:status` pseudo-header parsing accepted malformed values as
+  `status_code = 0` (via `atoi`), which is indistinguishable from "unset"
+  downstream. Now uses `strtol` with explicit range check (100-999 per
+  RFC 9110 §15.4) at both request (http2.c:310) and response (http2.c:767)
+  parse sites. Malformed input still yields 0 so downstream can flag it,
+  but out-of-range or non-numeric values no longer masquerade as valid.
+
+### Changed
+
+- Renamed shadowed local `expected` in `worker.c` re-home CAS block to
+  `expected_home` for clarity. The outer `expected` (line 634) claims an
+  unowned worker slot; the inner one wrests ownership from an existing
+  worker. Same-name collision was hygiene-only, not a runtime bug.
+- CI matrix expanded to include Fedora 44 build target (kernel 7.0+).
+- GitHub Actions bumped to current majors to clear Node.js 20 deprecation
+  warnings (cache@v6, checkout@v7, upload-artifact@v7, download-artifact@v8).
+
 ## [0.10.3] - 2026-07-09
 
 ### Fixed

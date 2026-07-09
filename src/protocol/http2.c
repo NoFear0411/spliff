@@ -304,10 +304,17 @@ static int on_header_callback(nghttp2_session *session,
             memcpy(ftxn->host, value, copylen);
             ftxn->host[copylen] = '\0';
         } else if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
+            /* RFC 9110 §15.4: HTTP status codes are three-digit integers.
+             * strtol + explicit range check rejects malformed :status values
+             * instead of silently emitting status_code=0 (atoi's default on
+             * non-numeric input, which is indistinguishable from "unset"). */
             char status_str[8] = {0};
             size_t copylen = valuelen < 7 ? valuelen : 7;
             memcpy(status_str, value, copylen);
-            ftxn->status_code = atoi(status_str);
+            char *endptr;
+            long v = strtol(status_str, &endptr, 10);
+            ftxn->status_code = (endptr != status_str && *endptr == '\0'
+                                 && v >= 100 && v <= 999) ? (int)v : 0;
         }
         /* :scheme not stored - always https for HTTP/2 */
         return 0;
@@ -761,10 +768,16 @@ static void h2_process_response_header_flow(flow_transaction_t *txn, const nghtt
     /* Handle pseudo-headers */
     if (namelen > 0 && name[0] == ':') {
         if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
+            /* RFC 9110 §15.4: three-digit integer, 100-599 semantically valid
+             * (100-999 range check preserves out-of-spec but well-formed codes
+             * such as 999). Malformed input yields 0 so downstream can flag it. */
             char status_str[8] = {0};
             size_t copylen = valuelen < 7 ? valuelen : 7;
             memcpy(status_str, value, copylen);
-            txn->status_code = atoi(status_str);
+            char *endptr;
+            long v = strtol(status_str, &endptr, 10);
+            txn->status_code = (endptr != status_str && *endptr == '\0'
+                                 && v >= 100 && v <= 999) ? (int)v : 0;
         }
         return;
     }

@@ -782,10 +782,13 @@ static void worker_loop(worker_ctx_t *ctx) {
                             /*
                              * Atomically try to re-home this flow to current worker.
                              * This ensures single-writer ownership of parser state.
+                             * Note: named distinct from the outer `expected` at line 634
+                             * (which claims an unowned slot); this one wrests ownership
+                             * away from an existing worker.
                              */
-                            uint32_t expected = home;
+                            uint32_t expected_home = home;
                             if (atomic_compare_exchange_strong(&event->flow_ctx->home_worker_id,
-                                                               &expected, my_id)) {
+                                                               &expected_home, my_id)) {
                                 /*
                                  * FIX: Add acquire fence after successful re-homing CAS.
                                  * Ensures we observe any partial initialization by original
