@@ -1,7 +1,7 @@
 # spliff Release Workflow
 #
 # Creates signed RPM releases when a version tag is pushed.
-# Builds for: Fedora 43/42 (dynamic), AlmaLinux 10/9 (static vectorscan)
+# Builds for: Fedora 44/43/42 (dynamic), AlmaLinux 10/9 (static vectorscan)
 # Publishes signed .rpm packages with detached GPG signatures to GitHub Releases
 #
 # Pipeline: build (4x parallel) → test → sign → publish
@@ -38,6 +38,7 @@ jobs:
     name: Check Existing Artifacts
     runs-on: ubuntu-latest
     outputs:
+      fedora-44: ${{ steps.check.outputs.fedora-44 }}
       fedora-43: ${{ steps.check.outputs.fedora-43 }}
       fedora-42: ${{ steps.check.outputs.fedora-42 }}
       almalinux-10: ${{ steps.check.outputs.almalinux-10 }}
@@ -52,7 +53,7 @@ jobs:
           # On tag: check if artifacts already exist in release
           if [[ "$GITHUB_REF" == refs/heads/* ]]; then
             echo "Main branch build - building all distros to populate cache"
-            for distro in fedora-43 fedora-42 almalinux-10 almalinux-9; do
+            for distro in fedora-44 fedora-43 fedora-42 almalinux-10 almalinux-9; do
               echo "$distro=build" >> $GITHUB_OUTPUT
             done
             echo "=== Build decisions (main branch) ==="
@@ -66,8 +67,10 @@ jobs:
           ASSETS=$(gh release view "$TAG" --repo ${{ github.repository }} --json assets -q '.assets[].name' 2>/dev/null || echo "")
 
           # Check each distro
-          for distro in fedora-43 fedora-42 almalinux-10 almalinux-9; do
-            if echo "$ASSETS" | grep -q "fc43" && [ "$distro" = "fedora-43" ]; then
+          for distro in fedora-44 fedora-43 fedora-42 almalinux-10 almalinux-9; do
+            if echo "$ASSETS" | grep -q "fc44" && [ "$distro" = "fedora-44" ]; then
+              echo "$distro=skip" >> $GITHUB_OUTPUT
+            elif echo "$ASSETS" | grep -q "fc43" && [ "$distro" = "fedora-43" ]; then
               echo "$distro=skip" >> $GITHUB_OUTPUT
             elif echo "$ASSETS" | grep -q "fc42" && [ "$distro" = "fedora-42" ]; then
               echo "$distro=skip" >> $GITHUB_OUTPUT
@@ -84,7 +87,67 @@ jobs:
           cat $GITHUB_OUTPUT
 
   # ==========================================================================
-  # Fedora 43 (Full feature support - primary build target)
+  # Fedora 44 (Full feature support - kernel 7.0+ target)
+  # ==========================================================================
+  build-fedora-44:
+    name: Build (Fedora 44)
+    needs: check-existing
+    if: needs.check-existing.outputs.fedora-44 == 'build'
+    runs-on: ubuntu-latest
+    container: fedora:44
+
+    steps:
+      - name: Setup DNF cache directory
+        run: mkdir -p /var/cache/dnf /var/cache/libdnf5
+
+      - name: Cache DNF packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/dnf
+            /var/cache/libdnf5
+          key: dnf-fedora-44-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            dnf-fedora-44-
+
+      - name: Install dependencies
+        run: |
+          dnf clean metadata || true
+          dnf install -y --setopt=keepcache=True \
+            git cmake make pkg-config \
+            gcc gcc-c++ clang llvm bpftool \
+            libbpf-devel elfutils-libelf-devel zlib-ng-devel \
+            llhttp-devel libnghttp2-devel \
+            ck-devel \
+            libzstd-devel brotli-devel \
+            libxdp-devel userspace-rcu-devel \
+            jemalloc-devel pcre2-devel \
+            vectorscan-devel \
+            rpm-build
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (Release)
+        run: cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+
+      - name: Build
+        run: cmake --build build-release --parallel
+
+      - name: Create RPM package
+        run: cd build-release && cpack -G RPM
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spliff-fedora-44
+          path: |
+            build-release/spliff
+            build-release/*.rpm
+          retention-days: 7
+
+  # ==========================================================================
+  # Fedora 43 (Full feature support)
   # ==========================================================================
   build-fedora-43:
     name: Build (Fedora 43)
@@ -464,11 +527,12 @@ jobs:
   # ==========================================================================
   test:
     name: Test Artifacts
-    needs: [build-fedora-43, build-fedora-42, build-alma10, build-alma9]
+    needs: [build-fedora-44, build-fedora-43, build-fedora-42, build-alma10, build-alma9]
     # Only run test/sign/publish on tag pushes (main branch builds only populate cache)
     if: |
       startsWith(github.ref, 'refs/tags/') &&
       always() && (
+        needs.build-fedora-44.result == 'success' ||
         needs.build-fedora-43.result == 'success' ||
         needs.build-fedora-42.result == 'success' ||
         needs.build-alma10.result == 'success' ||
